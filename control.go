@@ -45,10 +45,10 @@ const (
 	ButtonPaddle3 ControlID = "button.paddle.3"
 	ButtonPaddle4 ControlID = "button.paddle.4"
 
-	DPadUp    ControlID = "dpad.up"
-	DPadDown  ControlID = "dpad.down"
-	DPadLeft  ControlID = "dpad.left"
-	DPadRight ControlID = "dpad.right"
+	DPadUp    ControlID = "button.dpad.up"
+	DPadDown  ControlID = "button.dpad.down"
+	DPadLeft  ControlID = "button.dpad.left"
+	DPadRight ControlID = "button.dpad.right"
 
 	StickLeft    ControlID = "stick.left"
 	StickRight   ControlID = "stick.right"
@@ -79,7 +79,7 @@ var standardButtons = []ControlID{
 	DPadRight,
 }
 
-// StandardButtonIDs returns the standard digital controls in a stable order.
+// StandardButtonIDs returns the standard physical buttons in a stable order.
 func StandardButtonIDs() []ControlID {
 	return append([]ControlID(nil), standardButtons...)
 }

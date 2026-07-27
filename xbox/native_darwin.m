@@ -13,6 +13,7 @@
 typedef struct {
     GCController *controller;
     id disconnect_observer;
+    dispatch_queue_t handler_queue;
     pthread_mutex_t mutex;
     pthread_cond_t condition;
     teleop_gc_state queue[TELEOP_QUEUE_SIZE];
@@ -23,6 +24,44 @@ typedef struct {
     int disconnected;
     int closed;
 } teleop_gc_handle;
+
+static pthread_once_t teleop_gc_discovery_once = PTHREAD_ONCE_INIT;
+static char teleop_gc_handler_queue_key;
+
+static void teleop_gc_start_discovery(void) {
+    [GCController startWirelessControllerDiscoveryWithCompletionHandler:^{}];
+}
+
+static NSArray<GCController *> *teleop_gc_controllers(void) {
+    pthread_once(&teleop_gc_discovery_once, teleop_gc_start_discovery);
+
+    // GameController populates its registry through the calling thread's run
+    // loop. Command-line programs do not otherwise run one before discovery,
+    // so an immediate call to +controllers incorrectly appears empty. Pump a
+    // short slice even when populated so hotplug changes can be delivered.
+    for (int attempt = 0; attempt < 20; attempt++) {
+        [[NSRunLoop currentRunLoop]
+            runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.025]];
+        NSArray<GCController *> *controllers = [GCController controllers];
+        if ([controllers count] > 0) {
+            return controllers;
+        }
+    }
+    return [GCController controllers];
+}
+
+static void teleop_gc_copy_string(NSString *value, char *destination, size_t size) {
+    if (destination == NULL || size == 0) {
+        return;
+    }
+    const char *utf8 = [value UTF8String];
+    if (utf8 == NULL) {
+        destination[0] = '\0';
+        return;
+    }
+    strncpy(destination, utf8, size - 1);
+    destination[size - 1] = '\0';
+}
 
 static teleop_gc_state teleop_gc_capture(teleop_gc_handle *handle, GCExtendedGamepad *gamepad) {
     teleop_gc_state state;
@@ -89,12 +128,18 @@ static void teleop_gc_enqueue(teleop_gc_handle *handle, GCExtendedGamepad *gamep
 
 int teleop_gc_count(void) {
     @autoreleasepool {
-        [GCController startWirelessControllerDiscoveryWithCompletionHandler:^{}];
-        return (int)[[GCController controllers] count];
+        return (int)[teleop_gc_controllers() count];
     }
 }
 
-int teleop_gc_info(int index, char *name, size_t name_size, uint32_t *features) {
+int teleop_gc_info(
+    int index,
+    char *name,
+    size_t name_size,
+    char *product_category,
+    size_t product_category_size,
+    uint32_t *features
+) {
     @autoreleasepool {
         NSArray<GCController *> *controllers = [GCController controllers];
         if (index < 0 || index >= (int)[controllers count]) {
@@ -106,11 +151,12 @@ int teleop_gc_info(int index, char *name, size_t name_size, uint32_t *features) 
             return 0;
         }
         NSString *vendor = controller.vendorName ?: @"Game controller";
-        if (name != NULL && name_size > 0) {
-            const char *value = [vendor UTF8String];
-            strncpy(name, value, name_size - 1);
-            name[name_size - 1] = '\0';
-        }
+        teleop_gc_copy_string(vendor, name, name_size);
+        teleop_gc_copy_string(
+            controller.productCategory,
+            product_category,
+            product_category_size
+        );
         uint32_t result = 0;
         if (gamepad.buttonMenu != nil) result |= 1;
         if (gamepad.buttonOptions != nil) result |= 2;
@@ -142,6 +188,17 @@ void *teleop_gc_open(int index) {
         handle->controller = [controller retain];
         pthread_mutex_init(&handle->mutex, NULL);
         pthread_cond_init(&handle->condition, NULL);
+        handle->handler_queue = dispatch_queue_create(
+            "ai.openships.teleop.gamecontroller-input",
+            DISPATCH_QUEUE_SERIAL
+        );
+        dispatch_queue_set_specific(
+            handle->handler_queue,
+            &teleop_gc_handler_queue_key,
+            handle,
+            NULL
+        );
+        controller.handlerQueue = handle->handler_queue;
 
         gamepad.valueChangedHandler = ^(GCExtendedGamepad *changed, GCControllerElement *element) {
             (void)element;
@@ -207,15 +264,22 @@ void teleop_gc_close(void *opaque) {
     teleop_gc_handle *handle = (teleop_gc_handle *)opaque;
     if (handle == NULL) return;
     @autoreleasepool {
+        pthread_mutex_lock(&handle->mutex);
+        handle->closed = 1;
+        pthread_cond_broadcast(&handle->condition);
+        pthread_mutex_unlock(&handle->mutex);
+
         handle->controller.extendedGamepad.valueChangedHandler = nil;
         if (handle->disconnect_observer != nil) {
             [[NSNotificationCenter defaultCenter] removeObserver:handle->disconnect_observer];
             handle->disconnect_observer = nil;
         }
-        pthread_mutex_lock(&handle->mutex);
-        handle->closed = 1;
-        pthread_cond_broadcast(&handle->condition);
-        pthread_mutex_unlock(&handle->mutex);
+        if (dispatch_get_specific(&teleop_gc_handler_queue_key) != handle) {
+            dispatch_sync(handle->handler_queue, ^{});
+        }
+        handle->controller.handlerQueue = dispatch_get_main_queue();
+        dispatch_release(handle->handler_queue);
+        handle->handler_queue = nil;
         [handle->controller release];
         handle->controller = nil;
         // The handle remains allocated so a concurrent timed wait can safely

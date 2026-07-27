@@ -219,3 +219,16 @@ func TestMonitorModelReturnsStreamErrors(t *testing.T) {
 		t.Fatalf("stream error = %v, want %v", model.streamErr, streamErr)
 	}
 }
+
+func TestDPadButtonSummaryIncludesDirectionPhase(t *testing.T) {
+	t.Parallel()
+
+	event := teleop.ButtonEvent{
+		Button:  teleop.DPadRight,
+		Phase:   teleop.PhaseReleased,
+		Pressed: false,
+	}
+	if got := eventSummary(event); got != "button.dpad.right released" {
+		t.Fatalf("summary = %q", got)
+	}
+}

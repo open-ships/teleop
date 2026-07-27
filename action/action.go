@@ -49,6 +49,15 @@ func OnButton(action ID, button teleop.ControlID, phase teleop.Phase) Binding {
 	}
 }
 
+func OnDPad(action ID, direction teleop.ControlID, phase teleop.Phase) Binding {
+	return Binding{
+		Action:    action,
+		EventKind: teleop.EventButton,
+		Control:   direction,
+		Phase:     phase,
+	}
+}
+
 func OnGesture(action ID, gestureType gesture.Type, control teleop.ControlID) Binding {
 	return Binding{
 		Action:      action,

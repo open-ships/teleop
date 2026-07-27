@@ -119,13 +119,15 @@ across controller brands. For example, `xbox.ButtonA` is an alias for
 - Stick axes are in `[-1, +1]`; positive X is right and positive Y is up.
 - Triggers are in `[0, 1]`.
 - D-pad directions are independent booleans, so diagonals are preserved.
+- D-pad direction changes emit `ButtonEvent` values such as
+  `button.dpad.left` with `pressed` or `released` phases.
 - `Descriptor.Capability` reports only the controls exposed by the selected
   backend.
 - Canonical input is not coalesced and has no dead zone applied. Apply
   `teleop.ApplyRadialDeadZone` only when turning input into commands.
 
 Each backend observation produces an `ObservationEvent`, followed by any
-corresponding `ButtonEvent`, `StickEvent`, `TriggerEvent`, or `DPadEvent`.
+corresponding `ButtonEvent`, `StickEvent`, or `TriggerEvent`.
 Events carry a controller session, sequence number, observation time, and
 causal event IDs.
 

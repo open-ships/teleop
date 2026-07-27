@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/open-ships/teleop"
@@ -25,6 +26,11 @@ type configuration struct {
 }
 
 func main() {
+	// Apple's GameController framework initializes its device registry through
+	// the macOS main thread's run loop.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "teleop-monitor:", err)
 		os.Exit(1)

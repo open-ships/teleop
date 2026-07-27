@@ -80,12 +80,5 @@ func diffEvents(previous, current State, header func() Header) []Event {
 			Delta:    current.RightTrigger - previous.RightTrigger,
 		})
 	}
-	if previous.DPad != current.DPad {
-		events = append(events, DPadEvent{
-			Meta:     header(),
-			Previous: previous.DPad,
-			Current:  current.DPad,
-		})
-	}
 	return events
 }

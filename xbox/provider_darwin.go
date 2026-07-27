@@ -63,23 +63,22 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 
 func darwinDescriptor(index int) (teleop.Descriptor, bool) {
 	name := make([]byte, 256)
+	productCategory := make([]byte, 256)
 	var features C.uint32_t
 	ok := C.teleop_gc_info(
 		C.int(index),
 		(*C.char)(unsafe.Pointer(&name[0])),
 		C.size_t(len(name)),
+		(*C.char)(unsafe.Pointer(&productCategory[0])),
+		C.size_t(len(productCategory)),
 		&features,
 	)
 	if ok == 0 {
 		return teleop.Descriptor{}, false
 	}
-	if end := bytes.IndexByte(name, 0); end >= 0 {
-		name = name[:end]
-	}
-	lowerName := strings.ToLower(string(name))
-	if !strings.Contains(lowerName, "xbox") &&
-		!strings.Contains(lowerName, "x-box") &&
-		!strings.Contains(lowerName, "microsoft") {
+	vendorName := nullTerminatedString(name)
+	category := nullTerminatedString(productCategory)
+	if !isXboxIdentity(vendorName, category) {
 		return teleop.Descriptor{}, false
 	}
 	supported := map[teleop.ControlID]bool{
@@ -100,14 +99,39 @@ func darwinDescriptor(index int) (teleop.Descriptor, bool) {
 	return teleop.Descriptor{
 		ID:         teleop.DeviceID(fmt.Sprintf("gamecontroller:%d", index)),
 		Type:       teleop.ControllerXbox,
-		Name:       string(name),
+		Name:       darwinControllerName(vendorName, category),
 		Transport:  teleop.TransportUnknown,
 		Backend:    "darwin-gamecontroller",
 		Capability: capabilities(teleop.AuditExactBackendStream, supported),
 		Properties: map[string]string{
-			"gamecontroller_index": strconv.Itoa(index),
+			"gamecontroller_index":            strconv.Itoa(index),
+			"gamecontroller_product_category": category,
 		},
 	}, true
+}
+
+func nullTerminatedString(value []byte) string {
+	if end := bytes.IndexByte(value, 0); end >= 0 {
+		value = value[:end]
+	}
+	return string(value)
+}
+
+func isXboxIdentity(vendorName, productCategory string) bool {
+	identity := strings.ToLower(vendorName + " " + productCategory)
+	return strings.Contains(identity, "xbox") ||
+		strings.Contains(identity, "x-box") ||
+		strings.Contains(identity, "microsoft")
+}
+
+func darwinControllerName(vendorName, productCategory string) string {
+	switch strings.ToLower(strings.TrimSpace(vendorName)) {
+	case "", "controller", "game controller", "gamepad":
+		if productCategory != "" {
+			return productCategory
+		}
+	}
+	return vendorName
 }
 
 type darwinSource struct {

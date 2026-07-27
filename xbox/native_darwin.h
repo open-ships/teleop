@@ -35,7 +35,14 @@ typedef struct {
 } teleop_gc_state;
 
 int teleop_gc_count(void);
-int teleop_gc_info(int index, char *name, size_t name_size, uint32_t *features);
+int teleop_gc_info(
+    int index,
+    char *name,
+    size_t name_size,
+    char *product_category,
+    size_t product_category_size,
+    uint32_t *features
+);
 void *teleop_gc_open(int index);
 int teleop_gc_next(void *opaque, teleop_gc_state *state, int timeout_ms);
 void teleop_gc_close(void *opaque);
