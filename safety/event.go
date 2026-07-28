@@ -44,6 +44,12 @@ const (
 	ReasonNoInput Reason = "no_input"
 	// ReasonDeadManReleased reports that the dead-man control is not held.
 	ReasonDeadManReleased Reason = "dead_man_released"
+	// ReasonDeadManUnconfirmed reports a control the snapshot shows as held
+	// whose press the Guard never observed, so it cannot bound how long the
+	// hold has lasted. This is ordinary at startup and while a press is still
+	// propagating through the pipeline, so it inhibits without latching and
+	// clears on the next observed press.
+	ReasonDeadManUnconfirmed Reason = "dead_man_unconfirmed"
 	// ReasonDeadManStale reports a dead-man control held continuously past the
 	// re-actuation deadline, which is the signature of a defeated switch.
 	ReasonDeadManStale Reason = "dead_man_stale"

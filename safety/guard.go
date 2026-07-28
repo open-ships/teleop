@@ -312,9 +312,11 @@ func (g *Guard) evaluateLocked() Decision {
 		case !state.Button(g.options.deadMan):
 			reasons = append(reasons, ReasonDeadManReleased)
 		case !g.deadManHeld:
-			// Held, but the Guard never saw the press that started the hold:
-			// it cannot bound how long the control has been down.
-			reasons = append(reasons, ReasonDeadManStale)
+			// Held, but the Guard never saw the press that started the hold,
+			// so it cannot bound how long the control has been down. This is
+			// ordinary while a press propagates through the pipeline, so it
+			// inhibits without latching.
+			reasons = append(reasons, ReasonDeadManUnconfirmed)
 		case g.options.reactuation > 0 && now-g.deadManSince >= g.options.reactuation:
 			reasons = append(reasons, ReasonDeadManStale)
 		}
@@ -360,14 +362,16 @@ func (g *Guard) evaluateLocked() Decision {
 }
 
 // onlyDeadManEngagement reports a decision blocked solely because the operator
-// is not currently pressing the dead-man control. That is normal operation
-// rather than a fault, so it must not latch.
+// is not currently engaging the dead-man control, or because an engagement has
+// not yet been observed. Both are normal operation rather than faults, so
+// neither may latch: a gate that demands a re-arm every time an operator lets
+// go, or every time a press is still in flight, is one operators defeat.
 func onlyDeadManEngagement(reasons []Reason) bool {
 	if len(reasons) == 0 {
 		return false
 	}
 	for _, reason := range reasons {
-		if reason != ReasonDeadManReleased {
+		if reason != ReasonDeadManReleased && reason != ReasonDeadManUnconfirmed {
 			return false
 		}
 	}

@@ -97,6 +97,7 @@ A guard authorizes output only when it can affirmatively establish all of:
 | Pipeline healthy | controller terminated | `ReasonControllerFault` |
 | Loop alive | no `Heartbeat` within the watchdog | `ReasonLoopStalled` |
 | Operator engaged | dead-man control not held | `ReasonDeadManReleased` |
+| Engagement observed | held, but the press was never seen | `ReasonDeadManUnconfirmed` |
 | Switch not defeated | held past the re-actuation deadline | `ReasonDeadManStale` |
 | No stop | emergency stop active | `ReasonEmergencyStop` |
 

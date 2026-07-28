@@ -448,7 +448,6 @@ func (c *Controller) handleObservation(observation Observation, receivedAt time.
 
 	c.stateMu.Lock()
 	previous := c.state.Clone()
-	c.state = state.Clone()
 	c.stateMu.Unlock()
 
 	observationEvent := ObservationEvent{
@@ -464,6 +463,25 @@ func (c *Controller) handleObservation(observation Observation, receivedAt time.
 		Previous: previous,
 		Current:  state,
 	}
+
+	// Commit the state and its metadata together, before publishing. Updating
+	// state first and metadata after the publish loop leaves a window in which
+	// a snapshot returns new state alongside stale freshness metadata, which a
+	// consumer enforcing a command timeout reads as "no input has ever
+	// arrived". That fails safe, but it trips a gate for no reason, and a gate
+	// that trips spuriously is one operators learn to work around.
+	c.stateMu.Lock()
+	c.state = state.Clone()
+	c.meta = StateMeta{
+		ObservedAt:        observation.ObservedAt,
+		ReceivedAt:        receivedAt,
+		PublishedAt:       observationEvent.Meta.PublishedAt,
+		ReceivedMonotonic: observationEvent.Meta.ReceivedMonotonic,
+		Sequence:          observationEvent.Meta.ID.Sequence,
+		Connected:         true,
+	}
+	c.stateMu.Unlock()
+
 	if err := c.publish(observationEvent); err != nil {
 		return err
 	}
@@ -483,16 +501,6 @@ func (c *Controller) handleObservation(observation Observation, receivedAt time.
 		}
 	}
 
-	c.stateMu.Lock()
-	c.meta = StateMeta{
-		ObservedAt:        observation.ObservedAt,
-		ReceivedAt:        receivedAt,
-		PublishedAt:       observationEvent.Meta.PublishedAt,
-		ReceivedMonotonic: observationEvent.Meta.ReceivedMonotonic,
-		Sequence:          observationEvent.Meta.ID.Sequence,
-		Connected:         true,
-	}
-	c.stateMu.Unlock()
 	return nil
 }
 
@@ -615,6 +623,13 @@ func (c *Controller) terminate(err error) {
 	if err == nil {
 		err = ErrDisconnected
 	}
+	// Publish commands the application already handed over. RecordCommand
+	// reports success once a command is queued, so discarding the queue here
+	// would silently drop a command from the record after telling the caller
+	// it was accepted. They are published before the terminal neutral state so
+	// the log keeps them in the order they were issued.
+	c.drainCommands()
+
 	now := c.clock.Now()
 	c.neutralizeTerminal(now, "disconnect")
 
@@ -645,6 +660,33 @@ func (c *Controller) terminate(err error) {
 	deadline := time.Now().Add(c.options.shutdownTimeout)
 	c.addTerminalError(c.stopSinks(deadline))
 	c.addTerminalError(c.waitSourceClose(deadline))
+}
+
+// drainCommands publishes every command already accepted into the queue. It
+// uses terminal dispatch because the pipeline is shutting down and a failed
+// sink must not suppress delivery of the remainder.
+func (c *Controller) drainCommands() {
+	for {
+		select {
+		case request := <-c.external:
+			c.publishTerminal(CommandEvent{
+				Meta: c.nextHeaderAt(
+					"command",
+					request.issuedAt,
+					request.issuedAt,
+					0,
+					request.command.Causes,
+					false,
+				),
+				Command:    request.command.Name,
+				Payload:    request.payload,
+				Authorized: request.command.Authorized,
+				Reason:     request.command.Reason,
+			})
+		default:
+			return
+		}
+	}
 }
 
 func normalizeSourceError(err error, closing bool) error {

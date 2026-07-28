@@ -254,6 +254,13 @@ type linuxSource struct {
 	closeOnce  sync.Once
 	closeMu    sync.RWMutex
 	closed     bool
+
+	// pending holds bytes read from the device that do not yet form a complete
+	// event. The kernel can split an event across reads, so a decoder that
+	// assumed each read yielded whole events would either lose the remainder
+	// or block waiting for it.
+	pending bytes.Buffer
+	scratch []byte
 }
 
 func (s *linuxSource) Descriptor() teleop.Descriptor {
@@ -281,12 +288,9 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 		if err := ctx.Err(); err != nil {
 			return teleop.Observation{}, err
 		}
-		if err := s.waitReadable(ctx); err != nil {
+		event, err := s.nextEvent(ctx)
+		if err != nil {
 			return teleop.Observation{}, err
-		}
-		var event linuxInputEvent
-		if err := binary.Read(s.file, binary.NativeEndian, &event); err != nil {
-			return teleop.Observation{}, s.normalizeReadError(err)
 		}
 		s.appendRaw(event)
 
@@ -332,6 +336,91 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 					Data:   raw,
 				},
 			}, nil
+		}
+	}
+}
+
+// linuxReadBatchEvents bounds one read syscall. Reading several events at once
+// keeps syscall overhead low at high report rates without letting a burst
+// allocate without limit.
+const linuxReadBatchEvents = 64
+
+// nextEvent returns the next complete evdev event.
+//
+// Poll readiness guarantees that at least one byte can be read, not that a
+// whole event is available. Demanding a fixed-size read after a readiness
+// signal, as io.ReadFull does, blocks in a syscall that neither the context
+// nor Close can interrupt until the remainder of a split event arrives — and
+// for a partial event at the tail of a kernel buffer, that can be never.
+//
+// Reading whatever is available and decoding only complete records keeps poll
+// the single blocking point, so cancellation and Close stay effective.
+func (s *linuxSource) nextEvent(ctx context.Context) (linuxInputEvent, error) {
+	size := binary.Size(linuxInputEvent{})
+	if size <= 0 {
+		return linuxInputEvent{}, fmt.Errorf("evdev event has no fixed wire size")
+	}
+	for {
+		if s.pending.Len() >= size {
+			var event linuxInputEvent
+			if _, err := binary.Decode(
+				s.pending.Next(size),
+				binary.NativeEndian,
+				&event,
+			); err != nil {
+				return linuxInputEvent{}, fmt.Errorf("decode evdev event: %w", err)
+			}
+			return event, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return linuxInputEvent{}, err
+		}
+		if err := s.waitReadable(ctx); err != nil {
+			return linuxInputEvent{}, err
+		}
+		if s.scratch == nil {
+			s.scratch = make([]byte, size*linuxReadBatchEvents)
+		}
+		// Bound the read when the descriptor supports deadlines. This is best
+		// effort: an evdev device does not, because the capability ioctls need
+		// a raw descriptor and take it out of the runtime poller. Clearing a
+		// stale deadline matters as much as setting one, since a deadline left
+		// over from an earlier canceled call would fire against a live read.
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = s.file.SetReadDeadline(deadline)
+		} else {
+			_ = s.file.SetReadDeadline(time.Time{})
+		}
+		count, err := s.file.Read(s.scratch)
+		if count > 0 {
+			s.pending.Write(s.scratch[:count])
+		}
+		if err != nil {
+			// Bytes that completed an event are still usable; report the error
+			// only once the buffered remainder is exhausted.
+			if s.pending.Len() >= size {
+				continue
+			}
+			// The deadline was derived from ctx, so its expiry is a
+			// cancellation rather than a device fault. ctx.Err may not be set
+			// yet when both fire at once, so do not depend on it.
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return linuxInputEvent{}, ctxErr
+				}
+				return linuxInputEvent{}, context.DeadlineExceeded
+			}
+			// Poll reported readiness that did not survive to the read. Treat
+			// it as spurious and wait again rather than reporting a fault.
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				continue
+			}
+			return linuxInputEvent{}, s.normalizeReadError(err)
+		}
+		if count == 0 && s.pending.Len() < size {
+			// A descriptor that reports readable but yields nothing has
+			// reached end of file: the device detached.
+			return linuxInputEvent{}, s.normalizeReadError(io.EOF)
 		}
 	}
 }

@@ -112,14 +112,16 @@ func TestLinuxReadCancellation(t *testing.T) {
 	defer writer.Close()
 
 	source := &linuxSource{file: reader}
+	// Close on every exit path. A t.Fatal below would otherwise leak the
+	// descriptor until finalization, and these tests run in parallel, so a
+	// recycled descriptor number shows up as a spurious readiness in another
+	// test rather than as a failure here.
+	defer source.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
 	if _, err := source.Read(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Read error = %v, want context.DeadlineExceeded", err)
-	}
-	if err := source.Close(); err != nil {
-		t.Fatal(err)
 	}
 }
 

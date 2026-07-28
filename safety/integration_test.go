@@ -51,6 +51,28 @@ func waitForState(
 func deadManHeld(state teleop.State) bool  { return state.Button(deadMan) }
 func deadManClear(state teleop.State) bool { return !state.Button(deadMan) }
 
+// waitForPermit polls until the guard authorizes output. A snapshot showing
+// the dead-man control held does not by itself mean the guard has observed the
+// press that started the hold: the snapshot is committed when the observation
+// is handled, while the guard learns of the press when the resulting button
+// event reaches it. Polling the guard's own decision is the only correct
+// synchronization point.
+func waitForPermit(t *testing.T, guard *safety.Guard) safety.Decision {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var decision safety.Decision
+	for time.Now().Before(deadline) {
+		guard.Heartbeat()
+		decision = guard.Evaluate()
+		if decision.Permit {
+			return decision
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("guard never permitted output: %v", decision.Reasons)
+	return decision
+}
+
 // TestGuardedSessionIsFullyRecorded exercises the whole chain: a guard gates
 // output, the application records the command it issued, and the signed audit
 // log reproduces the decision, the command, and the causal link between them.
@@ -100,10 +122,7 @@ func TestGuardedSessionIsFullyRecorded(t *testing.T) {
 	if err := guard.Arm(); err != nil {
 		t.Fatal(err)
 	}
-	decision := guard.Evaluate()
-	if !decision.Permit {
-		t.Fatalf("guard must permit output: %v", decision.Reasons)
-	}
+	decision := waitForPermit(t, guard)
 
 	_, meta := controller.SnapshotWithMeta()
 	err = controller.RecordCommand(t.Context(), teleop.Command{

@@ -311,8 +311,22 @@ func TestDeadManHeldWithoutObservedPressIsStale(t *testing.T) {
 	if decision.Permit {
 		t.Fatal("an unobserved hold must not authorize output")
 	}
-	if !decision.Has(ReasonDeadManStale) {
+	if !decision.Has(ReasonDeadManUnconfirmed) {
 		t.Fatalf("reasons = %v", decision.Reasons)
+	}
+	// An unobserved hold is ordinary rather than a fault, so it must not
+	// demand a re-arm once the press is seen.
+	if decision.State != StateArmed {
+		t.Fatalf("state = %q, want %q", decision.State, StateArmed)
+	}
+	guard.Process(teleop.ButtonEvent{
+		Meta:    teleop.Header{Monotonic: source.Monotonic()},
+		Button:  deadMan,
+		Pressed: true,
+		Phase:   teleop.PhasePressed,
+	})
+	if !guard.Evaluate().Permit {
+		t.Fatal("observing the press must restore authority without a re-arm")
 	}
 }
 
