@@ -120,6 +120,28 @@ func TestLosslessSubscriptionFailsExplicitlyOnOverflow(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = controller.Close() })
 
+	ready, err := controller.Subscribe(teleop.SubscriptionOptions{
+		Delivery: teleop.DeliveryLossless,
+		Buffer:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for {
+		event, nextErr := ready.Next(ctx)
+		if nextErr != nil {
+			t.Fatal(nextErr)
+		}
+		if event.Kind() == teleop.EventCapabilities {
+			break
+		}
+	}
+	if err := ready.Close(); err != nil {
+		t.Fatal(err)
+	}
+
 	subscription, err := controller.Subscribe(teleop.SubscriptionOptions{
 		Delivery: teleop.DeliveryLossless,
 		Buffer:   1,
@@ -127,8 +149,6 @@ func TestLosslessSubscriptionFailsExplicitlyOnOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
 
 	// Connection and capabilities are published immediately, overflowing a
 	// deliberately undersized subscriber before it consumes either event.
