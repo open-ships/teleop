@@ -150,11 +150,13 @@ type State struct {
 	DPad         DPad    `json:"dpad"`
 }
 
+// Clone returns an isolated copy of the controller state.
 func (s State) Clone() State {
 	s.Buttons = s.Buttons.clone()
 	return s
 }
 
+// Button reports the current digital state of a button or D-pad direction.
 func (s State) Button(id ControlID) bool {
 	switch id {
 	case DPadUp:
@@ -170,6 +172,7 @@ func (s State) Button(id ControlID) bool {
 	}
 }
 
+// SetButton updates a button or D-pad direction.
 func (s *State) SetButton(id ControlID, pressed bool) {
 	switch id {
 	case DPadUp:

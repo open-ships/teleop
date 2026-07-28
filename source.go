@@ -33,6 +33,8 @@ var (
 	ErrInvalidState = errors.New("teleop: invalid controller state")
 )
 
+// SourceGap describes input known or suspected to be missing before an
+// observation.
 type SourceGap struct {
 	// Dropped is the known count, or a lower bound when Reason identifies a
 	// loss signal that cannot report its exact magnitude. Zero means unknown.
@@ -57,6 +59,7 @@ type InputSource interface {
 	Close() error
 }
 
+// EventSink receives the authoritative ordered controller event stream.
 type EventSink interface {
 	Record(context.Context, Event) error
 }
@@ -127,6 +130,7 @@ type controllerOptions struct {
 	deferredStart      bool
 }
 
+// OpenOption configures a controller session.
 type OpenOption func(*controllerOptions)
 
 // WithAuditSink attaches an authoritative ingress sink. The controller accepts

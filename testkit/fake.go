@@ -11,6 +11,7 @@ import (
 	"github.com/open-ships/teleop"
 )
 
+// FakeSource is a bounded, push-driven teleop.InputSource for tests.
 type FakeSource struct {
 	descriptor   teleop.Descriptor
 	observations chan teleop.Observation
@@ -18,6 +19,7 @@ type FakeSource struct {
 	closeOnce    sync.Once
 }
 
+// NewFakeSource returns a fake source with sensible virtual-device defaults.
 func NewFakeSource(descriptor teleop.Descriptor, buffer int) *FakeSource {
 	if buffer <= 0 {
 		buffer = 64
@@ -41,6 +43,7 @@ func NewFakeSource(descriptor teleop.Descriptor, buffer int) *FakeSource {
 	}
 }
 
+// Descriptor implements teleop.InputSource.
 func (f *FakeSource) Descriptor() teleop.Descriptor {
 	return f.descriptor.Clone()
 }
@@ -56,6 +59,7 @@ func (f *FakeSource) Read(ctx context.Context) (teleop.Observation, error) {
 	}
 }
 
+// Push queues a canonical state observed at the current wall-clock time.
 func (f *FakeSource) Push(ctx context.Context, state teleop.State) error {
 	return f.PushObservation(ctx, teleop.Observation{
 		State:      state,
@@ -66,6 +70,7 @@ func (f *FakeSource) Push(ctx context.Context, state teleop.State) error {
 	})
 }
 
+// PushObservation queues an exact observation for the controller ingest loop.
 func (f *FakeSource) PushObservation(ctx context.Context, observation teleop.Observation) error {
 	select {
 	case <-f.done:
@@ -82,11 +87,13 @@ func (f *FakeSource) PushObservation(ctx context.Context, observation teleop.Obs
 	}
 }
 
+// Close implements teleop.InputSource.
 func (f *FakeSource) Close() error {
 	f.closeOnce.Do(func() { close(f.done) })
 	return nil
 }
 
+// ReplaySource is a finite teleop.InputSource over recorded observations.
 type ReplaySource struct {
 	descriptor   teleop.Descriptor
 	observations []teleop.Observation
@@ -95,6 +102,7 @@ type ReplaySource struct {
 	closed       bool
 }
 
+// NewReplaySource copies descriptor and observations into a finite replay.
 func NewReplaySource(descriptor teleop.Descriptor, observations []teleop.Observation) *ReplaySource {
 	return &ReplaySource{
 		descriptor:   descriptor.Clone(),
@@ -102,6 +110,7 @@ func NewReplaySource(descriptor teleop.Descriptor, observations []teleop.Observa
 	}
 }
 
+// Descriptor implements teleop.InputSource.
 func (r *ReplaySource) Descriptor() teleop.Descriptor {
 	return r.descriptor.Clone()
 }
@@ -120,6 +129,7 @@ func (r *ReplaySource) Read(ctx context.Context) (teleop.Observation, error) {
 	return observation, nil
 }
 
+// Close implements teleop.InputSource.
 func (r *ReplaySource) Close() error {
 	r.mu.Lock()
 	r.closed = true

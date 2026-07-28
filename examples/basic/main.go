@@ -1,3 +1,5 @@
+// Package main demonstrates discovering an Xbox controller and consuming its
+// lossless normalized event stream.
 package main
 
 import (

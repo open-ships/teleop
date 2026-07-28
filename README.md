@@ -1,5 +1,7 @@
 # teleop
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/open-ships/teleop.svg)](https://pkg.go.dev/github.com/open-ships/teleop)
+
 Normalized, loss-aware game-controller input for Go teleoperation and autonomy
 applications.
 
@@ -19,8 +21,9 @@ provider works on Linux, macOS, and Windows.
 > not here. A backend cannot report input that the operating system, driver,
 > radio, or polling API never delivered.
 
-The API is pre-v1 while hardware mappings are validated across controller
-generations and operating systems.
+The API has completed its pre-v1 review, and hardware mappings have been
+validated across the supported controller generations and operating systems.
+The `v1.0.0` tag begins the Go module compatibility commitment.
 
 ## Features
 
@@ -302,13 +305,20 @@ recorder := audit.NewRecorder(
 ```
 
 Each mechanism closes a different gap. The hash chain shows the log was not
-edited; `WithHMAC` shows a key holder wrote it; `WithSigner` makes authorship
-non-repudiable, since the verifier no longer holds a key that could have forged
-it; `WithAnchor` makes a destroyed or truncated log detectable rather than
-merely suspected; and `WithProvenance` records the build, configuration, and
-operator without which recorded input cannot be turned back into behavior.
+edited; `WithHMAC` shows a key holder wrote it; `WithSigner` lets an
+independently trusted public key authenticate signed tree heads without giving
+the verifier signing capability; `WithAnchor` makes a destroyed or truncated
+log detectable rather than merely suspected; and `WithProvenance` records the
+build, configuration, and operator without which recorded input cannot be
+turned back into behavior.
 Records also form an RFC 6962 Merkle tree, so a single record can be proved to
 a signed head without disclosing the rest of the log.
+
+Verify completed signed logs with
+`audit.ReadTrusted(reader, trustedPublicKey)`. The public key must come from a
+separate trusted channel; a key declared only inside the log proves internal
+consistency, not device identity. Key provisioning, rotation, revocation, and
+destruction are deployment responsibilities.
 
 When feeding a finite `testkit.ReplaySource` through a controller, pass
 `teleop.WithDeferredStart()` so `Subscribe` is attached before replay begins.

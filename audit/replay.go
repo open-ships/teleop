@@ -19,8 +19,13 @@ type OpaqueEvent struct {
 	Payload json.RawMessage
 }
 
-func (event OpaqueEvent) Header() teleop.Header  { return event.Meta.Clone() }
+// Header implements teleop.Event.
+func (event OpaqueEvent) Header() teleop.Header { return event.Meta.Clone() }
+
+// Kind implements teleop.Event.
 func (event OpaqueEvent) Kind() teleop.EventKind { return event.Type }
+
+// CloneEvent implements teleop.EventCloner.
 func (event OpaqueEvent) CloneEvent() teleop.Event {
 	event.Meta = event.Meta.Clone()
 	event.Payload = append(json.RawMessage(nil), event.Payload...)
@@ -36,8 +41,13 @@ type EncodingErrorEvent struct {
 	Message      string
 }
 
-func (event EncodingErrorEvent) Header() teleop.Header  { return event.Meta.Clone() }
+// Header implements teleop.Event.
+func (event EncodingErrorEvent) Header() teleop.Header { return event.Meta.Clone() }
+
+// Kind implements teleop.Event.
 func (event EncodingErrorEvent) Kind() teleop.EventKind { return event.OriginalKind }
+
+// CloneEvent implements teleop.EventCloner.
 func (event EncodingErrorEvent) CloneEvent() teleop.Event {
 	event.Meta = event.Meta.Clone()
 	return event

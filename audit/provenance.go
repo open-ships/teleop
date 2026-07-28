@@ -26,11 +26,13 @@ type Provenance struct {
 	// BuildVersion is the module version, when built as a dependency.
 	BuildVersion string `json:"build_version,omitempty"`
 
+	// GoVersion, OS, and Arch identify the recording runtime.
 	GoVersion string `json:"go_version,omitempty"`
 	OS        string `json:"os,omitempty"`
 	Arch      string `json:"arch,omitempty"`
-	Host      string `json:"host,omitempty"`
-	PID       int    `json:"pid,omitempty"`
+	// Host and PID identify the recording process.
+	Host string `json:"host,omitempty"`
+	PID  int    `json:"pid,omitempty"`
 
 	// Application and ApplicationVersion identify the program embedding
 	// teleop, which the runtime cannot determine on its own.

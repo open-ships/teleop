@@ -18,11 +18,17 @@ import (
 type Type string
 
 const (
-	Tap              Type = "tap"
-	DoubleTap        Type = "double-tap"
-	Hold             Type = "hold"
-	Chord            Type = "chord"
-	StickRegion      Type = "stick-region"
+	// Tap is a short press followed by release.
+	Tap Type = "tap"
+	// DoubleTap is two taps within Config.DoubleTapWindow.
+	DoubleTap Type = "double-tap"
+	// Hold is a press sustained for Config.HoldMinimum.
+	Hold Type = "hold"
+	// Chord is an exact configured set of simultaneous buttons.
+	Chord Type = "chord"
+	// StickRegion is entry into or exit from a directional stick region.
+	StickRegion Type = "stick-region"
+	// TriggerThreshold is a hysteretic trigger threshold crossing.
 	TriggerThreshold Type = "trigger-threshold"
 )
 
@@ -40,8 +46,13 @@ type Event struct {
 	Value    float32            `json:"value,omitempty"`
 }
 
+// Header implements teleop.Event.
 func (e Event) Header() teleop.Header { return e.Meta.Clone() }
-func (Event) Kind() teleop.EventKind  { return EventKind }
+
+// Kind implements teleop.Event.
+func (Event) Kind() teleop.EventKind { return EventKind }
+
+// CloneEvent implements teleop.EventCloner.
 func (e Event) CloneEvent() teleop.Event {
 	e.Meta = e.Meta.Clone()
 	e.Controls = append([]teleop.ControlID(nil), e.Controls...)

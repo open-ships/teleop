@@ -1,5 +1,3 @@
-// Package audit writes, verifies, and replays append-only controller event
-// logs. The format is newline-delimited JSON for inspection and streaming.
 package audit
 
 import (
@@ -29,27 +27,46 @@ const (
 	// ControlSchemaVersion pins persisted ControlID meanings independently of
 	// the record container.
 	ControlSchemaVersion = "teleop.controls.v1"
-	MaxRecordSize        = 16 * 1024 * 1024
+	// MaxRecordSize is the largest encoded JSON Lines record accepted or
+	// produced by this package.
+	MaxRecordSize = 16 * 1024 * 1024
 
 	// DefaultCheckpointInterval bounds how long a log can run without emitting
-	// a signed, anchorable tree head.
+	// an anchorable tree head. WithSigner makes that head signed.
 	DefaultCheckpointInterval = 10 * time.Second
 	// DefaultCheckpointEvery bounds the same by record count, so a busy log
 	// checkpoints on volume rather than only on elapsed time.
 	DefaultCheckpointEvery = 10000
+	// DefaultMaxPendingBytes bounds event data withheld from a Verify callback
+	// while it waits for the next required signed tree head.
+	DefaultMaxPendingBytes = 64 * 1024 * 1024
 )
 
 var (
-	ErrClosed                 = errors.New("teleop/audit: recorder closed")
-	ErrFailed                 = errors.New("teleop/audit: recorder failed")
-	ErrUnverified             = errors.New("teleop/audit: stream is not hash chained")
-	ErrUnauthenticated        = errors.New("teleop/audit: stream is not HMAC authenticated")
+	// ErrClosed reports use of a recorder after Close.
+	ErrClosed = errors.New("teleop/audit: recorder closed")
+	// ErrFailed reports a recorder whose earlier permanent failure is sticky.
+	ErrFailed = errors.New("teleop/audit: recorder failed")
+	// ErrUnverified reports a stream without an integrity chain.
+	ErrUnverified = errors.New("teleop/audit: stream is not hash chained")
+	// ErrUnauthenticated reports a stream without an HMAC chain when one was
+	// required.
+	ErrUnauthenticated = errors.New("teleop/audit: stream is not HMAC authenticated")
+	// ErrAuthenticationRequired reports an HMAC stream read without its key.
 	ErrAuthenticationRequired = errors.New("teleop/audit: HMAC key required")
-	ErrIncomplete             = errors.New("teleop/audit: stream is incomplete")
-	ErrRecordTooLarge         = errors.New("teleop/audit: record too large")
+	// ErrIncomplete reports a missing footer or torn final record.
+	ErrIncomplete = errors.New("teleop/audit: stream is incomplete")
+	// ErrRecordTooLarge reports a JSON Lines record larger than MaxRecordSize.
+	ErrRecordTooLarge = errors.New("teleop/audit: record too large")
+	// ErrSessionRequired reports an event or checkpoint that cannot be bound to
+	// a non-zero controller session.
+	ErrSessionRequired = errors.New("teleop/audit: controller session is required")
 	// ErrTreeMismatch reports a checkpoint whose Merkle head does not match
 	// the records that precede it.
 	ErrTreeMismatch = errors.New("teleop/audit: merkle head does not match records")
+	// ErrPendingLimit reports that events awaiting a required signed tree head
+	// exceed VerifyOptions.MaxPendingBytes.
+	ErrPendingLimit = errors.New("teleop/audit: pending signature buffer limit exceeded")
 )
 
 const (
@@ -58,22 +75,34 @@ const (
 	chainHMAC   = "hmac-sha256"
 )
 
-// Options configures the audit writer.
+// Options configures a Recorder. Applications normally use the With functions
+// rather than constructing Options directly.
 type Options struct {
-	HashChain       bool
+	// HashChain enables the default SHA-256 integrity chain.
+	HashChain bool
+	// FlushEveryEvent flushes and, when supported, syncs each record.
 	FlushEveryEvent bool
-	HMACKey         []byte
-	Now             func() time.Time
+	// HMACKey selects HMAC-SHA-256 instead of an unkeyed chain.
+	HMACKey []byte
+	// Now supplies record timestamps.
+	Now func() time.Time
 
-	Signer             crypto.Signer
-	Anchor             Anchor
-	AnchorTimeout      time.Duration
-	AnchorQueue        int
+	// Signer signs tree heads and must expose an Ed25519 public key.
+	Signer crypto.Signer
+	// Anchor receives tree heads for publication outside the log's custody.
+	Anchor Anchor
+	// AnchorTimeout bounds each asynchronous publication.
+	AnchorTimeout time.Duration
+	// AnchorQueue is the number of pending publications retained.
+	AnchorQueue int
+	// CheckpointInterval and CheckpointEvery bound the gap between tree heads.
 	CheckpointInterval time.Duration
 	CheckpointEvery    uint64
-	Provenance         *Provenance
+	// Provenance describes the build and operating context.
+	Provenance *Provenance
 }
 
+// Option configures a Recorder.
 type Option func(*Options)
 
 // WithHashChain disables or enables integrity chaining. ReadAll rejects
@@ -90,7 +119,9 @@ func WithFlushEveryEvent(enabled bool) Option {
 }
 
 // WithHMAC authenticates the chain with HMAC-SHA-256. The key is copied; an
-// empty key is rejected on the first Record or Close.
+// empty key is rejected on the first Record or Close. Use a high-entropy key
+// generated by a cryptographically secure source; 32 random bytes retain the
+// full security strength of SHA-256.
 func WithHMAC(key []byte) Option {
 	return func(options *Options) {
 		options.HMACKey = make([]byte, len(key))
@@ -109,13 +140,14 @@ func WithClock(now func() time.Time) Option {
 }
 
 // WithSigner signs the manifest, every checkpoint, and the footer with an
-// Ed25519 key, giving the log non-repudiation that an HMAC chain cannot.
+// Ed25519 key, allowing verification without sharing signing capability.
 // Individual events are not signed: the Merkle tree and hash chain already
 // bind them to the nearest signed head, so per-event signing would add cost
 // without adding evidence.
 //
-// Prefer a crypto.Signer backed by a TPM, Secure Enclave, or HSM. A key the
-// operator can read is a key the operator can be accused of having used.
+// Prefer an Ed25519-capable hardware or remote crypto.Signer whose private key
+// cannot be exported. A key the operator can read is a key the operator can be
+// accused of having used.
 func WithSigner(signer crypto.Signer) Option {
 	return func(options *Options) {
 		if signer != nil {
@@ -133,6 +165,7 @@ func WithAnchor(anchor Anchor) Option {
 	return func(options *Options) {
 		if anchor != nil {
 			options.Anchor = anchor
+			options.HashChain = true
 		}
 	}
 }
@@ -146,9 +179,10 @@ func WithAnchorTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithCheckpoints sets how often a signed tree head is emitted, by elapsed
-// time and by record count. Either bound may be zero to disable it. Frequent
-// checkpoints narrow the window in which a truncation can go unwitnessed.
+// WithCheckpoints sets how often a tree head is emitted, by elapsed time and
+// by record count. WithSigner makes each head signed. Either bound may be zero
+// to disable it. Frequent checkpoints narrow the window in which a truncation
+// can go unwitnessed.
 func WithCheckpoints(interval time.Duration, every uint64) Option {
 	return func(options *Options) {
 		options.CheckpointInterval = interval
@@ -200,39 +234,64 @@ type diskRecord struct {
 	Provenance *Provenance `json:"provenance,omitempty"`
 	// Reason explains why a checkpoint was taken.
 	Reason string `json:"reason,omitempty"`
+
+	// provenanceRaw retains the exact authenticated wire representation during
+	// verification. It is unset while recording, where Provenance is marshaled
+	// directly into the hash input.
+	provenanceRaw json.RawMessage
 }
 
-// Record is the decoded, implementation-neutral event representation.
+// Record is the decoded, implementation-neutral representation of a verified
+// event record.
 type Record struct {
-	Version       int
-	RecordedAt    time.Time
-	Kind          teleop.EventKind
-	Header        teleop.Header
-	Payload       json.RawMessage
-	PreviousHash  string
-	Hash          string
+	// Version is the audit wire-format version.
+	Version int
+	// RecordedAt is when the recorder persisted the event.
+	RecordedAt time.Time
+	// Kind and Header identify the persisted event.
+	Kind   teleop.EventKind
+	Header teleop.Header
+	// Payload is an isolated copy of the original event JSON.
+	Payload json.RawMessage
+	// PreviousHash and Hash are the encoded chain links.
+	PreviousHash string
+	Hash         string
+	// EncodingError explains why Payload contains only the event header.
 	EncodingError string
 }
 
 // Verification describes what was actually verified.
 type Verification struct {
-	Version       int
-	Chain         string
-	Integrity     bool
+	// Version is the stream's wire-format version.
+	Version int
+	// Chain names the integrity mechanism declared by the manifest.
+	Chain string
+	// Integrity reports a successfully verified SHA-256 or HMAC chain.
+	Integrity bool
+	// Authenticated reports a successfully verified HMAC chain.
 	Authenticated bool
-	Complete      bool
-	EventCount    uint64
-	Durability    string
+	// Complete reports that a valid footer terminated the stream.
+	Complete bool
+	// EventCount is the number of event records read.
+	EventCount uint64
+	// Durability is the recorder policy declared by the manifest.
+	Durability string
 
-	// Signed reports that every signed record verified against the public key
-	// the log itself declares. On its own this shows internal consistency, not
-	// identity: a forger who replaces the whole log can also replace the
-	// declared key.
+	// Signed reports that every record read is covered by a tree head verified
+	// against the public key the log itself declares. On its own this shows
+	// internal consistency, not identity: a forger who replaces the whole log
+	// can also replace the declared key.
 	Signed bool
-	// Trusted reports that signatures verified against a key the caller
-	// supplied out of band. This is the property that carries evidentiary
-	// weight.
+	// Trusted reports that every record read is covered by a tree head verified
+	// against a key the caller supplied out of band. This is the property that
+	// carries evidentiary weight.
 	Trusted bool
+	// SignedTreeSize is the number of leading records covered by the latest
+	// tree head verified against the log's declared key.
+	SignedTreeSize uint64
+	// TrustedTreeSize is the number of leading records covered by the latest
+	// tree head verified against PublicKey from VerifyOptions.
+	TrustedTreeSize uint64
 	// KeyID and PublicKey identify the declared signing key.
 	KeyID     string
 	PublicKey ed25519.PublicKey
@@ -251,16 +310,28 @@ type Verification struct {
 
 // VerifyOptions configures streaming verification.
 type VerifyOptions struct {
-	RequireFooter         bool
-	AllowUnverified       bool
+	// RequireFooter rejects an interrupted or still-open stream.
+	RequireFooter bool
+	// AllowUnverified permits a stream that explicitly declares no hash chain.
+	AllowUnverified bool
+	// RequireAuthentication rejects non-HMAC chains.
 	RequireAuthentication bool
-	HMACKey               []byte
+	// HMACKey authenticates an HMAC-SHA-256 chain.
+	HMACKey []byte
 
-	// PublicKey is the signing key the verifier trusts. When set, the log's
-	// declared key must match it and every signature must verify against it.
+	// PublicKey is the signing key the verifier trusts. Setting it requires a
+	// version 3 signed stream, makes RequireSignature implicit, and withholds
+	// events from consume until a signed tree head covers them.
 	PublicKey ed25519.PublicKey
-	// RequireSignature rejects a log that carries no signatures.
+	// RequireSignature requires every returned or consumed event to be covered
+	// by a version 3 signed tree head. Without PublicKey, the key declared by the
+	// log proves internal consistency but not signer identity.
 	RequireSignature bool
+	// MaxPendingBytes bounds encoded event data withheld from consume while
+	// waiting for a required signed tree head. Zero selects
+	// DefaultMaxPendingBytes. Increase it only when a valid recorder is
+	// intentionally configured with larger gaps between checkpoints.
+	MaxPendingBytes uint64
 }
 
 // Recorder is a concurrency-safe, sticky-failure audit sink.
@@ -286,6 +357,9 @@ type Recorder struct {
 	checkpointsRecorded uint64
 }
 
+// NewRecorder returns an audit recorder that writes to writer. The default
+// SHA-256 chain detects accidental corruption but is not authentic; use
+// WithHMAC or WithSigner for an adversarial setting.
 func NewRecorder(writer io.Writer, options ...Option) *Recorder {
 	configured := Options{
 		HashChain:          true,
@@ -298,6 +372,21 @@ func NewRecorder(writer io.Writer, options ...Option) *Recorder {
 		if option != nil {
 			option(&configured)
 		}
+	}
+	if configured.HMACKey != nil {
+		key := make([]byte, len(configured.HMACKey))
+		copy(key, configured.HMACKey)
+		configured.HMACKey = key
+	}
+	if configured.Provenance != nil {
+		provenance := configured.Provenance.Clone()
+		configured.Provenance = &provenance
+	}
+	if configured.Signer != nil || configured.Anchor != nil {
+		// A signature or external anchor over an empty chain/tree cannot commit
+		// to events. Preserve this invariant regardless of option order or
+		// custom Options.
+		configured.HashChain = true
 	}
 	if configured.Now == nil {
 		configured.Now = time.Now
@@ -331,7 +420,7 @@ func (r *Recorder) PublicKey() ed25519.PublicKey {
 	if r.key == nil {
 		return nil
 	}
-	return r.key.public
+	return append(ed25519.PublicKey(nil), r.key.public...)
 }
 
 // AnchorStats reports external anchoring health. Non-zero Failed or Dropped
@@ -343,9 +432,11 @@ func (r *Recorder) AnchorStats() AnchorStats {
 	return r.anchors.stats()
 }
 
-// Checkpoint forces a signed tree head immediately. Callers should invoke it
-// at moments worth being able to prove later, such as arming, an emergency
-// stop, or a handover between operators.
+// Checkpoint forces a tree head immediately; WithSigner makes it signed.
+// Callers should invoke it at moments worth being able to prove later, such as
+// arming, an emergency stop, or a handover between operators. It returns
+// ErrSessionRequired until the first event binds the recorder to a controller
+// session.
 func (r *Recorder) Checkpoint(reason string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -354,6 +445,9 @@ func (r *Recorder) Checkpoint(reason string) error {
 	}
 	if r.failure != nil {
 		return errors.Join(ErrFailed, r.failure)
+	}
+	if !r.started {
+		return ErrSessionRequired
 	}
 	if err := r.startLocked(); err != nil {
 		return r.failLocked(err)
@@ -366,7 +460,7 @@ func (r *Recorder) Checkpoint(reason string) error {
 
 // Record implements teleop.EventSink. An event that JSON cannot represent is
 // retained as an encoding-error payload rather than terminating controller
-// input.
+// input. A zero session or a change of session permanently fails the recorder.
 func (r *Recorder) Record(ctx context.Context, event teleop.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -391,10 +485,15 @@ func (r *Recorder) Record(ctx context.Context, event teleop.Event) error {
 	if r.failure != nil {
 		return errors.Join(ErrFailed, r.failure)
 	}
+	if header.ID.Session == (teleop.SessionID{}) {
+		return r.failLocked(ErrSessionRequired)
+	}
 	// Bind the session before the manifest is written so a signed manifest
 	// cannot be transplanted onto a different session's records.
 	if !r.started {
 		r.session = header.ID.Session
+	} else if header.ID.Session != r.session {
+		return r.failLocked(errors.New("teleop/audit: event session changed"))
 	}
 	if err := r.startLocked(); err != nil {
 		return r.failLocked(err)
@@ -431,7 +530,7 @@ func (r *Recorder) checkpointDueLocked(now time.Time) bool {
 	return false
 }
 
-// checkpointLocked writes a signed tree head covering every record before it.
+// checkpointLocked writes a tree head covering every record before it.
 func (r *Recorder) checkpointLocked(reason string) error {
 	checkpoint := diskRecord{
 		Version:    FormatVersion,
@@ -455,6 +554,8 @@ func (r *Recorder) publishAnchorLocked(record diskRecord) {
 		return
 	}
 	checkpoint := Checkpoint{
+		Version:    record.Version,
+		RecordType: record.RecordType,
 		Session:    r.session,
 		Size:       record.TreeSize,
 		Root:       record.TreeRoot,
@@ -464,6 +565,7 @@ func (r *Recorder) publishAnchorLocked(record diskRecord) {
 		Signature:  record.Signature,
 	}
 	if r.key != nil {
+		checkpoint.SignatureAlgorithm = SignatureAlgorithmEd25519
 		checkpoint.KeyID = r.key.id
 		checkpoint.PublicKey = hex.EncodeToString(r.key.public)
 	}
@@ -497,6 +599,7 @@ func (r *Recorder) Close() error {
 		return nil
 	}
 	r.closed = true
+	defer r.clearKeyMaterialLocked()
 	// Stop anchoring on every exit path, including failures, so a failed
 	// Close cannot leak the publisher goroutine.
 	defer func() {
@@ -646,7 +749,19 @@ func (r *Recorder) failLocked(err error) error {
 	if r.failure == nil {
 		r.failure = err
 	}
+	r.clearKeyMaterialLocked()
 	return errors.Join(ErrFailed, r.failure)
+}
+
+func (r *Recorder) clearKeyMaterialLocked() {
+	clear(r.options.HMACKey)
+	r.options.HMACKey = nil
+	r.options.Signer = nil
+	if r.key != nil {
+		// Retain the public identity for PublicKey while releasing the private
+		// signer reference.
+		r.key.signer = nil
+	}
 }
 
 func (r *Recorder) flushAndSync() error {
@@ -661,29 +776,62 @@ func (r *Recorder) flushAndSync() error {
 	return nil
 }
 
-// ReadAll decodes and verifies a complete, chained stream.
+// ReadAll decodes and verifies a complete, hash-chained stream. It establishes
+// integrity, not signer identity; use ReadTrusted or ReadAuthenticated when
+// authenticity is required.
 func ReadAll(reader io.Reader) ([]Record, error) {
 	records, _, err := Read(reader, VerifyOptions{RequireFooter: true})
 	return records, err
 }
 
-// ReadAuthenticated verifies a complete HMAC stream with key.
+// ReadAuthenticated verifies a complete HMAC stream with key. The caller must
+// obtain and protect key outside the log.
 func ReadAuthenticated(reader io.Reader, key []byte) ([]Record, Verification, error) {
 	return Read(reader, VerifyOptions{
 		RequireFooter:         true,
 		RequireAuthentication: true,
-		HMACKey:               append([]byte(nil), key...),
+		HMACKey:               key,
 	})
 }
 
+// ReadTrusted verifies a complete version 3 stream against a public key
+// obtained outside the log. It rejects unsigned records, unsigned tails,
+// legacy formats, missing footers, and a self-declared replacement key.
+// Streams created with both WithSigner and WithHMAC must instead use Read with
+// both VerifyOptions.PublicKey and VerifyOptions.HMACKey.
+func ReadTrusted(
+	reader io.Reader,
+	public ed25519.PublicKey,
+) ([]Record, Verification, error) {
+	if len(public) != ed25519.PublicKeySize {
+		return nil, Verification{}, fmt.Errorf(
+			"%w: trusted public key is %d bytes",
+			ErrSignature,
+			len(public),
+		)
+	}
+	records, verification, err := Read(reader, VerifyOptions{
+		RequireFooter:    true,
+		RequireSignature: true,
+		PublicKey:        append(ed25519.PublicKey(nil), public...),
+	})
+	if err != nil {
+		return nil, verification, err
+	}
+	return records, verification, nil
+}
+
 // ReadPartial verifies all complete records and permits a missing or torn
-// footer. Valid prefix records are retained when a later record is invalid.
+// footer. Valid integrity-chained prefix records are retained when a later
+// record is invalid. It does not require signature coverage.
 func ReadPartial(reader io.Reader) ([]Record, error) {
 	records, _, err := Read(reader, VerifyOptions{})
 	return records, err
 }
 
-// Read performs streaming verification and accumulates event records.
+// Read verifies reader and accumulates the event records accepted under
+// options. On error, callers must use only the returned prefix whose security
+// properties are explicitly reported by Verification.
 func Read(reader io.Reader, options VerifyOptions) ([]Record, Verification, error) {
 	records := make([]Record, 0)
 	verification, err := Verify(reader, options, func(record Record) error {
@@ -693,27 +841,71 @@ func Read(reader io.Reader, options VerifyOptions) ([]Record, Verification, erro
 	return records, verification, err
 }
 
-// Verify checks a stream incrementally and invokes consume for each verified
-// event, avoiding whole-log memory growth.
+// Verify checks a stream incrementally and invokes consume for each accepted
+// event. When signature verification is required, events are buffered until a
+// verified tree head covers them; an unsigned tail is never passed to consume.
+// Without signature requirements, consume receives integrity-checked events as
+// they are read.
 func Verify(
 	reader io.Reader,
 	options VerifyOptions,
 	consume func(Record) error,
 ) (Verification, error) {
+	signatureRequired := options.RequireSignature || len(options.PublicKey) > 0
+	if len(options.PublicKey) > 0 && len(options.PublicKey) != ed25519.PublicKeySize {
+		return Verification{}, fmt.Errorf(
+			"%w: trusted public key is %d bytes",
+			ErrSignature,
+			len(options.PublicKey),
+		)
+	}
+	options.HMACKey = append([]byte(nil), options.HMACKey...)
+	defer clear(options.HMACKey)
+	options.PublicKey = append(ed25519.PublicKey(nil), options.PublicKey...)
+	maxPendingBytes := options.MaxPendingBytes
+	if maxPendingBytes == 0 {
+		maxPendingBytes = DefaultMaxPendingBytes
+	}
 	buffered := bufio.NewReaderSize(reader, 64*1024)
 	var (
-		verification Verification
-		previous     string
-		lineNumber   int
-		footer       bool
-		legacy       bool
-		seen         = make(map[teleop.EventID]struct{})
-		sequences    = make(map[string]uint64)
-		session      *teleop.SessionID
-		tree         Tree
-		trusted      ed25519.PublicKey
-		headSession  teleop.SessionID
+		verification   Verification
+		previous       string
+		lineNumber     int
+		footer         bool
+		legacy         bool
+		seen           = make(map[teleop.EventID]struct{})
+		sequences      = make(map[string]uint64)
+		session        *teleop.SessionID
+		tree           Tree
+		trusted        ed25519.PublicKey
+		headSession    teleop.SessionID
+		headSessionSet bool
+		signedThrough  uint64
+		trustedThrough uint64
+		pending        []Record
+		pendingBytes   uint64
 	)
+	updateCoverage := func() {
+		verification.SignedTreeSize = signedThrough
+		verification.TrustedTreeSize = trustedThrough
+		verification.Signed = tree.Size() > 0 && signedThrough == tree.Size()
+		verification.Trusted = tree.Size() > 0 &&
+			len(options.PublicKey) > 0 &&
+			trustedThrough == tree.Size()
+	}
+	releasePending := func() error {
+		for _, record := range pending {
+			if consume != nil {
+				if err := consume(record); err != nil {
+					return err
+				}
+			}
+		}
+		clear(pending)
+		pending = pending[:0]
+		pendingBytes = 0
+		return nil
+	}
 	for {
 		line, complete, err := nextLine(buffered)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -729,8 +921,8 @@ func Verify(
 			}
 			break
 		}
-		var disk diskRecord
-		if decodeErr := json.Unmarshal(line, &disk); decodeErr != nil {
+		disk, decodeErr := decodeDiskRecord(line)
+		if decodeErr != nil {
 			return verification, fmt.Errorf("decode audit line %d: %w", lineNumber, decodeErr)
 		}
 		if disk.Version < 1 || disk.Version > FormatVersion {
@@ -743,6 +935,13 @@ func Verify(
 		}
 		if lineNumber == 1 {
 			verification.Version = disk.Version
+			if signatureRequired && disk.Version < 3 {
+				return verification, fmt.Errorf(
+					"%w: format version %d cannot carry signed tree heads",
+					ErrSignatureRequired,
+					disk.Version,
+				)
+			}
 			legacy = disk.Version == 1
 			if legacy {
 				verification.Chain = chainSHA256
@@ -761,6 +960,13 @@ func Verify(
 				verification.Provenance = disk.Provenance
 				if disk.Session != nil {
 					headSession = *disk.Session
+					if headSession == (teleop.SessionID{}) {
+						return verification, fmt.Errorf(
+							"%w: audit line 1 declares a zero controller session",
+							ErrSessionRequired,
+						)
+					}
+					headSessionSet = true
 					verification.Session = headSession
 				}
 				if disk.PublicKey != "" {
@@ -768,8 +974,19 @@ func Verify(
 					if keyErr != nil {
 						return verification, fmt.Errorf("audit line 1: %w", keyErr)
 					}
+					if disk.KeyID == "" || disk.KeyID != KeyID(public) {
+						return verification, fmt.Errorf(
+							"%w: audit line 1 key identifier does not match its public key",
+							ErrUntrustedKey,
+						)
+					}
 					verification.PublicKey = public
 					verification.KeyID = disk.KeyID
+				} else if disk.KeyID != "" {
+					return verification, fmt.Errorf(
+						"%w: audit line 1 declares a key identifier without a public key",
+						ErrUntrustedKey,
+					)
 				}
 			}
 			if options.RequireAuthentication && verification.Chain != chainHMAC {
@@ -798,7 +1015,13 @@ func Verify(
 			} else if verification.PublicKey != nil {
 				trusted = verification.PublicKey
 			}
-			if options.RequireSignature && trusted == nil {
+			if verification.PublicKey != nil && verification.Chain == chainNone {
+				return verification, fmt.Errorf(
+					"%w: a signed stream requires an integrity chain",
+					ErrSignature,
+				)
+			}
+			if signatureRequired && trusted == nil {
 				return verification, ErrSignatureRequired
 			}
 		} else if disk.Version != verification.Version {
@@ -849,6 +1072,15 @@ func Verify(
 		// the tree, is what detects a log whose prefix was rewritten or whose
 		// middle records were removed.
 		head := disk.RecordType != "event"
+		headVerified := false
+		if head && disk.Version >= 3 && trusted == nil && disk.Signature != "" {
+			return verification, fmt.Errorf(
+				"%w: %s at audit line %d has a signature but no declared public key",
+				ErrSignature,
+				disk.RecordType,
+				lineNumber,
+			)
+		}
 		if head && disk.Version >= 3 && verification.Chain != chainNone {
 			if disk.TreeSize != tree.Size() {
 				return verification, fmt.Errorf(
@@ -896,8 +1128,11 @@ func Verify(
 				if sigErr := VerifyTreeHead(trusted, signed, disk.Signature); sigErr != nil {
 					return verification, fmt.Errorf("audit line %d: %w", lineNumber, sigErr)
 				}
-				verification.Signed = true
-				verification.Trusted = len(options.PublicKey) > 0
+				headVerified = true
+				signedThrough = tree.Size() + 1
+				if len(options.PublicKey) > 0 {
+					trustedThrough = tree.Size() + 1
+				}
 			}
 		}
 		if disk.Version >= 3 && verification.Chain != chainNone {
@@ -911,12 +1146,18 @@ func Verify(
 			}
 			tree.Append(HashLeaf(raw))
 			verification.TreeSize = tree.Size()
+			updateCoverage()
 		}
 
 		switch disk.RecordType {
 		case "manifest":
 			if legacy || lineNumber != 1 {
 				return verification, fmt.Errorf("audit line %d: misplaced manifest", lineNumber)
+			}
+			if signatureRequired && headVerified {
+				if err := releasePending(); err != nil {
+					return verification, err
+				}
 			}
 			continue
 		case "checkpoint":
@@ -935,6 +1176,11 @@ func Verify(
 				)
 			}
 			verification.Checkpoints++
+			if signatureRequired && headVerified {
+				if err := releasePending(); err != nil {
+					return verification, err
+				}
+			}
 			continue
 		case "footer":
 			if disk.EventCount != verification.EventCount {
@@ -947,6 +1193,11 @@ func Verify(
 			}
 			footer = true
 			verification.Complete = true
+			if signatureRequired && headVerified {
+				if err := releasePending(); err != nil {
+					return verification, err
+				}
+			}
 			continue
 		case "event":
 		default:
@@ -964,9 +1215,26 @@ func Verify(
 		if headerErr != nil {
 			return verification, fmt.Errorf("audit line %d: %w", lineNumber, headerErr)
 		}
+		if disk.Version >= 3 {
+			if !headSessionSet {
+				return verification, fmt.Errorf(
+					"%w: audit line 1 does not bind a controller session",
+					ErrSessionRequired,
+				)
+			}
+			if header.ID.Session != headSession {
+				return verification, fmt.Errorf(
+					"audit line %d: event session does not match manifest",
+					lineNumber,
+				)
+			}
+		}
 		if session == nil {
 			value := header.ID.Session
 			session = &value
+			if verification.Session == (teleop.SessionID{}) {
+				verification.Session = value
+			}
 		} else if header.ID.Session != *session {
 			return verification, fmt.Errorf("audit line %d: session changed within stream", lineNumber)
 		}
@@ -1008,7 +1276,21 @@ func Verify(
 			Hash:          disk.Hash,
 			EncodingError: encodingError,
 		}
-		if consume != nil {
+		if signatureRequired {
+			if consume != nil {
+				recordBytes := uint64(len(line))
+				if recordBytes > maxPendingBytes ||
+					pendingBytes > maxPendingBytes-recordBytes {
+					return verification, fmt.Errorf(
+						"%w: more than %d bytes await a signed tree head",
+						ErrPendingLimit,
+						maxPendingBytes,
+					)
+				}
+				pendingBytes += recordBytes
+				pending = append(pending, record)
+			}
+		} else if consume != nil {
 			if consumeErr := consume(record); consumeErr != nil {
 				return verification, consumeErr
 			}
@@ -1025,8 +1307,13 @@ func Verify(
 	verification.Authenticated = verification.Chain == chainHMAC
 	verification.TreeSize = tree.Size()
 	verification.TreeRoot = tree.Root()
-	if options.RequireSignature && !verification.Signed {
-		return verification, fmt.Errorf("%w: no signed tree head", ErrSignatureRequired)
+	updateCoverage()
+	if signatureRequired && !verification.Signed {
+		return verification, fmt.Errorf(
+			"%w: %d trailing record(s) are not covered by a signed tree head",
+			ErrSignatureRequired,
+			tree.Size()-signedThrough,
+		)
 	}
 	return verification, nil
 }
@@ -1140,7 +1427,9 @@ func recordHashV3(record diskRecord, chain string, key []byte) (string, error) {
 	writeHashField(digest, []byte(record.Reason))
 
 	var provenance []byte
-	if record.Provenance != nil {
+	if record.provenanceRaw != nil {
+		provenance = record.provenanceRaw
+	} else if record.Provenance != nil {
 		// encoding/json sorts map keys, so this encoding is deterministic.
 		encoded, marshalErr := json.Marshal(record.Provenance)
 		if marshalErr != nil {

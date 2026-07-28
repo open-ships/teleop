@@ -3,6 +3,8 @@ package audit
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"testing"
 	"time"
 )
@@ -27,7 +29,44 @@ func encodeLegacy(t *testing.T, records []diskRecord, hashFor func(diskRecord) (
 		}
 		record.Hash = digest
 		previous = digest
-		encoded, err := json.Marshal(record)
+		wire := map[string]any{
+			"version":       record.Version,
+			"record_type":   record.RecordType,
+			"recorded_at":   record.RecordedAt,
+			"previous_hash": record.PreviousHash,
+			"hash":          record.Hash,
+		}
+		if record.Kind != "" {
+			wire["kind"] = record.Kind
+		}
+		if record.Header != nil {
+			wire["header"] = record.Header
+		}
+		if len(record.Payload) > 0 {
+			wire["payload"] = record.Payload
+		}
+		if record.EventCount > 0 {
+			wire["event_count"] = record.EventCount
+		}
+		if record.Version == 2 {
+			if record.Chain != "" {
+				wire["chain"] = record.Chain
+			}
+			if record.ControlSchema != "" {
+				wire["control_schema"] = record.ControlSchema
+			}
+			if record.Durability != "" {
+				wire["durability"] = record.Durability
+			}
+			if record.EncodingError != "" {
+				wire["encoding_error"] = record.EncodingError
+			}
+			delete(wire, "header")
+		}
+		if record.PreviousHash == "" {
+			delete(wire, "previous_hash")
+		}
+		encoded, err := json.Marshal(wire)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -35,6 +74,91 @@ func encodeLegacy(t *testing.T, records []diskRecord, hashFor func(diskRecord) (
 		buffer.WriteByte('\n')
 	}
 	return bytes.NewReader(buffer.Bytes())
+}
+
+func TestLegacyVersionCannotSatisfyTrustedVerification(t *testing.T) {
+	recordedAt := time.Unix(1700000000, 0).UTC()
+	event := testButtonEvent(1)
+	payload, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := event.Meta
+	reader := encodeLegacy(t, []diskRecord{
+		{
+			Version:    1,
+			RecordType: "event",
+			RecordedAt: recordedAt,
+			Kind:       event.Kind(),
+			Header:     &header,
+			Payload:    payload,
+		},
+		{
+			Version:    1,
+			RecordType: "footer",
+			RecordedAt: recordedAt,
+			EventCount: 1,
+		},
+	}, recordHashV1)
+	public, _, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumed := 0
+	_, err = Verify(reader, VerifyOptions{PublicKey: public}, func(Record) error {
+		consumed++
+		return nil
+	})
+	if !errors.Is(err, ErrSignatureRequired) {
+		t.Fatalf("err = %v, want ErrSignatureRequired", err)
+	}
+	if consumed != 0 {
+		t.Fatalf("consumed %d legacy events during trusted verification", consumed)
+	}
+}
+
+func TestVersion2RejectsUnauthenticatedVersion3Metadata(t *testing.T) {
+	recordedAt := time.Unix(1700000000, 0).UTC()
+	key := bytes.Repeat([]byte{0x42}, 32)
+	reader := encodeLegacy(t, []diskRecord{
+		{
+			Version:       2,
+			RecordType:    "manifest",
+			RecordedAt:    recordedAt,
+			Chain:         chainHMAC,
+			ControlSchema: ControlSchemaVersion,
+			Durability:    "fsync-every-record",
+		},
+		{
+			Version:    2,
+			RecordType: "footer",
+			RecordedAt: recordedAt,
+		},
+	}, func(record diskRecord) (string, error) {
+		return recordHashV2(record, chainHMAC, key)
+	})
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := splitLines(t, raw)
+	var manifest map[string]any
+	if err := json.Unmarshal(lines[0], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	// Version 2 never authenticated provenance. A permissive decoder would
+	// expose this injected value while still reporting the HMAC chain valid.
+	manifest["provenance"] = map[string]any{"operator": "injected"}
+	lines[0], err = json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, verification, err := ReadAuthenticated(joinLines(lines), key)
+	if err == nil {
+		t.Fatalf("smuggled v3 metadata authenticated: %+v", verification)
+	}
 }
 
 func TestVersion2StreamsRemainReadable(t *testing.T) {

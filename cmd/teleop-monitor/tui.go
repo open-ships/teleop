@@ -535,23 +535,3 @@ func eventSummary(event teleop.Event) string {
 		return string(event.Kind())
 	}
 }
-
-func dpad(value teleop.DPad) string {
-	var directions []string
-	if value.Up {
-		directions = append(directions, "up")
-	}
-	if value.Down {
-		directions = append(directions, "down")
-	}
-	if value.Left {
-		directions = append(directions, "left")
-	}
-	if value.Right {
-		directions = append(directions, "right")
-	}
-	if len(directions) == 0 {
-		return "center"
-	}
-	return strings.Join(directions, "+")
-}

@@ -5,6 +5,7 @@ package teleop
 type ControllerType string
 
 const (
+	// ControllerXbox identifies the built-in Xbox-compatible provider family.
 	ControllerXbox ControllerType = "xbox"
 )
 
@@ -13,17 +14,24 @@ const (
 type Transport string
 
 const (
-	TransportUnknown      Transport = "unknown"
-	TransportBluetooth    Transport = "bluetooth"
-	TransportUSB          Transport = "usb"
+	// TransportUnknown means the backend cannot determine the connection.
+	TransportUnknown Transport = "unknown"
+	// TransportBluetooth identifies a Bluetooth connection.
+	TransportBluetooth Transport = "bluetooth"
+	// TransportUSB identifies a USB connection.
+	TransportUSB Transport = "usb"
+	// TransportXboxWireless identifies Microsoft's proprietary wireless link.
 	TransportXboxWireless Transport = "xbox-wireless"
-	TransportVirtual      Transport = "virtual"
+	// TransportVirtual identifies a synthetic or replay device.
+	TransportVirtual Transport = "virtual"
 )
 
 // ControlID names a physical control by position rather than by the label
 // printed by a particular controller manufacturer.
 type ControlID string
 
+// Standard control identifiers name physical positions independently of the
+// labels printed by a controller manufacturer.
 const (
 	ButtonFaceSouth ControlID = "button.face.south"
 	ButtonFaceEast  ControlID = "button.face.east"
@@ -84,26 +92,38 @@ func StandardButtonIDs() []ControlID {
 	return append([]ControlID(nil), standardButtons...)
 }
 
+// StickID selects one of the two standard analog sticks.
 type StickID string
 
 const (
-	LeftStick  StickID = "left"
+	// LeftStick selects the left analog stick.
+	LeftStick StickID = "left"
+	// RightStick selects the right analog stick.
 	RightStick StickID = "right"
 )
 
+// TriggerID selects one of the two standard analog triggers.
 type TriggerID string
 
 const (
-	LeftTrigger  TriggerID = "left"
+	// LeftTrigger selects the left analog trigger.
+	LeftTrigger TriggerID = "left"
+	// RightTrigger selects the right analog trigger.
 	RightTrigger TriggerID = "right"
 )
 
+// Phase describes an event edge or lifecycle transition.
 type Phase string
 
 const (
-	PhasePressed  Phase = "pressed"
+	// PhasePressed reports a digital press edge.
+	PhasePressed Phase = "pressed"
+	// PhaseReleased reports a digital release edge.
 	PhaseReleased Phase = "released"
-	PhaseChanged  Phase = "changed"
-	PhaseStarted  Phase = "started"
-	PhaseEnded    Phase = "ended"
+	// PhaseChanged reports an analog value change.
+	PhaseChanged Phase = "changed"
+	// PhaseStarted reports the start of a stateful derived event.
+	PhaseStarted Phase = "started"
+	// PhaseEnded reports the end of a stateful derived event.
+	PhaseEnded Phase = "ended"
 )

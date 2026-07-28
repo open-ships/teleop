@@ -47,7 +47,11 @@ func TestDevNullIsNotATerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close %s: %v", os.DevNull, err)
+		}
+	})
 	if isTerminal(int(file.Fd())) {
 		t.Fatal("os.DevNull was classified as a terminal")
 	}

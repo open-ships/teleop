@@ -17,15 +17,20 @@ import (
 )
 
 // A hash chain establishes integrity and an HMAC chain establishes
-// authenticity, but neither establishes non-repudiation: the party that
-// verifies an HMAC holds the same key that could have produced it, so a log
-// operator cannot use one to demonstrate that they did not author its
-// contents. An asymmetric signature separates those roles. Backing the private
-// key with a TPM, Secure Enclave, or PKCS#11 HSM further prevents the operator
-// from extracting it, which is what makes a signed log evidence about a device
-// rather than about whoever held a key.
+// authenticity, but an HMAC cannot provide third-party attribution: its
+// verifier holds the same key that could have produced it. An asymmetric
+// signature separates the writing and verification roles. When the public key
+// is bound to a device through trusted provisioning and the private key's
+// lifecycle is controlled, an Ed25519-capable hardware or remote signer can
+// support evidence about that device rather than merely about possession of an
+// exportable key.
 
-const signatureDomain = "teleop.audit.sth.v1"
+const (
+	signatureDomain = "teleop.audit.sth.v1"
+	// SignatureAlgorithmEd25519 identifies Ed25519 signatures in published
+	// checkpoints.
+	SignatureAlgorithmEd25519 = "ed25519"
+)
 
 var (
 	// ErrSignature reports a missing, malformed, or invalid signature.
@@ -38,8 +43,8 @@ var (
 )
 
 // GenerateKey creates an Ed25519 signing key. Production deployments should
-// prefer a crypto.Signer backed by hardware so the private key cannot be
-// exported; this exists for tests and for development logs.
+// prefer an Ed25519-capable hardware or remote crypto.Signer so the private key
+// cannot be exported; this exists for tests and for development logs.
 func GenerateKey() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -48,7 +53,9 @@ func GenerateKey() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	return public, private, nil
 }
 
-// KeyID returns the stable short identifier recorded alongside a signature.
+// KeyID returns the stable short display identifier recorded alongside a
+// signature. It is not a trust anchor; security decisions must compare the
+// complete public key obtained through a trusted channel.
 func KeyID(public ed25519.PublicKey) string {
 	sum := sha256.Sum256(public)
 	return hex.EncodeToString(sum[:8])
@@ -73,6 +80,14 @@ func newSigningKey(signer crypto.Signer) (*signingKey, error) {
 			signer.Public(),
 		)
 	}
+	if len(public) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf(
+			"%w: signer public key is %d bytes",
+			ErrSignature,
+			len(public),
+		)
+	}
+	public = append(ed25519.PublicKey(nil), public...)
 	return &signingKey{signer: signer, public: public, id: KeyID(public)}, nil
 }
 
@@ -83,6 +98,13 @@ func (k *signingKey) sign(message []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("sign audit record: %w", err)
 	}
+	if len(signature) != ed25519.SignatureSize {
+		return "", fmt.Errorf(
+			"%w: signer returned a %d-byte signature",
+			ErrSignature,
+			len(signature),
+		)
+	}
 	return hex.EncodeToString(signature), nil
 }
 
@@ -91,13 +113,19 @@ func (k *signingKey) sign(message []byte) (string, error) {
 // from one record and replayed onto another, and that a signed head commits to
 // every record beneath it.
 type TreeHead struct {
+	// Version and RecordType select the signed statement format.
 	Version    int
 	RecordType string
-	Session    teleop.SessionID
-	Size       uint64
-	Root       []byte
-	ChainHead  string
+	// Session binds the statement to one controller session.
+	Session teleop.SessionID
+	// Size and Root are the Merkle head over preceding records.
+	Size uint64
+	Root []byte
+	// ChainHead is the hash of the head record itself.
+	ChainHead string
+	// EventCount is the number of events committed by the statement.
 	EventCount uint64
+	// RecordedAt is the head record's timestamp.
 	RecordedAt time.Time
 }
 

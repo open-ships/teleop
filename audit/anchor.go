@@ -2,6 +2,8 @@ package audit
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,19 +21,110 @@ import (
 // produce a consistency proof against its last published head has been
 // rewritten, and a missing log whose head was published is provably missing.
 
-// Checkpoint is a signed tree head suitable for publication outside the log.
-// It is 32 bytes of root plus metadata, so anchoring is cheap enough to run
-// continuously.
+// Checkpoint is a self-describing tree head suitable for publication outside
+// the log. A recorder configured with WithSigner populates its key and
+// signature fields. Use VerifyCheckpoint with an independently trusted public
+// key before relying on a signed checkpoint.
 type Checkpoint struct {
-	Session    teleop.SessionID `json:"session"`
-	Size       uint64           `json:"size"`
-	Root       string           `json:"root"`
-	ChainHead  string           `json:"chain_head"`
-	EventCount uint64           `json:"event_count"`
-	RecordedAt time.Time        `json:"recorded_at"`
-	KeyID      string           `json:"key_id,omitempty"`
-	PublicKey  string           `json:"public_key,omitempty"`
-	Signature  string           `json:"signature,omitempty"`
+	// Version and RecordType select the signed statement format.
+	Version    int    `json:"version"`
+	RecordType string `json:"record_type"`
+	// SignatureAlgorithm identifies how Signature was produced.
+	SignatureAlgorithm string `json:"signature_algorithm,omitempty"`
+	// Session binds the head to one controller session.
+	Session teleop.SessionID `json:"session"`
+	// Size and Root are the Merkle head over records preceding this head.
+	Size uint64 `json:"size"`
+	Root string `json:"root"`
+	// ChainHead is the hash of the manifest, checkpoint, or footer itself.
+	ChainHead string `json:"chain_head"`
+	// EventCount is the number of events committed by this head.
+	EventCount uint64 `json:"event_count"`
+	// RecordedAt is the recorder timestamp included in the signature.
+	RecordedAt time.Time `json:"recorded_at"`
+	// KeyID and PublicKey identify the self-declared signer. Verifiers must not
+	// use them as the source of trust.
+	KeyID     string `json:"key_id,omitempty"`
+	PublicKey string `json:"public_key,omitempty"`
+	// Signature is the hex-encoded detached signature over the tree head.
+	Signature string `json:"signature,omitempty"`
+}
+
+// VerifyCheckpoint verifies checkpoint against public, which must be obtained
+// outside the checkpoint. It also rejects a conflicting self-declared key or
+// key identifier.
+func VerifyCheckpoint(public ed25519.PublicKey, checkpoint Checkpoint) error {
+	if len(public) != ed25519.PublicKeySize {
+		return fmt.Errorf("%w: public key is %d bytes", ErrSignature, len(public))
+	}
+	if checkpoint.Version != FormatVersion {
+		return fmt.Errorf(
+			"%w: checkpoint format version is %d, want %d",
+			ErrSignature,
+			checkpoint.Version,
+			FormatVersion,
+		)
+	}
+	switch checkpoint.RecordType {
+	case "manifest", "checkpoint", "footer":
+	default:
+		return fmt.Errorf(
+			"%w: checkpoint record type %q is invalid",
+			ErrSignature,
+			checkpoint.RecordType,
+		)
+	}
+	if checkpoint.Session == (teleop.SessionID{}) &&
+		(checkpoint.RecordType == "checkpoint" || checkpoint.EventCount > 0) {
+		return fmt.Errorf("%w: checkpoint has no controller session", ErrSessionRequired)
+	}
+	if checkpoint.SignatureAlgorithm != SignatureAlgorithmEd25519 {
+		return fmt.Errorf(
+			"%w: checkpoint signature algorithm %q is unsupported",
+			ErrSignature,
+			checkpoint.SignatureAlgorithm,
+		)
+	}
+	if checkpoint.PublicKey != "" {
+		declared, err := decodePublicKey(checkpoint.PublicKey)
+		if err != nil {
+			return err
+		}
+		if !declared.Equal(public) {
+			return ErrUntrustedKey
+		}
+	}
+	if checkpoint.KeyID != "" && checkpoint.KeyID != KeyID(public) {
+		return fmt.Errorf("%w: checkpoint key identifier does not match", ErrUntrustedKey)
+	}
+	root, err := hex.DecodeString(checkpoint.Root)
+	if err != nil {
+		return fmt.Errorf("%w: decode checkpoint root: %v", ErrSignature, err)
+	}
+	if len(root) != HashSize {
+		return fmt.Errorf("%w: checkpoint root is %d bytes", ErrSignature, len(root))
+	}
+	chainHead, err := hex.DecodeString(checkpoint.ChainHead)
+	if err != nil {
+		return fmt.Errorf("%w: decode checkpoint chain head: %v", ErrSignature, err)
+	}
+	if len(chainHead) != HashSize {
+		return fmt.Errorf(
+			"%w: checkpoint chain head is %d bytes",
+			ErrSignature,
+			len(chainHead),
+		)
+	}
+	return VerifyTreeHead(public, TreeHead{
+		Version:    checkpoint.Version,
+		RecordType: checkpoint.RecordType,
+		Session:    checkpoint.Session,
+		Size:       checkpoint.Size,
+		Root:       root,
+		ChainHead:  checkpoint.ChainHead,
+		EventCount: checkpoint.EventCount,
+		RecordedAt: checkpoint.RecordedAt,
+	}, checkpoint.Signature)
 }
 
 // Anchor publishes checkpoints to append-only storage outside the recorder's
@@ -177,8 +270,12 @@ func (r *anchorRunner) stats() AnchorStats {
 // count means the log's recent heads are not externally witnessed, so recent
 // records are integrity protected but not protected against destruction.
 type AnchorStats struct {
+	// Published is the number of heads successfully sent.
 	Published uint64
-	Failed    uint64
-	Dropped   uint64
-	Err       error
+	// Failed is the number of attempted publications that returned errors.
+	Failed uint64
+	// Dropped is the number evicted from a saturated queue.
+	Dropped uint64
+	// Err is the first publication error observed.
+	Err error
 }

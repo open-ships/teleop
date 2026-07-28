@@ -32,11 +32,12 @@ truncation of a completed stream. Its default unkeyed SHA-256 chain provides
 integrity against corruption, not authenticity: an attacker able to rewrite
 the file can recompute the entire chain. For adversarial tamper-evidence, create
 the recorder with `audit.WithHMAC(key)` and verify it with
-`audit.ReadAuthenticated(reader, key)`. Keep that key outside the log.
+`audit.ReadAuthenticated(reader, key)`. Generate at least 32 random key bytes
+with a cryptographically secure source and keep them outside the log.
 
 Use `audit.ReadPartial` only when inspecting an interrupted or currently open
-log; it returns only the verified prefix. Unchained streams require the
-explicit unverified read option.
+log; it returns the integrity-checked prefix and does not require signature
+coverage. Unchained streams require the explicit unverified read option.
 
 Audit files contain a single header/footer-delimited stream. Create a unique
 file per session; `O_EXCL` prevents an accidental overwrite. Appending a new
@@ -75,50 +76,80 @@ adding a stronger one does not make a weaker one redundant.
 | --- | --- | --- |
 | Integrity | Was the log edited? | hash chain |
 | Authenticity | Did a holder of the key write it? | `WithHMAC` |
-| Non-repudiation | Can the author deny writing it? | `WithSigner` |
+| Origin authentication | Did the provisioned signing key write it? | `WithSigner` |
 | Existence | Was a log destroyed or truncated? | `WithAnchor` |
 | Disclosure | Can one record be proved without the rest? | Merkle inclusion proof |
 | Reconstruction | What code and configuration interpreted this input? | `WithProvenance` |
 
-## Signing and non-repudiation
+## Signing and origin authentication
 
 An HMAC chain proves that someone holding the key wrote the log. It cannot
 establish who, because the verifier holds the same key that could have produced
 it. `audit.WithSigner` signs the manifest, every checkpoint, and the footer
-with Ed25519, so verification and authorship are separate capabilities:
+with Ed25519, so writing and verification are separate capabilities:
 
 ```go
 recorder := audit.NewRecorder(file, audit.WithSigner(signer))
 ```
 
-`signer` is any `crypto.Signer` with an Ed25519 key. Prefer one backed by a
-TPM, Secure Enclave, or PKCS#11 HSM: a key the operator can export is a key the
-operator can be accused of having used, which is the property signing exists to
-remove.
+`signer` is any `crypto.Signer` with an Ed25519 key. Prefer an
+Ed25519-capable hardware or remote signer whose private key is non-exportable.
+Hardware non-exportability does not by itself establish device identity: bind
+the public key to the device through trusted provisioning and retain the
+key-lifecycle records needed by future verifiers.
 
 Individual events are not signed. The hash chain and Merkle tree already bind
 every event to the nearest signed head, so per-event signatures would add cost
 without adding evidence.
 
-Verification distinguishes two different claims:
+For a completed signed log, prefer the fail-closed helper:
+
+```go
+records, verification, err := audit.ReadTrusted(reader, trustedKey)
+```
+
+`trustedKey` must be obtained outside the log. The equivalent configurable
+call is:
 
 ```go
 records, verification, err := audit.Read(reader, audit.VerifyOptions{
     RequireFooter:    true,
-    RequireSignature: true,
     PublicKey:        trustedKey, // obtained out of band
 })
 ```
 
-- `verification.Signed` means signatures verified against the key the log
-  declares about itself. That is internal consistency only: whoever can rewrite
-  the log can also replace the declared key.
-- `verification.Trusted` means they verified against `PublicKey`, supplied from
-  outside the log. Only this claim carries evidentiary weight.
+- `verification.Signed` means every record read is covered by a tree head
+  verified against the key the log declares about itself. That is internal
+  consistency only: whoever can rewrite the whole log can also replace the
+  declared key.
+- `verification.Trusted` means every record read is covered by a tree head
+  verified against `PublicKey`, supplied from outside the log. Only this claim
+  carries evidentiary weight.
+- `SignedTreeSize` and `TrustedTreeSize` expose the exact prefix covered by the
+  latest verified head.
 
-Omitting `PublicKey` therefore proves much less than supplying it. A mismatch
-between the declared key and the trusted key fails with `ErrUntrustedKey`
-rather than being ignored.
+Setting `PublicKey` makes `RequireSignature` implicit, requires format version
+3, and withholds events from a streaming verifier until a signed checkpoint or
+footer covers them. A mismatch between the declared key and the trusted key
+fails with `ErrUntrustedKey` rather than being ignored.
+
+`KeyID` is only a short display/index label. Never use it alone as a trust
+decision; compare the complete public key or a certificate/attestation bound to
+that key.
+
+The withheld event buffer defaults to 64 MiB so a replayed manifest followed
+by an attacker-controlled unsigned tail cannot cause unbounded memory growth.
+If intentionally large events can exceed that between signed heads, set
+`VerifyOptions.MaxPendingBytes` to a deployment-appropriate bound.
+
+The package uses keys but does not manage their lifecycle. Hardware
+provisioning, trusted public-key distribution, access control, rotation,
+revocation, archival verification, and destruction belong to the deployment's
+key-management system.
+
+If a deployment deliberately combines `WithSigner` and `WithHMAC`, verification
+needs both trust inputs. Use `audit.Read` with `RequireFooter`, `PublicKey`, and
+`HMACKey`; `ReadTrusted` accepts only the public-key input.
 
 ## Checkpoints and external anchoring
 
@@ -144,8 +175,14 @@ Anchor to a different failure and custody domain than the log itself: object
 storage under a WORM or legal-hold policy, a transparency log, or a host under
 separate control. Anchoring beside the log proves very little.
 
-A checkpoint is 32 bytes of root plus metadata, so anchoring is cheap enough to
-run continuously. Publication is asynchronous and never blocks the input path.
+A published checkpoint identifies its format version, record type, and
+signature algorithm. Verify it against an independently trusted key:
+
+```go
+err := audit.VerifyCheckpoint(trustedKey, checkpoint)
+```
+
+Checkpoint publication is asynchronous and never blocks the input path.
 Because a later head supersedes an earlier one, a saturated anchor queue drops
 the oldest pending checkpoint rather than the freshest. Drops and failures are
 counted, never hidden:
@@ -160,7 +197,8 @@ if stats := recorder.AnchorStats(); stats.Failed > 0 || stats.Dropped > 0 {
 An anchor failure does not stop recording. A network problem should not stop a
 vessel; it should be visible. Call `recorder.Checkpoint(reason)` directly at
 moments worth being able to prove later, such as arming, an emergency stop, or
-an operator handover.
+an operator handover. The first recorded controller event binds the log's
+session; a checkpoint attempted before that returns `audit.ErrSessionRequired`.
 
 ## Selective disclosure with Merkle proofs
 

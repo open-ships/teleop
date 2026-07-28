@@ -36,8 +36,13 @@ type Event struct {
 	Value    Value              `json:"value"`
 }
 
+// Header implements teleop.Event.
 func (e Event) Header() teleop.Header { return e.Meta.Clone() }
-func (Event) Kind() teleop.EventKind  { return EventKind }
+
+// Kind implements teleop.Event.
+func (Event) Kind() teleop.EventKind { return EventKind }
+
+// CloneEvent implements teleop.EventCloner.
 func (e Event) CloneEvent() teleop.Event {
 	e.Meta = e.Meta.Clone()
 	e.Controls = append([]teleop.ControlID(nil), e.Controls...)
@@ -61,10 +66,12 @@ type Binding struct {
 	ConnectionState teleop.ConnectionState
 }
 
+// OnButton binds a button transition to action.
 func OnButton(action ID, button teleop.ControlID, phase teleop.Phase) Binding {
 	return Binding{Action: action, EventKind: teleop.EventButton, Control: button, Phase: phase}
 }
 
+// OnDPad binds a D-pad direction transition to action.
 func OnDPad(action ID, direction teleop.ControlID, phase teleop.Phase) Binding {
 	return OnButton(action, direction, phase)
 }
@@ -79,6 +86,7 @@ func OnGesture(action ID, gestureType gesture.Type, control teleop.ControlID) Bi
 	return OnGesturePhase(action, gestureType, control, phase)
 }
 
+// OnGesturePhase binds one phase of a recognized gesture to action.
 func OnGesturePhase(
 	action ID,
 	gestureType gesture.Type,
@@ -106,11 +114,13 @@ func OnChord(action ID, name string, controls ...teleop.ControlID) Binding {
 	}
 }
 
+// OnStick binds changes from one normalized stick to action.
 func OnStick(action ID, stick teleop.StickID) Binding {
 	control, _ := stickControl(stick)
 	return Binding{Action: action, EventKind: teleop.EventStick, Control: control}
 }
 
+// OnTrigger binds changes from one normalized trigger to action.
 func OnTrigger(action ID, trigger teleop.TriggerID) Binding {
 	control, _ := triggerControl(trigger)
 	return Binding{Action: action, EventKind: teleop.EventTrigger, Control: control}

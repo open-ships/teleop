@@ -281,8 +281,8 @@ func (g *Guard) evaluateLocked() Decision {
 	// has never been shown to work, so it is treated as failed rather than as
 	// merely quiet.
 	var age time.Duration
-	switch {
-	case meta.Sequence == 0:
+	switch meta.Sequence {
+	case 0:
 		reasons = append(reasons, ReasonNoInput)
 		age = now
 	default:
@@ -425,7 +425,7 @@ func (g *Guard) Advance(time.Time) []teleop.Event { return nil }
 func (g *Guard) AdvanceContext(
 	_ context.Context,
 	pc teleop.ProcessingContext,
-	now time.Time,
+	_ time.Time,
 ) ([]teleop.Event, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

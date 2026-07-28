@@ -25,6 +25,13 @@ func FuzzVerify(f *testing.F) {
 	if err := signer.Close(); err != nil {
 		f.Fatal(err)
 	}
+	_, validVerification, err := ReadTrusted(
+		bytes.NewReader(valid.Bytes()),
+		public,
+	)
+	if err != nil {
+		f.Fatal(err)
+	}
 	f.Add(valid.Bytes())
 
 	unsigned := &bytes.Buffer{}
@@ -44,15 +51,19 @@ func FuzzVerify(f *testing.F) {
 		// Unverified reads must survive arbitrary input.
 		_, _, _ = Read(bytes.NewReader(data), VerifyOptions{AllowUnverified: true})
 
-		// A trusted-key read must never report success on anything the fuzzer
-		// produced: it cannot forge a signature over the trusted key.
+		// A trusted-key read can accept byte-different but semantically
+		// equivalent JSON encodings, such as top-level whitespace or uppercase
+		// signature hex. It must never authenticate a different committed tree.
 		_, verification, err := Read(bytes.NewReader(data), VerifyOptions{
 			RequireFooter:    true,
 			RequireSignature: true,
 			PublicKey:        public,
 		})
-		if err == nil && !bytes.Equal(data, valid.Bytes()) {
-			t.Fatalf("fuzzed input verified as trusted: %+v", verification)
+		if err == nil &&
+			(!verification.Trusted ||
+				verification.EventCount != validVerification.EventCount ||
+				!bytes.Equal(verification.TreeRoot, validVerification.TreeRoot)) {
+			t.Fatalf("fuzzed input verified as a different trusted tree: %+v", verification)
 		}
 	})
 }

@@ -4,6 +4,8 @@ package xbox
 
 import "github.com/open-ships/teleop"
 
+// Xbox button aliases map familiar printed labels to controller-neutral
+// control positions.
 const (
 	ButtonA = teleop.ButtonFaceSouth
 	ButtonB = teleop.ButtonFaceEast

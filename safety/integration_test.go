@@ -273,7 +273,11 @@ func TestGuardTripsWithoutApplicationInvolvement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer controller.Close()
+	t.Cleanup(func() {
+		if err := controller.Close(); err != nil {
+			t.Errorf("close controller: %v", err)
+		}
+	})
 	guard.Bind(controller)
 
 	if err := source.Push(t.Context(), teleop.State{}); err != nil {

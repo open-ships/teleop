@@ -87,6 +87,8 @@ const (
 	advanceInterval        = 25 * time.Millisecond
 )
 
+// Controller implements one open, normalized, loss-accounted controller
+// session.
 type Controller struct {
 	source     InputSource
 	descriptor Descriptor
@@ -877,7 +879,7 @@ func (c *Controller) processStages(inputs []Event, start int) error {
 			if output == nil {
 				continue
 			}
-			if err, panicked := c.dispatchProcessorOutput(output, true); err != nil {
+			if panicked, err := c.dispatchProcessorOutput(output, true); err != nil {
 				if panicked {
 					c.processorDisabled[index] = true
 				}
@@ -916,7 +918,7 @@ func (c *Controller) advanceProcessor(index int, processor Processor, now time.T
 		if event == nil {
 			continue
 		}
-		if err, panicked := c.dispatchProcessorOutput(event, true); err != nil {
+		if panicked, err := c.dispatchProcessorOutput(event, true); err != nil {
 			if panicked {
 				c.processorDisabled[index] = true
 			}
@@ -929,14 +931,14 @@ func (c *Controller) advanceProcessor(index int, processor Processor, now time.T
 func (c *Controller) dispatchProcessorOutput(
 	event Event,
 	reportLoss bool,
-) (err error, panicked bool) {
+) (panicked bool, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("%w: processor event: %v", ErrCallbackPanic, recovered)
 			panicked = true
 		}
 	}()
-	return c.dispatch(event, reportLoss), false
+	return false, c.dispatch(event, reportLoss)
 }
 
 func (c *Controller) callProcessor(processor Processor, event Event) ([]Event, error) {

@@ -8,20 +8,26 @@ import (
 	"github.com/open-ships/teleop"
 )
 
+// Provider discovers and opens Xbox-compatible controllers using the current
+// platform backend.
 type Provider struct{}
 
+// NewProvider returns an Xbox controller provider.
 func NewProvider() *Provider {
 	return &Provider{}
 }
 
+// Type implements teleop.Provider.
 func (*Provider) Type() teleop.ControllerType {
 	return teleop.ControllerXbox
 }
 
+// Discover implements teleop.Provider.
 func (*Provider) Discover(ctx context.Context) ([]teleop.Descriptor, error) {
 	return discoverPlatform(ctx)
 }
 
+// Open implements teleop.Provider.
 func (*Provider) Open(
 	ctx context.Context,
 	id teleop.DeviceID,

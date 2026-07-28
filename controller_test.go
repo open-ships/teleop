@@ -67,7 +67,7 @@ func TestControllerPublishesCanonicalEventsAndAudit(t *testing.T) {
 		button      teleop.ButtonEvent
 		stick       teleop.StickEvent
 	)
-	for !(button.Button != "" && stick.Stick != "") {
+	for button.Button == "" || stick.Stick == "" {
 		event, err := subscription.Next(ctx)
 		if err != nil {
 			t.Fatal(err)

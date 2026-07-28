@@ -21,10 +21,16 @@ func TestHashChainDetectsTampering(t *testing.T) {
 
 	var output bytes.Buffer
 	recorder := audit.NewRecorder(&output)
+	var session teleop.SessionID
+	session[0] = 1
 	for sequence := uint64(1); sequence <= 2; sequence++ {
 		err := recorder.Record(context.Background(), teleop.ButtonEvent{
 			Meta: teleop.Header{
-				ID:         teleop.EventID{Stream: "input", Sequence: sequence},
+				ID: teleop.EventID{
+					Session:  session,
+					Stream:   "input",
+					Sequence: sequence,
+				},
 				ObservedAt: time.Unix(int64(sequence), 0),
 			},
 			Button:  teleop.ButtonFaceSouth,
@@ -61,9 +67,15 @@ func TestObservationsExtractReplayableState(t *testing.T) {
 	t.Parallel()
 
 	state := teleop.State{LeftTrigger: 0.75}
+	var session teleop.SessionID
+	session[0] = 1
 	event := teleop.ObservationEvent{
 		Meta: teleop.Header{
-			ID:         teleop.EventID{Stream: "input", Sequence: 1},
+			ID: teleop.EventID{
+				Session:  session,
+				Stream:   "input",
+				Sequence: 1,
+			},
 			ObservedAt: time.Unix(20, 0),
 		},
 		Current: state,
@@ -193,6 +205,89 @@ func TestHMACRequiresAndAuthenticatesKey(t *testing.T) {
 		audit.ErrAuthenticationRequired,
 	) {
 		t.Fatalf("empty HMAC key error = %v", err)
+	}
+}
+
+func TestRecorderRequiresOneNonZeroSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero session", func(t *testing.T) {
+		var output bytes.Buffer
+		recorder := audit.NewRecorder(&output)
+		event := testButtonEvent(1)
+		event.Meta.ID.Session = teleop.SessionID{}
+
+		if err := recorder.Record(context.Background(), event); !errors.Is(
+			err,
+			audit.ErrSessionRequired,
+		) {
+			t.Fatalf("zero-session Record error = %v, want ErrSessionRequired", err)
+		}
+	})
+
+	t.Run("session change", func(t *testing.T) {
+		var output bytes.Buffer
+		recorder := audit.NewRecorder(&output)
+		if err := recorder.Record(context.Background(), testButtonEvent(1)); err != nil {
+			t.Fatal(err)
+		}
+		event := testButtonEvent(2)
+		event.Meta.ID.Session[0] = 2
+
+		if err := recorder.Record(context.Background(), event); err == nil {
+			t.Fatal("Record accepted an event from a different session")
+		}
+	})
+
+	t.Run("checkpoint before session", func(t *testing.T) {
+		var output bytes.Buffer
+		recorder := audit.NewRecorder(&output)
+		if err := recorder.Checkpoint("arming"); !errors.Is(
+			err,
+			audit.ErrSessionRequired,
+		) {
+			t.Fatalf("pre-session Checkpoint error = %v, want ErrSessionRequired", err)
+		}
+		if err := recorder.Record(context.Background(), testButtonEvent(1)); err != nil {
+			t.Fatal(err)
+		}
+		if err := recorder.Checkpoint("arming"); err != nil {
+			t.Fatalf("bound Checkpoint: %v", err)
+		}
+		if err := recorder.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestRecorderRetainsPublicKeyAfterClose(t *testing.T) {
+	t.Parallel()
+
+	public, private, err := audit.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hmacKey := bytes.Repeat([]byte{0x42}, 32)
+	var output bytes.Buffer
+	recorder := audit.NewRecorder(
+		&output,
+		audit.WithHMAC(hmacKey),
+		audit.WithSigner(private),
+	)
+	if err := recorder.Record(context.Background(), testButtonEvent(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Public identity remains available after Close, while the caller continues
+	// to own its original HMAC key.
+	if got := recorder.PublicKey(); !got.Equal(public) {
+		t.Fatalf("PublicKey after Close = %x, want %x", got, public)
+	}
+	if hmacKey[0] != 0x42 {
+		t.Fatal("Close modified the caller-owned HMAC key")
 	}
 }
 

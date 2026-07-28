@@ -2,6 +2,7 @@ package teleop
 
 import "math"
 
+// Clamp limits value to the inclusive range from minimum to maximum.
 func Clamp(value, minimum, maximum float32) float32 {
 	if math.IsNaN(float64(value)) {
 		if minimum <= 0 && maximum >= 0 {
