@@ -14,6 +14,7 @@ import (
 type stubController struct {
 	descriptor teleop.Descriptor
 	state      teleop.State
+	done       chan struct{}
 }
 
 func (c *stubController) Descriptor() teleop.Descriptor {
@@ -26,6 +27,29 @@ func (c *stubController) Capabilities() teleop.Capabilities {
 
 func (c *stubController) Snapshot() teleop.State {
 	return c.state
+}
+
+func (c *stubController) SnapshotWithMeta() (teleop.State, teleop.StateMeta) {
+	return c.state, teleop.StateMeta{Connected: true}
+}
+
+func (*stubController) Session() teleop.SessionID {
+	return teleop.SessionID{}
+}
+
+func (c *stubController) Done() <-chan struct{} {
+	if c.done == nil {
+		c.done = make(chan struct{})
+	}
+	return c.done
+}
+
+func (*stubController) Err() error {
+	return nil
+}
+
+func (*stubController) RecordCommand(context.Context, teleop.Command) error {
+	return nil
 }
 
 func (*stubController) Subscribe(
@@ -50,6 +74,10 @@ func (s *stubSubscription) Next(context.Context) (teleop.Event, error) {
 	event := s.events[0]
 	s.events = s.events[1:]
 	return event, nil
+}
+
+func (*stubSubscription) Stats() teleop.SubscriptionStats {
+	return teleop.SubscriptionStats{}
 }
 
 func (*stubSubscription) Close() error {
@@ -156,6 +184,26 @@ func TestMonitorModelTracksObservationsAndGaps(t *testing.T) {
 	}
 	if !strings.Contains(model.render(), "INPUT GAP") {
 		t.Fatal("gap warning is not visible")
+	}
+}
+
+func TestMonitorModelClearsGapAlertOnNextObservation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	model := newMonitorModel(
+		ctx,
+		cancel,
+		&stubController{descriptor: teleop.Descriptor{Name: "Test Controller"}},
+		&stubSubscription{},
+		"",
+	)
+	model.addEvent(teleop.GapEvent{Reason: "kernel overflow\x1b[2J"}, teleop.State{})
+	if model.lastGap != "kernel overflow[2J" {
+		t.Fatalf("sanitized gap = %q", model.lastGap)
+	}
+	model.addEvent(teleop.ObservationEvent{Current: teleop.State{}}, teleop.State{})
+	if model.lastGap != "" {
+		t.Fatalf("gap alert remained after a complete observation: %q", model.lastGap)
 	}
 }
 

@@ -5,33 +5,57 @@ import (
 	"time"
 )
 
+// DeviceID is the provider-stable identity used to open a discovered device.
 type DeviceID string
 
 // AuditGrade states what the selected OS backend can honestly guarantee.
 type AuditGrade string
 
 const (
+	// AuditExactBackendStream means the backend reports each exposed input
+	// transition rather than reconstructing changes from sampled snapshots.
 	AuditExactBackendStream AuditGrade = "exact-backend-stream"
-	AuditSampledState       AuditGrade = "sampled-state"
-	AuditUnavailable        AuditGrade = "unavailable"
+	// AuditSampledState means the backend derives events from periodic state.
+	AuditSampledState AuditGrade = "sampled-state"
+	// AuditUnavailable means the backend makes no audit-delivery guarantee.
+	AuditUnavailable AuditGrade = "unavailable"
 )
 
+// Valid reports whether grade is a guarantee understood by this format.
+func (grade AuditGrade) Valid() bool {
+	switch grade {
+	case AuditExactBackendStream, AuditSampledState, AuditUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// ControlKind classifies a discovered physical control.
 type ControlKind string
 
 const (
-	ControlButton  ControlKind = "button"
-	ControlStick   ControlKind = "stick"
+	// ControlButton identifies a digital button.
+	ControlButton ControlKind = "button"
+	// ControlStick identifies a two-axis stick.
+	ControlStick ControlKind = "stick"
+	// ControlTrigger identifies a normalized analog trigger.
 	ControlTrigger ControlKind = "trigger"
-	ControlDPad    ControlKind = "dpad"
-	ControlOther   ControlKind = "other"
+	// ControlDPad identifies one digital D-pad direction.
+	ControlDPad ControlKind = "dpad"
+	// ControlOther identifies a provider-specific control.
+	ControlOther ControlKind = "other"
 )
 
+// ControlDescriptor identifies one control exposed by a device.
 type ControlDescriptor struct {
 	ID    ControlID   `json:"id"`
 	Kind  ControlKind `json:"kind"`
 	Label string      `json:"label,omitempty"`
 }
 
+// Capabilities describes the controls and optional output features a device
+// exposes through its selected backend.
 type Capabilities struct {
 	Controls   []ControlDescriptor `json:"controls"`
 	AuditGrade AuditGrade          `json:"audit_grade"`
@@ -40,11 +64,16 @@ type Capabilities struct {
 	LEDs       bool                `json:"leds"`
 }
 
+// Clone returns an isolated copy with an explicit valid audit grade.
 func (c Capabilities) Clone() Capabilities {
+	if !c.AuditGrade.Valid() {
+		c.AuditGrade = AuditUnavailable
+	}
 	c.Controls = append([]ControlDescriptor(nil), c.Controls...)
 	return c
 }
 
+// Supports reports whether id appears in the discovered control list.
 func (c Capabilities) Supports(id ControlID) bool {
 	for _, control := range c.Controls {
 		if control.ID == id {
@@ -54,6 +83,8 @@ func (c Capabilities) Supports(id ControlID) bool {
 	return false
 }
 
+// Descriptor contains the stable metadata and capabilities of one discovered
+// controller.
 type Descriptor struct {
 	ID         DeviceID          `json:"id"`
 	Type       ControllerType    `json:"type"`
@@ -66,6 +97,7 @@ type Descriptor struct {
 	Capability Capabilities      `json:"capabilities"`
 }
 
+// Clone returns an isolated copy of the device descriptor.
 func (d Descriptor) Clone() Descriptor {
 	d.Capability = d.Capability.Clone()
 	if d.Properties != nil {
@@ -84,15 +116,21 @@ type Provider interface {
 	Open(context.Context, DeviceID, ...OpenOption) (GameController, error)
 }
 
+// DeviceEventKind identifies a hotplug discovery change.
 type DeviceEventKind string
 
 const (
-	DeviceAdded   DeviceEventKind = "added"
+	// DeviceAdded reports a newly discovered controller.
+	DeviceAdded DeviceEventKind = "added"
+	// DeviceRemoved reports a controller no longer present.
 	DeviceRemoved DeviceEventKind = "removed"
+	// DeviceUpdated reports changed metadata or capabilities.
 	DeviceUpdated DeviceEventKind = "updated"
-	DeviceError   DeviceEventKind = "error"
+	// DeviceError reports a failed discovery poll.
+	DeviceError DeviceEventKind = "error"
 )
 
+// DeviceEvent is one hotplug discovery update.
 type DeviceEvent struct {
 	Kind       DeviceEventKind `json:"kind"`
 	Descriptor Descriptor      `json:"descriptor"`

@@ -11,12 +11,45 @@ import (
 func TestParseDarwinID(t *testing.T) {
 	t.Parallel()
 
-	index, err := parseDarwinID("gamecontroller:3")
-	if err != nil || index != 3 {
-		t.Fatalf("parse = %d, %v", index, err)
+	const identifier = uint64(0x1234abcd)
+	id := formatDarwinID(identifier)
+	got, err := parseDarwinID(id)
+	if err != nil || got != identifier {
+		t.Fatalf("parse %q = %#x, %v; want %#x", id, got, err, identifier)
 	}
-	if _, err := parseDarwinID(teleop.DeviceID("bad")); err == nil {
-		t.Fatal("invalid ID parsed successfully")
+	for _, invalid := range []teleop.DeviceID{
+		"",
+		"bad",
+		"gamecontroller:0",
+		"gamecontroller:0000000000000000",
+		"gamecontroller:000000000000000g",
+		"gamecontroller:00000000000000001",
+	} {
+		if _, err := parseDarwinID(invalid); err == nil {
+			t.Errorf("invalid ID %q parsed successfully", invalid)
+		}
+	}
+}
+
+func TestNewDarwinDescriptorUsesOpaqueIdentifier(t *testing.T) {
+	t.Parallel()
+
+	const identifier = uint64(0x1234abcd)
+	descriptor, ok := newDarwinDescriptor(
+		identifier,
+		7,
+		"Xbox Wireless Controller",
+		"Xbox One",
+		0,
+	)
+	if !ok {
+		t.Fatal("Xbox descriptor rejected")
+	}
+	if descriptor.ID != formatDarwinID(identifier) {
+		t.Fatalf("descriptor ID = %q, want %q", descriptor.ID, formatDarwinID(identifier))
+	}
+	if got := descriptor.Properties["gamecontroller_identifier"]; got != "000000001234abcd" {
+		t.Fatalf("identifier property = %q", got)
 	}
 }
 

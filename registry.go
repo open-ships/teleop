@@ -2,17 +2,20 @@ package teleop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 )
 
-// Registry is an explicit, dependency-injected collection of providers.
+// Registry is an explicit, dependency-injected collection of providers. Its
+// zero value is ready for Register.
 type Registry struct {
 	mu        sync.RWMutex
 	providers map[ControllerType]Provider
 }
 
+// NewRegistry constructs an explicit provider registry.
 func NewRegistry(providers ...Provider) *Registry {
 	registry := &Registry{providers: make(map[ControllerType]Provider)}
 	for _, provider := range providers {
@@ -23,15 +26,21 @@ func NewRegistry(providers ...Provider) *Registry {
 	return registry
 }
 
+// Register adds or replaces the provider for its controller type.
 func (r *Registry) Register(provider Provider) {
 	if provider == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.providers == nil {
+		r.providers = make(map[ControllerType]Provider)
+	}
 	r.providers[provider.Type()] = provider
 }
 
+// Discover queries every provider, retaining successful results while joining
+// provider-specific errors.
 func (r *Registry) Discover(ctx context.Context) ([]Descriptor, error) {
 	r.mu.RLock()
 	types := make([]ControllerType, 0, len(r.providers))
@@ -45,17 +54,29 @@ func (r *Registry) Discover(ctx context.Context) ([]Descriptor, error) {
 	}
 	r.mu.RUnlock()
 
-	var devices []Descriptor
+	var (
+		devices   []Descriptor
+		resultErr error
+	)
 	for _, provider := range providers {
 		found, err := provider.Discover(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("discover %s controllers: %w", provider.Type(), err)
+		for _, descriptor := range found {
+			devices = append(devices, descriptor.Clone())
 		}
-		devices = append(devices, found...)
+		if err != nil {
+			resultErr = errors.Join(
+				resultErr,
+				fmt.Errorf("discover %s controllers: %w", provider.Type(), err),
+			)
+			if ctx.Err() != nil {
+				break
+			}
+		}
 	}
-	return devices, nil
+	return devices, resultErr
 }
 
+// Open delegates to the registered provider for controllerType.
 func (r *Registry) Open(
 	ctx context.Context,
 	controllerType ControllerType,

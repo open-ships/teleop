@@ -43,30 +43,33 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	index, err := parseDarwinID(id)
+	identifier, err := parseDarwinID(id)
 	if err != nil {
 		return nil, err
 	}
-	descriptor, ok := darwinDescriptor(index)
+	descriptor, ok := darwinDescriptorByID(identifier)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", teleop.ErrUnavailable, id)
 	}
-	handle := C.teleop_gc_open(C.int(index))
+	handle := C.teleop_gc_open(C.uint64_t(identifier))
 	if handle == nil {
 		return nil, fmt.Errorf("%w: open %s", teleop.ErrUnavailable, id)
 	}
 	return &darwinSource{
 		handle:     handle,
 		descriptor: descriptor,
+		closeDone:  make(chan struct{}),
 	}, nil
 }
 
 func darwinDescriptor(index int) (teleop.Descriptor, bool) {
 	name := make([]byte, 256)
 	productCategory := make([]byte, 256)
+	var identifier C.uint64_t
 	var features C.uint32_t
 	ok := C.teleop_gc_info(
 		C.int(index),
+		&identifier,
 		(*C.char)(unsafe.Pointer(&name[0])),
 		C.size_t(len(name)),
 		(*C.char)(unsafe.Pointer(&productCategory[0])),
@@ -76,8 +79,46 @@ func darwinDescriptor(index int) (teleop.Descriptor, bool) {
 	if ok == 0 {
 		return teleop.Descriptor{}, false
 	}
-	vendorName := nullTerminatedString(name)
-	category := nullTerminatedString(productCategory)
+	return newDarwinDescriptor(
+		uint64(identifier),
+		index,
+		nullTerminatedString(name),
+		nullTerminatedString(productCategory),
+		uint32(features),
+	)
+}
+
+func darwinDescriptorByID(identifier uint64) (teleop.Descriptor, bool) {
+	name := make([]byte, 256)
+	productCategory := make([]byte, 256)
+	var features C.uint32_t
+	ok := C.teleop_gc_info_by_id(
+		C.uint64_t(identifier),
+		(*C.char)(unsafe.Pointer(&name[0])),
+		C.size_t(len(name)),
+		(*C.char)(unsafe.Pointer(&productCategory[0])),
+		C.size_t(len(productCategory)),
+		&features,
+	)
+	if ok == 0 {
+		return teleop.Descriptor{}, false
+	}
+	return newDarwinDescriptor(
+		identifier,
+		-1,
+		nullTerminatedString(name),
+		nullTerminatedString(productCategory),
+		uint32(features),
+	)
+}
+
+func newDarwinDescriptor(
+	identifier uint64,
+	index int,
+	vendorName string,
+	category string,
+	features uint32,
+) (teleop.Descriptor, bool) {
 	if !isXboxIdentity(vendorName, category) {
 		return teleop.Descriptor{}, false
 	}
@@ -89,24 +130,28 @@ func darwinDescriptor(index int) (teleop.Descriptor, bool) {
 		teleop.StickLeft: true, teleop.StickRight: true,
 		teleop.TriggerLeft: true, teleop.TriggerRight: true,
 	}
-	mask := uint32(features)
+	mask := features
 	supported[Menu] = mask&1 != 0
 	supported[View] = mask&2 != 0
 	supported[Xbox] = mask&4 != 0
 	supported[Share] = mask&8 != 0
 	supported[LeftStick] = mask&16 != 0
 	supported[RightStick] = mask&32 != 0
+	properties := map[string]string{
+		"gamecontroller_identifier":       fmt.Sprintf("%016x", identifier),
+		"gamecontroller_product_category": category,
+	}
+	if index >= 0 {
+		properties["gamecontroller_index"] = strconv.Itoa(index)
+	}
 	return teleop.Descriptor{
-		ID:         teleop.DeviceID(fmt.Sprintf("gamecontroller:%d", index)),
+		ID:         formatDarwinID(identifier),
 		Type:       teleop.ControllerXbox,
 		Name:       darwinControllerName(vendorName, category),
 		Transport:  teleop.TransportUnknown,
 		Backend:    "darwin-gamecontroller",
 		Capability: capabilities(teleop.AuditExactBackendStream, supported),
-		Properties: map[string]string{
-			"gamecontroller_index":            strconv.Itoa(index),
-			"gamecontroller_product_category": category,
-		},
+		Properties: properties,
 	}, true
 }
 
@@ -139,6 +184,8 @@ type darwinSource struct {
 	handle     unsafe.Pointer
 	descriptor teleop.Descriptor
 	closed     bool
+	active     sync.WaitGroup
+	closeDone  chan struct{}
 }
 
 func (s *darwinSource) Descriptor() teleop.Descriptor {
@@ -156,10 +203,18 @@ func (s *darwinSource) Read(ctx context.Context) (teleop.Observation, error) {
 			return teleop.Observation{}, teleop.ErrClosed
 		}
 		handle := s.handle
+		s.active.Add(1)
 		s.mu.Unlock()
 
 		var native C.teleop_gc_state
 		result := int(C.teleop_gc_next(handle, &native, 100))
+		s.active.Done()
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		if closed {
+			return teleop.Observation{}, teleop.ErrClosed
+		}
 		switch result {
 		case 0:
 			continue
@@ -238,20 +293,45 @@ func (s *darwinSource) Read(ctx context.Context) (teleop.Observation, error) {
 
 func (s *darwinSource) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		done := s.closeDone
+		s.mu.Unlock()
+		<-done
 		return nil
 	}
 	s.closed = true
-	C.teleop_gc_close(s.handle)
+	handle := s.handle
+	s.mu.Unlock()
+
+	// teleop_gc_next uses the native handle during its timed wait. Prevent new
+	// reads, wait for existing calls to return, and only then release it.
+	s.active.Wait()
+	C.teleop_gc_close(handle)
+
+	s.mu.Lock()
+	s.handle = nil
+	close(s.closeDone)
+	s.mu.Unlock()
 	return nil
 }
 
-func parseDarwinID(id teleop.DeviceID) (int, error) {
-	value := strings.TrimPrefix(string(id), "gamecontroller:")
-	index, err := strconv.Atoi(value)
-	if err != nil || index < 0 {
+func formatDarwinID(identifier uint64) teleop.DeviceID {
+	return teleop.DeviceID(fmt.Sprintf("gamecontroller:%016x", identifier))
+}
+
+func parseDarwinID(id teleop.DeviceID) (uint64, error) {
+	const prefix = "gamecontroller:"
+	raw := string(id)
+	if !strings.HasPrefix(raw, prefix) {
 		return 0, fmt.Errorf("%w: invalid Game Controller device ID %q", teleop.ErrUnavailable, id)
 	}
-	return index, nil
+	value := strings.TrimPrefix(raw, prefix)
+	identifier, err := strconv.ParseUint(value, 16, 64)
+	if err != nil ||
+		identifier == 0 ||
+		len(value) != 16 ||
+		value != fmt.Sprintf("%016x", identifier) {
+		return 0, fmt.Errorf("%w: invalid Game Controller device ID %q", teleop.ErrUnavailable, id)
+	}
+	return identifier, nil
 }

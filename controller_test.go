@@ -67,7 +67,7 @@ func TestControllerPublishesCanonicalEventsAndAudit(t *testing.T) {
 		button      teleop.ButtonEvent
 		stick       teleop.StickEvent
 	)
-	for !(button.Button != "" && stick.Stick != "") {
+	for button.Button == "" || stick.Stick == "" {
 		event, err := subscription.Next(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -95,6 +95,9 @@ func TestControllerPublishesCanonicalEventsAndAudit(t *testing.T) {
 		t.Fatalf("snapshot = %#v", got)
 	}
 
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := recorder.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +132,9 @@ func TestLosslessSubscriptionFailsExplicitlyOnOverflow(t *testing.T) {
 
 	// Connection and capabilities are published immediately, overflowing a
 	// deliberately undersized subscriber before it consumes either event.
+	if _, err = subscription.Next(ctx); err != nil {
+		t.Fatalf("buffered event error = %v", err)
+	}
 	_, err = subscription.Next(ctx)
 	if !errors.Is(err, teleop.ErrSubscriptionOverflow) {
 		t.Fatalf("Next error = %v, want %v", err, teleop.ErrSubscriptionOverflow)
@@ -264,14 +270,20 @@ func TestAdvancingProcessorPublishesHoldWhileControllerIsIdle(t *testing.T) {
 func TestNormalization(t *testing.T) {
 	t.Parallel()
 
-	if got := teleop.NormalizeAxis(0, -32768, 32767); got < 0 || got > 0.001 {
-		t.Fatalf("centered axis = %f", got)
+	if got := teleop.NormalizeAxis(0, -32768, 32767); got != 0 {
+		t.Fatalf("centered axis = %f, want exact neutral", got)
 	}
 	if got := teleop.NormalizeAxis(-32768, -32768, 32767); got != -1 {
 		t.Fatalf("minimum axis = %f", got)
 	}
 	if got := teleop.NormalizeTrigger(255, 0, 255); got != 1 {
 		t.Fatalf("maximum trigger = %f", got)
+	}
+	if got := teleop.NormalizeAxis(32767, -32768, 32767); got != 1 {
+		t.Fatalf("maximum signed axis = %f", got)
+	}
+	if got := teleop.NormalizeTrigger(2_147_483_647, -2_147_483_648, 2_147_483_647); got != 1 {
+		t.Fatalf("wide trigger maximum = %f", got)
 	}
 	if got := teleop.ApplyRadialDeadZone(teleop.Stick{X: 0.05}, 0.1); got != (teleop.Stick{}) {
 		t.Fatalf("dead-zone result = %#v", got)

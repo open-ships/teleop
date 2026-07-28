@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"syscall"
 
 	"github.com/open-ships/teleop"
 	"github.com/open-ships/teleop/audit"
@@ -32,12 +31,12 @@ func main() {
 	defer runtime.UnlockOSThread()
 
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "teleop-monitor:", err)
+		fmt.Fprintln(os.Stderr, "teleop-monitor:", terminalText(err.Error()))
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run() (err error) {
 	var config configuration
 	flag.StringVar(&config.deviceID, "device", "", "device ID to open (defaults to the first controller)")
 	flag.BoolVar(&config.list, "list", false, "list connected Xbox controllers and exit")
@@ -45,7 +44,7 @@ func run() error {
 	flag.StringVar(&config.audit, "audit", "", "write a lossless, hash-chained audit log to this file")
 	flag.Parse()
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), monitoredSignals()...)
 	defer cancel()
 
 	provider := xbox.NewProvider()
@@ -73,13 +72,19 @@ func run() error {
 		auditFile   *os.File
 	)
 	if config.audit != "" {
-		auditFile, err = os.OpenFile(config.audit, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		auditFile, err = os.OpenFile(config.audit, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
 			return fmt.Errorf("open audit log: %w", err)
 		}
-		defer auditFile.Close()
 		recorder = audit.NewRecorder(auditFile, audit.WithFlushEveryEvent(true))
-		defer recorder.Close()
+		defer func() {
+			if closeErr := recorder.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close audit recorder: %w", closeErr))
+			}
+			if closeErr := auditFile.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close audit file: %w", closeErr))
+			}
+		}()
 		openOptions = append(openOptions, teleop.WithAuditSink(recorder))
 	}
 
@@ -87,18 +92,31 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer controller.Close()
+	defer func() {
+		if closeErr := controller.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close controller: %w", closeErr))
+		}
+	}()
 
+	streaming := config.json || !terminalOutput()
+	delivery := teleop.DeliveryLatest
+	if streaming {
+		delivery = teleop.DeliveryLossless
+	}
 	subscription, err := controller.Subscribe(teleop.SubscriptionOptions{
-		Delivery: teleop.DeliveryLossless,
+		Delivery: delivery,
 		Buffer:   8192,
 	})
 	if err != nil {
 		return err
 	}
-	defer subscription.Close()
+	defer func() {
+		if closeErr := subscription.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close subscription: %w", closeErr))
+		}
+	}()
 
-	if config.json || !terminalOutput() {
+	if streaming {
 		return streamJSON(ctx, subscription)
 	}
 	return runTUI(ctx, controller, subscription, config.audit)
@@ -110,15 +128,19 @@ func printDevices(devices []teleop.Descriptor) {
 		return
 	}
 	for _, device := range devices {
-		fmt.Printf(
-			"%s\t%s\tbackend=%s transport=%s audit=%s\n",
-			device.ID,
-			device.Name,
-			device.Backend,
-			device.Transport,
-			device.Capability.AuditGrade,
-		)
+		fmt.Println(deviceLine(device))
 	}
+}
+
+func deviceLine(device teleop.Descriptor) string {
+	return fmt.Sprintf(
+		"%s\t%s\tbackend=%s transport=%s audit=%s",
+		terminalText(string(device.ID)),
+		terminalText(device.Name),
+		terminalText(device.Backend),
+		terminalText(string(device.Transport)),
+		terminalText(string(device.Capability.AuditGrade)),
+	)
 }
 
 func selectDevice(devices []teleop.Descriptor, id teleop.DeviceID) (teleop.Descriptor, error) {

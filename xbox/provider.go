@@ -8,20 +8,26 @@ import (
 	"github.com/open-ships/teleop"
 )
 
+// Provider discovers and opens Xbox-compatible controllers using the current
+// platform backend.
 type Provider struct{}
 
+// NewProvider returns an Xbox controller provider.
 func NewProvider() *Provider {
 	return &Provider{}
 }
 
+// Type implements teleop.Provider.
 func (*Provider) Type() teleop.ControllerType {
 	return teleop.ControllerXbox
 }
 
+// Discover implements teleop.Provider.
 func (*Provider) Discover(ctx context.Context) ([]teleop.Descriptor, error) {
 	return discoverPlatform(ctx)
 }
 
+// Open implements teleop.Provider.
 func (*Provider) Open(
 	ctx context.Context,
 	id teleop.DeviceID,
@@ -31,7 +37,11 @@ func (*Provider) Open(
 	if err != nil {
 		return nil, err
 	}
-	return teleop.NewController(source, options...)
+	// Provider.Open's context owns both discovery/opening and the resulting
+	// session. A caller may still override it explicitly with a later
+	// teleop.WithContext option.
+	openOptions := append([]teleop.OpenOption{teleop.WithContext(ctx)}, options...)
+	return teleop.NewController(source, openOptions...)
 }
 
 // Watch polls the platform's controller registry and publishes hotplug changes.
