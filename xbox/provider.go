@@ -31,7 +31,11 @@ func (*Provider) Open(
 	if err != nil {
 		return nil, err
 	}
-	return teleop.NewController(source, options...)
+	// Provider.Open's context owns both discovery/opening and the resulting
+	// session. A caller may still override it explicitly with a later
+	// teleop.WithContext option.
+	openOptions := append([]teleop.OpenOption{teleop.WithContext(ctx)}, options...)
+	return teleop.NewController(source, openOptions...)
 }
 
 // Watch polls the platform's controller registry and publishes hotplug changes.

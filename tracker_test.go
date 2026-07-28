@@ -53,6 +53,47 @@ func TestDPadIDsUseButtonNamespace(t *testing.T) {
 	}
 }
 
+func TestDiffEventsCoversEveryStateShapeInDeterministicOrder(t *testing.T) {
+	var sequence uint64
+	header := func() Header {
+		sequence++
+		return Header{ID: EventID{Sequence: sequence}}
+	}
+	current := State{
+		LeftStick:    Stick{X: -0.5, Y: 0.75},
+		RightStick:   Stick{X: 0.25, Y: -1},
+		LeftTrigger:  0.4,
+		RightTrigger: 1,
+	}
+	current.SetButton(ButtonFaceNorth, true)
+	current.SetButton("button.extension.z", true)
+	current.SetButton("button.extension.a", true)
+
+	events := diffEvents(State{}, current, header)
+	if len(events) != 7 {
+		t.Fatalf("events = %#v, want 7 state changes", events)
+	}
+	assertButtonEvent(t, events[0], ButtonFaceNorth, PhasePressed, true)
+	assertButtonEvent(t, events[1], "button.extension.a", PhasePressed, true)
+	assertButtonEvent(t, events[2], "button.extension.z", PhasePressed, true)
+	if event, ok := events[3].(StickEvent); !ok ||
+		event.Stick != LeftStick || event.Position != current.LeftStick {
+		t.Fatalf("left-stick event = %#v", events[3])
+	}
+	if event, ok := events[4].(StickEvent); !ok ||
+		event.Stick != RightStick || event.Position != current.RightStick {
+		t.Fatalf("right-stick event = %#v", events[4])
+	}
+	if event, ok := events[5].(TriggerEvent); !ok ||
+		event.Trigger != LeftTrigger || event.Position != current.LeftTrigger {
+		t.Fatalf("left-trigger event = %#v", events[5])
+	}
+	if event, ok := events[6].(TriggerEvent); !ok ||
+		event.Trigger != RightTrigger || event.Position != current.RightTrigger {
+		t.Fatalf("right-trigger event = %#v", events[6])
+	}
+}
+
 func assertButtonEvent(
 	t *testing.T,
 	event Event,

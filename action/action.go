@@ -3,102 +3,191 @@
 package action
 
 import (
+	"context"
+	"fmt"
+	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/open-ships/teleop"
 	"github.com/open-ships/teleop/gesture"
 )
 
+// ID identifies an application-defined action.
 type ID string
 
+// EventKind is the persisted kind for action events.
 const EventKind teleop.EventKind = "action"
 
+// Value carries the input value that caused an action.
 type Value struct {
-	Pressed bool         `json:"pressed,omitempty"`
-	Scalar  float32      `json:"scalar,omitempty"`
-	Vector  teleop.Stick `json:"vector,omitempty"`
+	Pressed bool          `json:"pressed,omitempty"`
+	Scalar  float32       `json:"scalar,omitempty"`
+	Vector  *teleop.Stick `json:"vector,omitempty"`
 }
 
+// Event is one mapped semantic action.
 type Event struct {
-	Meta    teleop.Header    `json:"header"`
-	Action  ID               `json:"action"`
-	Phase   teleop.Phase     `json:"phase"`
-	Control teleop.ControlID `json:"control,omitempty"`
-	Value   Value            `json:"value"`
+	Meta     teleop.Header      `json:"header"`
+	Action   ID                 `json:"action"`
+	Phase    teleop.Phase       `json:"phase"`
+	Control  teleop.ControlID   `json:"control,omitempty"`
+	Controls []teleop.ControlID `json:"controls,omitempty"`
+	Value    Value              `json:"value"`
 }
 
 func (e Event) Header() teleop.Header { return e.Meta.Clone() }
 func (Event) Kind() teleop.EventKind  { return EventKind }
+func (e Event) CloneEvent() teleop.Event {
+	e.Meta = e.Meta.Clone()
+	e.Controls = append([]teleop.ControlID(nil), e.Controls...)
+	if e.Value.Vector != nil {
+		vector := *e.Value.Vector
+		e.Value.Vector = &vector
+	}
+	return e
+}
 
-// Binding matches an event kind and optional control, phase, and gesture type.
-// Empty match fields act as wildcards.
+// Binding matches an event kind and optional exact controls, phase, gesture
+// type, and connection state. Empty match fields are wildcards.
 type Binding struct {
-	Action      ID
-	EventKind   teleop.EventKind
-	Control     teleop.ControlID
-	Phase       teleop.Phase
-	GestureType gesture.Type
+	Action          ID
+	EventKind       teleop.EventKind
+	Control         teleop.ControlID
+	Controls        []teleop.ControlID
+	Phase           teleop.Phase
+	GestureType     gesture.Type
+	Region          string
+	ConnectionState teleop.ConnectionState
 }
 
 func OnButton(action ID, button teleop.ControlID, phase teleop.Phase) Binding {
-	return Binding{
-		Action:    action,
-		EventKind: teleop.EventButton,
-		Control:   button,
-		Phase:     phase,
-	}
+	return Binding{Action: action, EventKind: teleop.EventButton, Control: button, Phase: phase}
 }
 
 func OnDPad(action ID, direction teleop.ControlID, phase teleop.Phase) Binding {
-	return Binding{
-		Action:    action,
-		EventKind: teleop.EventButton,
-		Control:   direction,
-		Phase:     phase,
-	}
+	return OnButton(action, direction, phase)
 }
 
+// OnGesture binds the single meaningful phase: ended for taps and started for
+// stateful gestures. Use OnGesturePhase when both edges are meaningful.
 func OnGesture(action ID, gestureType gesture.Type, control teleop.ControlID) Binding {
+	phase := teleop.PhaseStarted
+	if gestureType == gesture.Tap || gestureType == gesture.DoubleTap {
+		phase = teleop.PhaseEnded
+	}
+	return OnGesturePhase(action, gestureType, control, phase)
+}
+
+func OnGesturePhase(
+	action ID,
+	gestureType gesture.Type,
+	control teleop.ControlID,
+	phase teleop.Phase,
+) Binding {
 	return Binding{
 		Action:      action,
 		EventKind:   gesture.EventKind,
 		Control:     control,
+		Phase:       phase,
 		GestureType: gestureType,
 	}
 }
 
-func OnStick(action ID, stick teleop.StickID) Binding {
-	control := teleop.StickRight
-	if stick == teleop.LeftStick {
-		control = teleop.StickLeft
-	}
+// OnChord binds an exact chord by its configured name and controls.
+func OnChord(action ID, name string, controls ...teleop.ControlID) Binding {
 	return Binding{
-		Action:    action,
-		EventKind: teleop.EventStick,
-		Control:   control,
+		Action:      action,
+		EventKind:   gesture.EventKind,
+		Controls:    canonicalControls(controls),
+		Phase:       teleop.PhaseStarted,
+		GestureType: gesture.Chord,
+		Region:      name,
 	}
+}
+
+func OnStick(action ID, stick teleop.StickID) Binding {
+	control, _ := stickControl(stick)
+	return Binding{Action: action, EventKind: teleop.EventStick, Control: control}
 }
 
 func OnTrigger(action ID, trigger teleop.TriggerID) Binding {
-	control := teleop.TriggerRight
-	if trigger == teleop.LeftTrigger {
-		control = teleop.TriggerLeft
-	}
+	control, _ := triggerControl(trigger)
+	return Binding{Action: action, EventKind: teleop.EventTrigger, Control: control}
+}
+
+// OnConnection binds a lifecycle transition such as a disconnect failsafe.
+func OnConnection(action ID, state teleop.ConnectionState) Binding {
 	return Binding{
-		Action:    action,
-		EventKind: teleop.EventTrigger,
-		Control:   control,
+		Action:          action,
+		EventKind:       teleop.EventConnection,
+		ConnectionState: state,
 	}
 }
 
+var mapperInstances atomic.Uint64
+
+// Mapper is immutable after construction and safe for concurrent Process calls.
 type Mapper struct {
-	mu       sync.Mutex
-	bindings []Binding
-	sequence uint64
+	mu             sync.Mutex
+	bindings       []Binding
+	fallbackStream string
+	fallbackSeq    map[teleop.SessionID]uint64
 }
 
+// New validates and copies bindings. Invalid bindings panic instead of silently
+// matching a different control.
 func New(bindings ...Binding) *Mapper {
-	return &Mapper{bindings: append([]Binding(nil), bindings...)}
+	copied := append([]Binding(nil), bindings...)
+	for index := range copied {
+		copied[index].Controls = canonicalControls(copied[index].Controls)
+		if err := validateBinding(copied[index]); err != nil {
+			panic(err)
+		}
+	}
+	instance := mapperInstances.Add(1)
+	return &Mapper{
+		bindings:       copied,
+		fallbackStream: fmt.Sprintf("action/%d", instance),
+		fallbackSeq:    make(map[teleop.SessionID]uint64),
+	}
+}
+
+func validateBinding(binding Binding) error {
+	if binding.Action == "" {
+		return fmt.Errorf("action: binding has an empty action")
+	}
+	if binding.EventKind == teleop.EventStick &&
+		binding.Control != teleop.StickLeft &&
+		binding.Control != teleop.StickRight {
+		return fmt.Errorf("action: invalid stick control %q", binding.Control)
+	}
+	if binding.EventKind == teleop.EventTrigger &&
+		binding.Control != teleop.TriggerLeft &&
+		binding.Control != teleop.TriggerRight {
+		return fmt.Errorf("action: invalid trigger control %q", binding.Control)
+	}
+	if binding.GestureType == gesture.Chord && len(binding.Controls) < 2 {
+		return fmt.Errorf("action: chord binding needs at least two controls")
+	}
+	if binding.GestureType == gesture.Chord && binding.Region == "" {
+		return fmt.Errorf("action: chord binding needs its configured name")
+	}
+	if binding.ConnectionState != "" &&
+		binding.ConnectionState != teleop.Connected &&
+		binding.ConnectionState != teleop.Disconnected {
+		return fmt.Errorf("action: invalid connection state %q", binding.ConnectionState)
+	}
+	if binding.ConnectionState != "" && binding.EventKind != teleop.EventConnection {
+		return fmt.Errorf("action: connection state requires a connection event binding")
+	}
+	if binding.Region != "" && binding.EventKind != gesture.EventKind {
+		return fmt.Errorf("action: gesture region requires a gesture event binding")
+	}
+	if binding.Control != "" && len(binding.Controls) > 0 {
+		return fmt.Errorf("action: binding cannot match both one control and an exact control set")
+	}
+	return nil
 }
 
 // Process implements teleop.Processor.
@@ -111,91 +200,205 @@ func (m *Mapper) Process(input teleop.Event) []teleop.Event {
 	return result
 }
 
-// Map returns strongly typed application actions.
+// ProcessContext implements teleop.ContextProcessor.
+func (m *Mapper) ProcessContext(
+	_ context.Context,
+	processing teleop.ProcessingContext,
+	input teleop.Event,
+) ([]teleop.Event, error) {
+	mapped := m.mapInput(input, processing)
+	result := make([]teleop.Event, len(mapped))
+	for index := range mapped {
+		result[index] = mapped[index]
+	}
+	return result, nil
+}
+
+// Map returns strongly typed application actions using an instance-unique
+// standalone event stream.
 func (m *Mapper) Map(input teleop.Event) []Event {
+	return m.mapInput(input, nil)
+}
+
+func (m *Mapper) mapInput(
+	input teleop.Event,
+	processing teleop.ProcessingContext,
+) []Event {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var result []Event
+	values, handled := eventValues(input)
+	if !handled {
+		return nil
+	}
+	source := input.Header()
+	result := make([]Event, 0, len(m.bindings))
 	for _, binding := range m.bindings {
-		control, phase, value, gestureType := eventValues(input)
-		if binding.EventKind != "" && input.Kind() != binding.EventKind {
+		if binding.EventKind != "" && input.Kind() != binding.EventKind ||
+			binding.Control != "" && binding.Control != values.control ||
+			len(binding.Controls) > 0 && !equalControls(binding.Controls, values.controls) ||
+			binding.Phase != "" && binding.Phase != values.phase ||
+			binding.GestureType != "" && binding.GestureType != values.gestureType ||
+			binding.Region != "" && binding.Region != values.region ||
+			binding.ConnectionState != "" &&
+				binding.ConnectionState != values.connectionState {
 			continue
 		}
-		if binding.Control != "" && binding.Control != control {
-			continue
-		}
-		if binding.Phase != "" && binding.Phase != phase {
-			continue
-		}
-		if binding.GestureType != "" && binding.GestureType != gestureType {
-			continue
-		}
-		source := input.Header()
-		m.sequence++
-		result = append(result, Event{
-			Meta: teleop.Header{
+		var header teleop.Header
+		if processing != nil {
+			header = processing.NewHeader(
+				"action",
+				source.ObservedAt,
+				source.DeviceTimestamp,
+				source.ID,
+			)
+			header.Synthetic = source.Synthetic
+		} else {
+			m.fallbackSeq[source.ID.Session]++
+			header = teleop.Header{
 				ID: teleop.EventID{
 					Session:  source.ID.Session,
-					Stream:   "action",
-					Sequence: m.sequence,
+					Stream:   m.fallbackStream,
+					Sequence: m.fallbackSeq[source.ID.Session],
 				},
-				DeviceID:   source.DeviceID,
-				ObservedAt: source.ObservedAt,
-				Causes:     []teleop.EventID{source.ID},
-			},
-			Action:  binding.Action,
-			Phase:   phase,
-			Control: control,
-			Value:   value,
+				DeviceID:        source.DeviceID,
+				ObservedAt:      source.ObservedAt,
+				ReceivedAt:      source.ReceivedAt,
+				PublishedAt:     source.PublishedAt,
+				DeviceTimestamp: source.DeviceTimestamp,
+				Causes:          []teleop.EventID{source.ID},
+				Synthetic:       source.Synthetic,
+			}
+		}
+		result = append(result, Event{
+			Meta:     header,
+			Action:   binding.Action,
+			Phase:    values.phase,
+			Control:  values.control,
+			Controls: append([]teleop.ControlID(nil), values.controls...),
+			Value:    values.value,
 		})
 	}
 	return result
 }
 
-func eventValues(input teleop.Event) (teleop.ControlID, teleop.Phase, Value, gesture.Type) {
+type extractedValues struct {
+	control         teleop.ControlID
+	controls        []teleop.ControlID
+	phase           teleop.Phase
+	value           Value
+	gestureType     gesture.Type
+	region          string
+	connectionState teleop.ConnectionState
+}
+
+func eventValues(input teleop.Event) (extractedValues, bool) {
 	switch event := input.(type) {
 	case teleop.ButtonEvent:
-		return event.Button, event.Phase, Value{Pressed: event.Pressed}, ""
+		return extractedValues{
+			control: event.Button, controls: []teleop.ControlID{event.Button},
+			phase: event.Phase, value: Value{Pressed: event.Pressed},
+		}, true
 	case *teleop.ButtonEvent:
-		return event.Button, event.Phase, Value{Pressed: event.Pressed}, ""
+		return eventValues(*event)
 	case teleop.StickEvent:
-		control := teleop.StickRight
-		if event.Stick == teleop.LeftStick {
-			control = teleop.StickLeft
+		control, ok := stickControl(event.Stick)
+		if !ok {
+			return extractedValues{}, false
 		}
-		return control, teleop.PhaseChanged, Value{Vector: event.Position}, ""
+		vector := event.Position
+		return extractedValues{
+			control: control, controls: []teleop.ControlID{control},
+			phase: teleop.PhaseChanged, value: Value{Vector: &vector},
+		}, true
 	case *teleop.StickEvent:
-		control := teleop.StickRight
-		if event.Stick == teleop.LeftStick {
-			control = teleop.StickLeft
-		}
-		return control, teleop.PhaseChanged, Value{Vector: event.Position}, ""
+		return eventValues(*event)
 	case teleop.TriggerEvent:
-		control := teleop.TriggerRight
-		if event.Trigger == teleop.LeftTrigger {
-			control = teleop.TriggerLeft
+		control, ok := triggerControl(event.Trigger)
+		if !ok {
+			return extractedValues{}, false
 		}
-		return control, teleop.PhaseChanged, Value{Scalar: event.Position}, ""
+		return extractedValues{
+			control: control, controls: []teleop.ControlID{control},
+			phase: teleop.PhaseChanged, value: Value{Scalar: event.Position},
+		}, true
 	case *teleop.TriggerEvent:
-		control := teleop.TriggerRight
-		if event.Trigger == teleop.LeftTrigger {
-			control = teleop.TriggerLeft
-		}
-		return control, teleop.PhaseChanged, Value{Scalar: event.Position}, ""
+		return eventValues(*event)
 	case gesture.Event:
+		controls := canonicalControls(event.Controls)
 		var control teleop.ControlID
-		if len(event.Controls) > 0 {
-			control = event.Controls[0]
+		if len(controls) == 1 {
+			control = controls[0]
 		}
-		return control, event.Phase, Value{Scalar: event.Value}, event.Type
+		return extractedValues{
+			control: control, controls: controls, phase: event.Phase,
+			value: Value{Scalar: event.Value}, gestureType: event.Type,
+			region: event.Region,
+		}, true
 	case *gesture.Event:
-		var control teleop.ControlID
-		if len(event.Controls) > 0 {
-			control = event.Controls[0]
-		}
-		return control, event.Phase, Value{Scalar: event.Value}, event.Type
+		return eventValues(*event)
+	case teleop.ConnectionEvent:
+		return extractedValues{
+			phase: connectionPhase(event.State), connectionState: event.State,
+		}, true
+	case *teleop.ConnectionEvent:
+		return eventValues(*event)
 	default:
-		return "", "", Value{}, ""
+		return extractedValues{}, false
 	}
+}
+
+func connectionPhase(state teleop.ConnectionState) teleop.Phase {
+	if state == teleop.Connected {
+		return teleop.PhaseStarted
+	}
+	return teleop.PhaseEnded
+}
+
+func stickControl(stick teleop.StickID) (teleop.ControlID, bool) {
+	switch stick {
+	case teleop.LeftStick:
+		return teleop.StickLeft, true
+	case teleop.RightStick:
+		return teleop.StickRight, true
+	default:
+		return "", false
+	}
+}
+
+func triggerControl(trigger teleop.TriggerID) (teleop.ControlID, bool) {
+	switch trigger {
+	case teleop.LeftTrigger:
+		return teleop.TriggerLeft, true
+	case teleop.RightTrigger:
+		return teleop.TriggerRight, true
+	default:
+		return "", false
+	}
+}
+
+func canonicalControls(values []teleop.ControlID) []teleop.ControlID {
+	result := append([]teleop.ControlID(nil), values...)
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	write := 0
+	for _, value := range result {
+		if value == "" || write > 0 && result[write-1] == value {
+			continue
+		}
+		result[write] = value
+		write++
+	}
+	return result[:write]
+}
+
+func equalControls(left, right []teleop.ControlID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }

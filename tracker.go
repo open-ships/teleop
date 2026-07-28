@@ -4,31 +4,11 @@ import "sort"
 
 func diffEvents(previous, current State, header func() Header) []Event {
 	var events []Event
-	buttons := StandardButtonIDs()
-	seen := make(map[ControlID]bool)
-	for _, id := range buttons {
-		seen[id] = true
-	}
-	var extensions []ControlID
-	for id := range previous.Buttons.Extensions {
-		if !seen[id] {
-			extensions = append(extensions, id)
-			seen[id] = true
-		}
-	}
-	for id := range current.Buttons.Extensions {
-		if !seen[id] {
-			extensions = append(extensions, id)
-			seen[id] = true
-		}
-	}
-	sort.Slice(extensions, func(i, j int) bool { return extensions[i] < extensions[j] })
-	buttons = append(buttons, extensions...)
-	for _, id := range buttons {
+	appendButton := func(id ControlID) {
 		before := previous.Button(id)
 		after := current.Button(id)
 		if before == after {
-			continue
+			return
 		}
 		phase := PhaseReleased
 		if after {
@@ -40,6 +20,30 @@ func diffEvents(previous, current State, header func() Header) []Event {
 			Phase:   phase,
 			Pressed: after,
 		})
+	}
+	for _, id := range standardButtons {
+		appendButton(id)
+	}
+
+	var extensions []ControlID
+	for id := range previous.Buttons.Extensions {
+		if !isStandardButton(id) {
+			extensions = append(extensions, id)
+		}
+	}
+	for id := range current.Buttons.Extensions {
+		if !isStandardButton(id) {
+			extensions = append(extensions, id)
+		}
+	}
+	sort.Slice(extensions, func(i, j int) bool { return extensions[i] < extensions[j] })
+	var previousID ControlID
+	for index, id := range extensions {
+		if index > 0 && id == previousID {
+			continue
+		}
+		appendButton(id)
+		previousID = id
 	}
 
 	if previous.LeftStick != current.LeftStick {
@@ -81,4 +85,13 @@ func diffEvents(previous, current State, header func() Header) []Event {
 		})
 	}
 	return events
+}
+
+func isStandardButton(id ControlID) bool {
+	for _, standard := range standardButtons {
+		if id == standard {
+			return true
+		}
+	}
+	return false
 }

@@ -68,6 +68,11 @@ func (f *FakeSource) Push(ctx context.Context, state teleop.State) error {
 
 func (f *FakeSource) PushObservation(ctx context.Context, observation teleop.Observation) error {
 	select {
+	case <-f.done:
+		return teleop.ErrClosed
+	default:
+	}
+	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-f.done:

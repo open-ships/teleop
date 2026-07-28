@@ -149,25 +149,27 @@ func (m *monitorModel) addEvent(event teleop.Event, state teleop.State) {
 	if observation, ok := event.(teleop.ObservationEvent); ok {
 		m.observations++
 		m.state = observation.Current
+		m.lastGap = ""
 		return
 	}
 	if observation, ok := event.(*teleop.ObservationEvent); ok {
 		m.observations++
 		m.state = observation.Current
+		m.lastGap = ""
 		return
 	}
 
 	if gap, ok := event.(teleop.GapEvent); ok {
-		m.lastGap = gap.Reason
+		m.lastGap = terminalText(gap.Reason)
 	}
 	if gap, ok := event.(*teleop.GapEvent); ok {
-		m.lastGap = gap.Reason
+		m.lastGap = terminalText(gap.Reason)
 	}
 
 	m.recent = append(m.recent, recentEvent{
 		number:  m.eventCount,
 		kind:    event.Kind(),
-		summary: eventSummary(event),
+		summary: terminalText(eventSummary(event)),
 	})
 	if len(m.recent) > maxRecentEvents {
 		m.recent = m.recent[len(m.recent)-maxRecentEvents:]
@@ -270,19 +272,19 @@ func (m *monitorModel) renderHeader(width int) string {
 	}
 	title := accentStyle.Render("TELEOP MONITOR")
 
-	deviceName := m.descriptor.Name
+	deviceName := terminalText(m.descriptor.Name)
 	if deviceName == "" {
 		deviceName = "Game controller"
 	}
-	metadata := fmt.Sprintf(
+	metadata := terminalText(fmt.Sprintf(
 		"%s  ·  %s  ·  %s  ·  audit %s",
 		m.descriptor.Type,
 		m.descriptor.Backend,
 		m.descriptor.Transport,
 		m.descriptor.Capability.AuditGrade,
-	)
+	))
 	if m.auditPath != "" {
-		metadata += "  ·  " + filepath.Base(m.auditPath)
+		metadata += "  ·  " + terminalText(filepath.Base(m.auditPath))
 	}
 
 	return lipgloss.JoinVertical(
@@ -471,8 +473,6 @@ func eventKindLabel(kind teleop.EventKind) string {
 		return "stick"
 	case teleop.EventTrigger:
 		return "trigger"
-	case teleop.EventDPad:
-		return "d-pad"
 	case teleop.EventConnection:
 		return "device"
 	case teleop.EventCapabilities:
@@ -517,10 +517,6 @@ func eventSummary(event teleop.Event) string {
 		return fmt.Sprintf("%s %.3f", value.Trigger, value.Position)
 	case *teleop.TriggerEvent:
 		return fmt.Sprintf("%s %.3f", value.Trigger, value.Position)
-	case teleop.DPadEvent:
-		return dpad(value.Current)
-	case *teleop.DPadEvent:
-		return dpad(value.Current)
 	case teleop.ConnectionEvent:
 		return string(value.State)
 	case *teleop.ConnectionEvent:

@@ -16,6 +16,16 @@ const (
 	AuditUnavailable        AuditGrade = "unavailable"
 )
 
+// Valid reports whether grade is a guarantee understood by this format.
+func (grade AuditGrade) Valid() bool {
+	switch grade {
+	case AuditExactBackendStream, AuditSampledState, AuditUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 type ControlKind string
 
 const (
@@ -41,6 +51,9 @@ type Capabilities struct {
 }
 
 func (c Capabilities) Clone() Capabilities {
+	if !c.AuditGrade.Valid() {
+		c.AuditGrade = AuditUnavailable
+	}
 	c.Controls = append([]ControlDescriptor(nil), c.Controls...)
 	return c
 }

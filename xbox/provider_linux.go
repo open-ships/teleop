@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"unsafe"
 
 	"github.com/open-ships/teleop"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -65,6 +67,11 @@ const (
 
 	busUSB       = 0x03
 	busBluetooth = 0x05
+
+	linuxReadPollInterval = 100 * time.Millisecond
+	// maxLinuxRawBytes bounds a malformed evdev frame that never reaches
+	// SYN_REPORT. Native input is diagnostic data, not unbounded storage.
+	maxLinuxRawBytes = 1 << 20
 )
 
 type linuxInputID struct {
@@ -245,6 +252,8 @@ type linuxSource struct {
 	dropped    bool
 	initial    bool
 	closeOnce  sync.Once
+	closeMu    sync.RWMutex
+	closed     bool
 }
 
 func (s *linuxSource) Descriptor() teleop.Descriptor {
@@ -252,6 +261,12 @@ func (s *linuxSource) Descriptor() teleop.Descriptor {
 }
 
 func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
+	if err := ctx.Err(); err != nil {
+		return teleop.Observation{}, err
+	}
+	if s.isClosed() {
+		return teleop.Observation{}, teleop.ErrClosed
+	}
 	if s.initial {
 		s.initial = false
 		return teleop.Observation{
@@ -266,14 +281,14 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 		if err := ctx.Err(); err != nil {
 			return teleop.Observation{}, err
 		}
-		var event linuxInputEvent
-		if err := binary.Read(s.file, binary.LittleEndian, &event); err != nil {
-			if errors.Is(err, os.ErrClosed) {
-				return teleop.Observation{}, teleop.ErrClosed
-			}
+		if err := s.waitReadable(ctx); err != nil {
 			return teleop.Observation{}, err
 		}
-		_ = binary.Write(&s.raw, binary.LittleEndian, event)
+		var event linuxInputEvent
+		if err := binary.Read(s.file, binary.NativeEndian, &event); err != nil {
+			return teleop.Observation{}, s.normalizeReadError(err)
+		}
+		s.appendRaw(event)
 
 		if event.Type == evSyn && event.Code == synDropped {
 			s.dropped = true
@@ -282,19 +297,23 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 		if s.dropped {
 			if event.Type == evSyn && event.Code == synReport {
 				if err := s.resync(); err != nil {
-					return teleop.Observation{}, err
+					return teleop.Observation{}, s.normalizeReadError(err)
 				}
 				raw := append([]byte(nil), s.raw.Bytes()...)
 				s.raw.Reset()
 				s.dropped = false
 				return teleop.Observation{
-					State:      s.state.Clone(),
-					ObservedAt: linuxEventTime(event),
+					State:           s.state.Clone(),
+					ObservedAt:      linuxEventTime(event),
+					DeviceTimestamp: int64(event.Time.Sec)*1_000_000_000 + int64(event.Time.Usec)*1_000,
 					Native: teleop.NativeInput{
 						Format: "linux-evdev",
 						Data:   raw,
 					},
-					Gap: &teleop.SourceGap{Reason: "evdev SYN_DROPPED buffer overrun"},
+					Gap: &teleop.SourceGap{
+						Dropped: 1, // SYN_DROPPED proves at least one event was lost.
+						Reason:  "evdev SYN_DROPPED buffer overrun",
+					},
 				}, nil
 			}
 			continue
@@ -314,6 +333,14 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 				},
 			}, nil
 		}
+	}
+}
+
+func (s *linuxSource) appendRaw(event linuxInputEvent) {
+	_ = binary.Write(&s.raw, binary.NativeEndian, event)
+	if s.raw.Len() > maxLinuxRawBytes {
+		s.raw.Reset()
+		s.dropped = true
 	}
 }
 
@@ -380,7 +407,82 @@ func (s *linuxSource) resync() error {
 
 func (s *linuxSource) Close() error {
 	var err error
-	s.closeOnce.Do(func() { err = s.file.Close() })
+	s.closeOnce.Do(func() {
+		s.closeMu.Lock()
+		s.closed = true
+		s.closeMu.Unlock()
+		err = s.file.Close()
+	})
+	return err
+}
+
+func (s *linuxSource) isClosed() bool {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
+	return s.closed
+}
+
+func (s *linuxSource) waitReadable(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.isClosed() {
+			return teleop.ErrClosed
+		}
+
+		timeout := linuxReadPollInterval
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return ctx.Err()
+			}
+			if remaining < timeout {
+				timeout = remaining
+			}
+		}
+		timeoutMillis := int((timeout + time.Millisecond - 1) / time.Millisecond)
+		pollFDs := []unix.PollFd{{
+			Fd:     int32(s.file.Fd()),
+			Events: unix.POLLIN,
+		}}
+		ready, err := unix.Poll(pollFDs, timeoutMillis)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			return s.normalizeReadError(err)
+		}
+		if ready == 0 {
+			continue
+		}
+		revents := pollFDs[0].Revents
+		if revents&unix.POLLNVAL != 0 {
+			if s.isClosed() {
+				return teleop.ErrClosed
+			}
+			return fmt.Errorf("%w: evdev descriptor is invalid", teleop.ErrDisconnected)
+		}
+		if revents&(unix.POLLIN|unix.POLLERR|unix.POLLHUP) != 0 {
+			return nil
+		}
+	}
+}
+
+func (s *linuxSource) normalizeReadError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if s.isClosed() || errors.Is(err, os.ErrClosed) {
+		return teleop.ErrClosed
+	}
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.ENXIO) ||
+		errors.Is(err, syscall.EIO) {
+		return fmt.Errorf("%w: evdev read: %v", teleop.ErrDisconnected, err)
+	}
 	return err
 }
 
@@ -436,31 +538,34 @@ func linuxCapabilities(file *os.File) (map[teleop.ControlID]bool, map[uint16]lin
 	return supported, ranges, nil
 }
 
-func linuxKeyControls() map[int]teleop.ControlID {
-	return map[int]teleop.ControlID{
-		btnSouth:      ButtonA,
-		btnEast:       ButtonB,
-		btnWest:       ButtonX,
-		btnNorth:      ButtonY,
-		btnTL:         LeftBumper,
-		btnTR:         RightBumper,
-		btnThumbL:     LeftStick,
-		btnThumbR:     RightStick,
-		btnStart:      Menu,
-		btnSelect:     View,
-		btnMode:       Xbox,
-		keyF12:        Share,
-		keyRecord:     Share,
-		btnDPadUp:     teleop.DPadUp,
-		btnDPadDown:   teleop.DPadDown,
-		btnDPadLeft:   teleop.DPadLeft,
-		btnDPadRight:  teleop.DPadRight,
-		btnGripLeft:   Paddle1,
-		btnGripRight:  Paddle2,
-		btnGripLeft2:  Paddle3,
-		btnGripRight2: Paddle4,
-	}
+var linuxControls = map[int]teleop.ControlID{
+	btnSouth: ButtonA,
+	btnEast:  ButtonB,
+	// Xbox's xpad driver emits the legacy BTN_X/BTN_Y aliases. Those aliases
+	// share numeric values with BTN_NORTH/BTN_WEST, respectively, so their
+	// physical labels are the inverse of the geometric names.
+	btnNorth:      ButtonX,
+	btnWest:       ButtonY,
+	btnTL:         LeftBumper,
+	btnTR:         RightBumper,
+	btnThumbL:     LeftStick,
+	btnThumbR:     RightStick,
+	btnStart:      Menu,
+	btnSelect:     View,
+	btnMode:       Xbox,
+	keyF12:        Share,
+	keyRecord:     Share,
+	btnDPadUp:     teleop.DPadUp,
+	btnDPadDown:   teleop.DPadDown,
+	btnDPadLeft:   teleop.DPadLeft,
+	btnDPadRight:  teleop.DPadRight,
+	btnGripLeft:   Paddle1,
+	btnGripRight:  Paddle2,
+	btnGripLeft2:  Paddle3,
+	btnGripRight2: Paddle4,
 }
+
+func linuxKeyControls() map[int]teleop.ControlID { return linuxControls }
 
 func linuxKeyControl(code uint16) (teleop.ControlID, bool) {
 	control, ok := linuxKeyControls()[int(code)]
@@ -481,16 +586,6 @@ func linuxDeviceString(fd uintptr, number uintptr) (string, error) {
 func linuxBit(buffer []byte, bit int) bool {
 	index := bit / 8
 	return index >= 0 && index < len(buffer) && buffer[index]&(1<<uint(bit%8)) != 0
-}
-
-func linuxIOR(kind, number, size uintptr) uintptr {
-	const (
-		read      = 2
-		direction = 30
-		sizeShift = 16
-		typeShift = 8
-	)
-	return uintptr(read)<<direction | size<<sizeShift | kind<<typeShift | number
 }
 
 func linuxIOCTL(fd, request uintptr, value unsafe.Pointer) error {
