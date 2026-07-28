@@ -384,6 +384,8 @@ when commands stop arriving. See [the safety guide](docs/safety.md).
 
 ## Terminal monitor
 
+![teleop monitor showing live Xbox controller state and the canonical event stream](docs/teleop-monitor.png)
+
 List controllers:
 
 ```sh
