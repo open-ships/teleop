@@ -29,6 +29,7 @@ The `v1.0.0` tag begins the Go module compatibility commitment.
 
 - Controller-neutral `GameController`, `Provider`, `State`, and `Event` APIs
 - Normalized sticks, triggers, buttons, and four-way D-pad with diagonals
+- Normalized low- and high-frequency controller rumble
 - Xbox A/B/X/Y aliases without coupling application code to printed labels
 - Typed input, connection, capability, error, and known-loss events
 - Multiple controllers, fan-out subscriptions, and explicit hotplug watching
@@ -130,6 +131,34 @@ backends are change-driven, so a held control can legitimately produce no new
 observations; observation age alone is not proof of disconnect. Confirmed
 disconnects always synthesize a neutral state and release events.
 
+## Controller rumble
+
+Check the discovered capability before applying vibration:
+
+```go
+if controller.Capabilities().Rumble {
+    err := controller.SetRumble(ctx, teleop.Rumble{
+        LowFrequency:  0.8,
+        HighFrequency: 0.35,
+    })
+    if err != nil {
+        return err
+    }
+}
+```
+
+Both strengths are normalized to `[0,1]`. Backends with discrete motors map
+them directly; macOS Core Haptics maps the balance to intensity and sharpness.
+A rumble setting remains active until it is replaced, the zero value is
+applied, or the controller closes:
+
+```go
+err := controller.SetRumble(ctx, teleop.Rumble{})
+```
+
+The context bounds the call; canceling it after `SetRumble` returns does not
+stop the motors. Every built-in backend stops active rumble during `Close`.
+
 ## Input model
 
 Controls are named by physical position so application bindings remain stable
@@ -141,8 +170,8 @@ across controller brands. For example, `xbox.ButtonA` is an alias for
 - D-pad directions are independent booleans, so diagonals are preserved.
 - D-pad direction changes emit `ButtonEvent` values such as
   `button.dpad.left` with `pressed` or `released` phases.
-- `Descriptor.Capability` reports only the controls exposed by the selected
-  backend.
+- `Descriptor.Capability` reports only the controls and output features
+  exposed by the selected backend.
 - Canonical input is not coalesced and has no dead zone applied. Apply
   `teleop.ApplyRadialDeadZone` only when turning input into commands.
 
@@ -233,17 +262,21 @@ or XInput slot.
 
 | Platform | Backend | Audit grade | Notes |
 | --- | --- | --- | --- |
-| Linux | evdev | `AuditExactBackendStream` | Direct `/dev/input` event stream; no `libudev` dependency |
-| macOS | Game Controller | `AuditExactBackendStream` | Requires cgo and Apple's Foundation and GameController frameworks |
-| Windows | XInput | `AuditSampledState` | Polls up to four XInput slots; physical transport is not exposed |
+| Linux | evdev | `AuditExactBackendStream` | Direct `/dev/input` events and `FF_RUMBLE`; no `libudev` dependency |
+| macOS | Game Controller | `AuditExactBackendStream` | Input plus Core Haptics rumble; requires cgo |
+| Windows | XInput | `AuditSampledState` | Polls up to four slots and uses `XInputSetState` for rumble |
 
 Capabilities vary by controller, driver, and OS. Guide/Xbox, Share, and Elite
 paddles are reported only when the backend exposes them. Standard XInput does
-not expose these controls.
+not expose these controls. Rumble is advertised only when the selected backend
+can drive it.
 
 ### Linux setup
 
-The application needs read permission for `/dev/input/event*`.
+The application needs read permission for `/dev/input/event*`. Rumble also
+requires write permission. If a rumble-capable device can only be opened
+read-only, input remains available and `Capabilities.Rumble` is false for the
+open session.
 
 - USB controllers normally use the kernel `xpad` driver.
 - Bluetooth controllers commonly use
@@ -400,7 +433,15 @@ go run ./cmd/teleop-monitor
 
 The Bubble Tea monitor uses the alternate screen, switches between
 side-by-side and stacked layouts as the terminal is resized, and exits
-immediately with `q`, `Esc`, or `Ctrl-C`.
+immediately with `q`, `Esc`, or `Ctrl-C`. When the opened controller advertises
+rumble, press `r` to toggle it and `m` to switch between both components and
+alternating low/high (left/right on XInput-style controllers). Use `Tab` to
+select the intensity or interval slider and `←`/`→` to adjust it. Intensity
+runs from `0.0` to `1.0` in `0.1` steps. The alternating interval is the time
+per side and runs from 1 to 10 seconds in one-second steps.
+Changes update live while rumble is active. A full-width haptic-feedback
+section above the input and event panels shows the controls and rumble state;
+failures stay visible with a retry hint.
 
 Record while monitoring:
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -13,7 +14,12 @@ import (
 	"github.com/open-ships/teleop"
 )
 
-const maxRecentEvents = 64
+const (
+	maxRecentEvents      = 64
+	rumbleIntensitySteps = 10
+	rumbleIntervalSteps  = 10
+	rumbleIntervalStep   = time.Second
+)
 
 var (
 	accentStyle = lipgloss.NewStyle().
@@ -25,6 +31,9 @@ var (
 	recordingStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.BrightRed)
+	rumbleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.BrightMagenta)
 	mutedStyle = lipgloss.NewStyle().
 			Faint(true)
 	activeControlStyle = lipgloss.NewStyle().
@@ -50,6 +59,41 @@ type controllerStreamEndedMsg struct {
 	err error
 }
 
+type rumbleSetMsg struct {
+	enabled  bool
+	level    int
+	mode     rumbleMode
+	side     rumbleSide
+	revision uint64
+	err      error
+}
+
+type rumbleTickMsg struct {
+	revision uint64
+}
+
+type rumbleMode uint8
+
+const (
+	rumbleModeBoth rumbleMode = iota
+	rumbleModeAlternate
+)
+
+type rumbleSide uint8
+
+const (
+	rumbleSideBoth rumbleSide = iota
+	rumbleSideLeft
+	rumbleSideRight
+)
+
+type hapticSlider uint8
+
+const (
+	hapticSliderIntensity hapticSlider = iota
+	hapticSliderInterval
+)
+
 type recentEvent struct {
 	number  uint64
 	kind    teleop.EventKind
@@ -65,13 +109,25 @@ type monitorModel struct {
 	state        teleop.State
 	auditPath    string
 
-	width        int
-	height       int
-	eventCount   uint64
-	observations uint64
-	recent       []recentEvent
-	lastGap      string
-	streamErr    error
+	width               int
+	height              int
+	eventCount          uint64
+	observations        uint64
+	recent              []recentEvent
+	lastGap             string
+	streamErr           error
+	rumbleOn            bool
+	rumblePending       bool
+	rumbleTarget        bool
+	rumbleTargetMode    rumbleMode
+	rumbleTargetSide    rumbleSide
+	rumbleLevel         int
+	rumbleMode          rumbleMode
+	rumbleSide          rumbleSide
+	rumbleIntervalLevel int
+	hapticSlider        hapticSlider
+	rumbleRevision      uint64
+	rumbleErr           error
 }
 
 func newMonitorModel(
@@ -82,15 +138,17 @@ func newMonitorModel(
 	auditPath string,
 ) *monitorModel {
 	return &monitorModel{
-		ctx:          ctx,
-		cancelEvents: cancelEvents,
-		controller:   controller,
-		subscription: subscription,
-		descriptor:   controller.Descriptor(),
-		state:        controller.Snapshot(),
-		auditPath:    auditPath,
-		width:        96,
-		height:       28,
+		ctx:                 ctx,
+		cancelEvents:        cancelEvents,
+		controller:          controller,
+		subscription:        subscription,
+		descriptor:          controller.Descriptor(),
+		state:               controller.Snapshot(),
+		auditPath:           auditPath,
+		width:               96,
+		height:              28,
+		rumbleLevel:         rumbleIntensitySteps,
+		rumbleIntervalLevel: 4,
 	}
 }
 
@@ -106,12 +164,61 @@ func (m *monitorModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancelEvents()
 			return m, tea.Quit
 		}
+		if strings.EqualFold(key, "r") && !message.Key().IsRepeat {
+			return m, m.toggleRumble()
+		}
+		if strings.EqualFold(key, "m") && !message.Key().IsRepeat {
+			return m, m.toggleRumbleMode()
+		}
+		if key == "tab" {
+			m.toggleHapticSlider()
+			return m, nil
+		}
+		switch key {
+		case "left":
+			return m, m.adjustHapticSlider(-1)
+		case "right":
+			return m, m.adjustHapticSlider(1)
+		}
 	case tea.WindowSizeMsg:
 		m.width = message.Width
 		m.height = message.Height
 	case controllerEventMsg:
 		m.addEvent(message.event, message.state)
 		return m, m.waitForEvent()
+	case rumbleSetMsg:
+		m.rumblePending = false
+		if message.err != nil {
+			m.rumbleErr = message.err
+			return m, nil
+		}
+		m.rumbleOn = message.enabled
+		m.rumbleErr = nil
+		m.rumbleSide = message.side
+		if !message.enabled {
+			m.rumbleSide = rumbleSideBoth
+			return m, nil
+		}
+		if message.revision != m.rumbleRevision ||
+			message.mode != m.rumbleMode ||
+			message.level != m.rumbleLevel {
+			return m, m.requestCurrentRumble()
+		}
+		if m.rumbleMode == rumbleModeAlternate {
+			return m, m.scheduleRumbleTick()
+		}
+	case rumbleTickMsg:
+		if message.revision != m.rumbleRevision ||
+			!m.rumbleOn ||
+			m.rumblePending ||
+			m.rumbleMode != rumbleModeAlternate {
+			return m, nil
+		}
+		side := rumbleSideLeft
+		if m.rumbleSide == rumbleSideLeft {
+			side = rumbleSideRight
+		}
+		return m, m.requestRumble(true, side)
 	case controllerStreamEndedMsg:
 		if !errors.Is(message.err, context.Canceled) &&
 			!errors.Is(message.err, teleop.ErrClosed) {
@@ -140,6 +247,167 @@ func (m *monitorModel) waitForEvent() tea.Cmd {
 			state: m.controller.Snapshot(),
 		}
 	}
+}
+
+func (m *monitorModel) toggleRumble() tea.Cmd {
+	if !m.descriptor.Capability.Rumble || m.rumblePending {
+		return nil
+	}
+	if m.rumbleErr != nil {
+		if !m.rumbleTarget {
+			return m.requestRumble(false, rumbleSideBoth)
+		}
+		side := m.rumbleTargetSide
+		if m.rumbleTargetMode != m.rumbleMode {
+			side = m.currentRumbleSide()
+		}
+		return m.requestRumble(true, side)
+	}
+
+	m.rumbleRevision++
+	if m.rumbleOn {
+		return m.requestRumble(false, rumbleSideBoth)
+	}
+	return m.requestCurrentRumble()
+}
+
+func (m *monitorModel) toggleRumbleMode() tea.Cmd {
+	if !m.descriptor.Capability.Rumble {
+		return nil
+	}
+	if m.rumbleMode == rumbleModeBoth {
+		m.rumbleMode = rumbleModeAlternate
+	} else {
+		m.rumbleMode = rumbleModeBoth
+		m.hapticSlider = hapticSliderIntensity
+	}
+	m.rumbleRevision++
+	if m.rumblePending || !m.rumbleOn {
+		return nil
+	}
+	return m.requestCurrentRumble()
+}
+
+func (m *monitorModel) toggleHapticSlider() {
+	if !m.descriptor.Capability.Rumble ||
+		m.rumbleMode != rumbleModeAlternate {
+		m.hapticSlider = hapticSliderIntensity
+		return
+	}
+	if m.hapticSlider == hapticSliderIntensity {
+		m.hapticSlider = hapticSliderInterval
+	} else {
+		m.hapticSlider = hapticSliderIntensity
+	}
+}
+
+func (m *monitorModel) adjustHapticSlider(delta int) tea.Cmd {
+	if m.hapticSlider == hapticSliderInterval {
+		return m.adjustRumbleInterval(delta)
+	}
+	return m.adjustRumbleIntensity(delta)
+}
+
+func (m *monitorModel) adjustRumbleIntensity(delta int) tea.Cmd {
+	if !m.descriptor.Capability.Rumble {
+		return nil
+	}
+	level := min(rumbleIntensitySteps, max(0, m.rumbleLevel+delta))
+	if level == m.rumbleLevel {
+		return nil
+	}
+	m.rumbleLevel = level
+	m.rumbleRevision++
+	if m.rumblePending || !m.rumbleOn {
+		return nil
+	}
+	return m.requestCurrentRumble()
+}
+
+func (m *monitorModel) adjustRumbleInterval(delta int) tea.Cmd {
+	if !m.descriptor.Capability.Rumble ||
+		m.rumbleMode != rumbleModeAlternate {
+		return nil
+	}
+	level := min(
+		rumbleIntervalSteps-1,
+		max(0, m.rumbleIntervalLevel+delta),
+	)
+	if level == m.rumbleIntervalLevel {
+		return nil
+	}
+	m.rumbleIntervalLevel = level
+	m.rumbleRevision++
+	if m.rumblePending || !m.rumbleOn {
+		return nil
+	}
+	return m.scheduleRumbleTick()
+}
+
+func (m *monitorModel) currentRumbleSide() rumbleSide {
+	if m.rumbleMode == rumbleModeBoth {
+		return rumbleSideBoth
+	}
+	if m.rumbleSide == rumbleSideLeft ||
+		m.rumbleSide == rumbleSideRight {
+		return m.rumbleSide
+	}
+	return rumbleSideLeft
+}
+
+func (m *monitorModel) requestCurrentRumble() tea.Cmd {
+	return m.requestRumble(true, m.currentRumbleSide())
+}
+
+func (m *monitorModel) requestRumble(
+	enabled bool,
+	side rumbleSide,
+) tea.Cmd {
+	if !enabled || m.rumbleMode == rumbleModeBoth {
+		side = rumbleSideBoth
+	}
+	m.rumbleTarget = enabled
+	m.rumbleTargetMode = m.rumbleMode
+	m.rumbleTargetSide = side
+	m.rumblePending = true
+	m.rumbleErr = nil
+	rumble := teleop.Rumble{}
+	if enabled {
+		intensity := float32(m.rumbleLevel) / rumbleIntensitySteps
+		switch side {
+		case rumbleSideLeft:
+			rumble.LowFrequency = intensity
+		case rumbleSideRight:
+			rumble.HighFrequency = intensity
+		default:
+			rumble.LowFrequency = intensity
+			rumble.HighFrequency = intensity
+		}
+	}
+	level := m.rumbleLevel
+	mode := m.rumbleMode
+	revision := m.rumbleRevision
+	return func() tea.Msg {
+		return rumbleSetMsg{
+			enabled:  enabled,
+			level:    level,
+			mode:     mode,
+			side:     side,
+			revision: revision,
+			err:      m.controller.SetRumble(m.ctx, rumble),
+		}
+	}
+}
+
+func (m *monitorModel) rumbleInterval() time.Duration {
+	return time.Duration(m.rumbleIntervalLevel+1) * rumbleIntervalStep
+}
+
+func (m *monitorModel) scheduleRumbleTick() tea.Cmd {
+	revision := m.rumbleRevision
+	return tea.Tick(m.rumbleInterval(), func(time.Time) tea.Msg {
+		return rumbleTickMsg{revision: revision}
+	})
 }
 
 func (m *monitorModel) addEvent(event teleop.Event, state teleop.State) {
@@ -221,7 +489,11 @@ func (m *monitorModel) render() string {
 	}
 	contentWidth := max(30, width-2)
 
-	parts := []string{m.renderHeader(contentWidth)}
+	footer := m.renderFooter(contentWidth)
+	parts := []string{
+		m.renderHeader(contentWidth),
+		m.renderHaptics(contentWidth),
+	}
 	if m.lastGap != "" {
 		recovery := "reconnect the controller"
 		if m.auditPath != "" {
@@ -233,28 +505,34 @@ func (m *monitorModel) render() string {
 			errorStyle.Render(m.lastGap+" — "+recovery)
 		parts = append(parts, alert)
 	}
+	occupiedHeight := lipgloss.Height(
+		lipgloss.JoinVertical(lipgloss.Left, parts...),
+	) + lipgloss.Height(footer)
 
 	if contentWidth >= 104 {
 		stateWidth := min(58, contentWidth-31)
 		eventWidth := contentWidth - stateWidth - 3
 		state := m.renderState(stateWidth)
-		events := m.renderEvents(eventWidth, max(5, height-7))
+		eventLines := max(5, height-occupiedHeight-2)
+		events := m.renderEvents(eventWidth, eventLines)
 		separatorHeight := max(lipgloss.Height(state), lipgloss.Height(events))
 		separator := mutedStyle.Render(
 			strings.TrimSuffix(strings.Repeat(" │ \n", separatorHeight), "\n"),
 		)
 		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Top, state, separator, events))
 	} else {
-		eventLines := max(3, height-18)
+		state := m.renderState(contentWidth)
+		eventLines := max(
+			3,
+			height-occupiedHeight-lipgloss.Height(state)-2,
+		)
 		parts = append(
 			parts,
-			m.renderState(contentWidth),
+			state,
 			m.renderEvents(contentWidth, eventLines),
 		)
 	}
 
-	footer := mutedStyle.Render("q / esc  quit") + "   " +
-		mutedStyle.Render("every event remains available with --json")
 	parts = append(parts, footer)
 
 	content := lipgloss.JoinVertical(lipgloss.Left, parts...)
@@ -294,6 +572,188 @@ func (m *monitorModel) renderHeader(width int) string {
 		mutedStyle.MaxWidth(width).Render(metadata),
 		mutedStyle.Render(strings.Repeat("─", width)),
 	)
+}
+
+func (m *monitorModel) renderHaptics(width int) string {
+	header := sectionHeader("HAPTIC FEEDBACK", width)
+	label := lipgloss.NewStyle().Bold(true).Render("RUMBLE")
+	supported := m.descriptor.Capability.Rumble
+	var state, action string
+
+	switch {
+	case !supported:
+		state = mutedStyle.Render("— UNAVAILABLE")
+	case m.rumblePending:
+		transition := "starting"
+		if !m.rumbleTarget {
+			transition = "stopping"
+		} else if m.rumbleOn {
+			transition = "applying"
+		}
+		state = rumbleStyle.Render("◇ " + strings.ToUpper(transition) + "…")
+	case m.rumbleErr != nil:
+		if m.rumbleOn {
+			state = m.renderRumbleOnState(width)
+		} else {
+			state = mutedStyle.Render("○ OFF")
+		}
+	case m.rumbleOn:
+		state = m.renderRumbleOnState(width)
+		action = keyHint("r", "turn off")
+	default:
+		state = mutedStyle.Render("○ OFF")
+		action = keyHint("r", "turn on")
+	}
+
+	status := label + "  " + state
+	rows := []string{header}
+	if m.rumbleErr != nil {
+		failure := errorStyle.Render("ERROR") + " " +
+			errorStyle.Render(terminalText(m.rumbleErr.Error()))
+		retry := keyHint("r", "retry")
+		line := status + "   " + failure + "   " + retry
+		if lipgloss.Width(line) <= width {
+			rows = append(rows, line)
+		} else {
+			detail := retry + "   " + failure
+			rows = append(
+				rows,
+				status+"   "+errorStyle.Render("ERROR"),
+				lipgloss.NewStyle().MaxWidth(width).Render(detail),
+			)
+		}
+	} else {
+		if action != "" {
+			status += "   " + action
+		}
+		mode := m.renderRumbleMode(width)
+		if lipgloss.Width(status)+5+lipgloss.Width(mode) <= width {
+			rows = append(rows, status+"     "+mode)
+		} else {
+			rows = append(rows, status, mode)
+		}
+	}
+	if supported {
+		if m.rumbleErr != nil {
+			rows = append(rows, m.renderRumbleMode(width))
+		}
+		rows = append(rows, m.renderRumbleIntensity(width))
+		if m.rumbleMode == rumbleModeAlternate {
+			rows = append(rows, m.renderRumbleInterval(width))
+		}
+		rows = append(rows, m.renderHapticHelp(width))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+func (m *monitorModel) renderRumbleOnState(width int) string {
+	value := "● ON"
+	if m.rumbleMode == rumbleModeAlternate {
+		side := "LEFT"
+		if m.rumbleSide == rumbleSideRight {
+			side = "RIGHT"
+		}
+		if width < 34 {
+			side = side[:1]
+		}
+		value += " · " + side
+	}
+	return rumbleStyle.Render(value)
+}
+
+func (m *monitorModel) renderRumbleMode(width int) string {
+	value := "BOTH"
+	if m.rumbleMode == rumbleModeAlternate {
+		value = "ALTERNATE L/R"
+	}
+	action := "change"
+	if width < 34 {
+		if m.rumbleMode == rumbleModeAlternate {
+			value = "ALT L/R"
+		}
+		action = "mode"
+	}
+	label := lipgloss.NewStyle().Bold(true).Render("MODE")
+	return label + "  " +
+		lipgloss.NewStyle().Bold(true).Render(value) + "   " +
+		keyHint("m", action)
+}
+
+func (m *monitorModel) renderRumbleIntensity(width int) string {
+	level := min(rumbleIntensitySteps, max(0, m.rumbleLevel))
+	value := fmt.Sprintf("%3d%%", level*100/rumbleIntensitySteps)
+	return renderHapticSlider(
+		"INTENSITY",
+		value,
+		level,
+		rumbleIntensitySteps,
+		width,
+		m.hapticSlider == hapticSliderIntensity,
+	)
+}
+
+func (m *monitorModel) renderRumbleInterval(width int) string {
+	level := min(
+		rumbleIntervalSteps-1,
+		max(0, m.rumbleIntervalLevel),
+	)
+	value := m.rumbleInterval().String()
+	return renderHapticSlider(
+		"INTERVAL",
+		value,
+		level,
+		rumbleIntervalSteps-1,
+		width,
+		m.hapticSlider == hapticSliderInterval,
+	)
+}
+
+func (m *monitorModel) renderHapticHelp(width int) string {
+	adjust := keyHint("← / →", "adjust")
+	if m.rumbleMode != rumbleModeAlternate {
+		return adjust
+	}
+	selectSlider := keyHint("tab", "select slider")
+	if lipgloss.Width(selectSlider)+3+lipgloss.Width(adjust) <= width {
+		return selectSlider + "   " + adjust
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, selectSlider, adjust)
+}
+
+func renderHapticSlider(
+	label string,
+	value string,
+	level int,
+	maxLevel int,
+	width int,
+	selected bool,
+) string {
+	meterWidth := 10
+	if width < 34 {
+		meterWidth = 7
+	}
+	filled := 0
+	if maxLevel > 0 {
+		filled = (level*meterWidth + maxLevel/2) / maxLevel
+	}
+	meter := rumbleStyle.Render(strings.Repeat("━", filled)) +
+		mutedStyle.Render(strings.Repeat("─", meterWidth-filled))
+	marker := "  "
+	if selected {
+		marker = accentStyle.Render("›") + " "
+	}
+	return marker +
+		lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("%-9s", label)) +
+		"  [" + meter + "]  " + value
+}
+
+func (m *monitorModel) renderFooter(width int) string {
+	quit := mutedStyle.Render("q / esc  quit")
+	note := mutedStyle.Render("every event remains available with --json")
+	if lipgloss.Width(quit)+3+lipgloss.Width(note) <= width {
+		return quit + "   " + note
+	}
+	return quit
 }
 
 func (m *monitorModel) renderState(width int) string {
@@ -455,6 +915,10 @@ func sectionHeader(label string, width int) string {
 	title := accentStyle.Render(label)
 	remaining := max(1, width-lipgloss.Width(title)-1)
 	return title + " " + mutedStyle.Render(strings.Repeat("─", remaining))
+}
+
+func keyHint(key, action string) string {
+	return accentStyle.Render(key) + mutedStyle.Render("  "+action)
 }
 
 func padBetween(left, right string, width int) string {

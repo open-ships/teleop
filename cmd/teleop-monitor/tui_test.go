@@ -5,8 +5,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/open-ships/teleop"
 )
@@ -15,6 +17,8 @@ type stubController struct {
 	descriptor teleop.Descriptor
 	state      teleop.State
 	done       chan struct{}
+	rumble     []teleop.Rumble
+	rumbleErr  error
 }
 
 func (c *stubController) Descriptor() teleop.Descriptor {
@@ -50,6 +54,17 @@ func (*stubController) Err() error {
 
 func (*stubController) RecordCommand(context.Context, teleop.Command) error {
 	return nil
+}
+
+func (c *stubController) SetRumble(
+	ctx context.Context,
+	rumble teleop.Rumble,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.rumble = append(c.rumble, rumble)
+	return c.rumbleErr
 }
 
 func (*stubController) Subscribe(
@@ -137,6 +152,7 @@ func TestMonitorModelConsumesAndRendersControllerEvents(t *testing.T) {
 	for _, expected := range []string{
 		"TELEOP MONITOR",
 		"Test Xbox Controller",
+		"HAPTIC FEEDBACK",
 		"INPUT STATE",
 		"EVENT STREAM",
 		"button.face.south",
@@ -145,6 +161,45 @@ func TestMonitorModelConsumesAndRendersControllerEvents(t *testing.T) {
 		if !strings.Contains(view.Content, expected) {
 			t.Errorf("view does not contain %q", expected)
 		}
+	}
+}
+
+func TestMonitorModelPlacesHapticsBeforePrimaryPanels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	model := newMonitorModel(
+		ctx,
+		cancel,
+		&stubController{
+			descriptor: teleop.Descriptor{
+				Name: "Rumble Controller",
+				Capability: teleop.Capabilities{
+					Rumble: true,
+				},
+			},
+		},
+		&stubSubscription{},
+		"",
+	)
+
+	for _, width := range []int{60, 140} {
+		model.width = width
+		rendered := model.render()
+		haptics := strings.Index(rendered, "HAPTIC FEEDBACK")
+		input := strings.Index(rendered, "INPUT STATE")
+		events := strings.Index(rendered, "EVENT STREAM")
+		if haptics < 0 || input < 0 || events < 0 {
+			t.Fatalf("width %d omitted a primary section", width)
+		}
+		if !(haptics < input && haptics < events) {
+			t.Fatalf(
+				"width %d section order does not place haptics before both primary panels",
+				width,
+			)
+		}
+	}
+	if strings.Contains(model.renderFooter(140), "RUMBLE") {
+		t.Fatal("global footer still contains the rumble control")
 	}
 }
 
@@ -240,6 +295,474 @@ func TestMonitorModelRespondsToResizeAndQuit(t *testing.T) {
 	}
 	if !errors.Is(eventContext.Err(), context.Canceled) {
 		t.Fatal("quit key did not cancel the pending event read")
+	}
+}
+
+func TestMonitorModelTogglesRumble(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	controller := &stubController{
+		descriptor: teleop.Descriptor{
+			Name: "Rumble Controller",
+			Capability: teleop.Capabilities{
+				Rumble: true,
+			},
+		},
+	}
+	model := newMonitorModel(
+		ctx,
+		cancel,
+		controller,
+		&stubSubscription{},
+		"",
+	)
+
+	for _, expected := range []string{
+		"HAPTIC FEEDBACK",
+		"○ OFF",
+		"turn on",
+		"INTENSITY",
+		"100%",
+		"adjust",
+	} {
+		if !strings.Contains(model.render(), expected) {
+			t.Fatalf("available haptic section does not contain %q", expected)
+		}
+	}
+	if strings.Contains(model.renderFooter(96), "rumble") {
+		t.Fatal("rumble control still appears in the global footer")
+	}
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
+	if command != nil || model.rumbleLevel != 9 {
+		t.Fatal("offline left key did not lower intensity without a backend call")
+	}
+	if len(controller.rumble) != 0 || !strings.Contains(model.render(), "90%") {
+		t.Fatal("offline intensity adjustment was not retained in the slider")
+	}
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{
+		Code: 'r',
+		Text: "r",
+	}))
+	if command == nil || !model.rumblePending || !model.rumbleTarget {
+		t.Fatal("rumble-on key did not start an enable request")
+	}
+	_, repeated := model.Update(tea.KeyPressMsg(tea.Key{
+		Code:     'r',
+		Text:     "r",
+		IsRepeat: true,
+	}))
+	if repeated != nil {
+		t.Fatal("repeated rumble key started a second request")
+	}
+	for _, line := range strings.Split(model.renderHaptics(30), "\n") {
+		if lipgloss.Width(line) > 30 {
+			t.Fatalf(
+				"compact haptic line is %d cells wide, want at most 30",
+				lipgloss.Width(line),
+			)
+		}
+	}
+	message, ok := command().(rumbleSetMsg)
+	if !ok {
+		t.Fatal("rumble command returned an unexpected message")
+	}
+	_, _ = model.Update(message)
+	if !model.rumbleOn || model.rumblePending {
+		t.Fatal("successful rumble-on request did not update the model")
+	}
+	if len(controller.rumble) != 1 ||
+		controller.rumble[0] != (teleop.Rumble{
+			LowFrequency:  0.9,
+			HighFrequency: 0.9,
+		}) {
+		t.Fatalf("rumble-on calls = %#v, want both components at 0.9", controller.rumble)
+	}
+	for _, expected := range []string{"● ON", "turn off"} {
+		if !strings.Contains(model.render(), expected) {
+			t.Fatalf("enabled view does not contain %q", expected)
+		}
+	}
+
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
+	if command == nil || model.rumbleLevel != 8 || !model.rumblePending {
+		t.Fatal("live left key did not start an intensity update")
+	}
+	if !strings.Contains(model.renderHaptics(96), "APPLYING") {
+		t.Fatal("live intensity update does not show its pending state")
+	}
+	_, queued := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
+	if queued != nil || model.rumbleLevel != 7 {
+		t.Fatal("pending intensity adjustment was not coalesced")
+	}
+	message, ok = command().(rumbleSetMsg)
+	if !ok {
+		t.Fatal("intensity command returned an unexpected message")
+	}
+	_, catchUp := model.Update(message)
+	if catchUp == nil {
+		t.Fatal("coalesced intensity did not schedule a catch-up request")
+	}
+	message, ok = catchUp().(rumbleSetMsg)
+	if !ok {
+		t.Fatal("catch-up intensity command returned an unexpected message")
+	}
+	_, _ = model.Update(message)
+	if model.rumblePending || model.rumbleLevel != 7 {
+		t.Fatal("catch-up intensity request did not settle at 70%")
+	}
+	if len(controller.rumble) != 3 ||
+		controller.rumble[1] != (teleop.Rumble{
+			LowFrequency:  0.8,
+			HighFrequency: 0.8,
+		}) ||
+		controller.rumble[2] != (teleop.Rumble{
+			LowFrequency:  0.7,
+			HighFrequency: 0.7,
+		}) {
+		t.Fatalf("live intensity calls = %#v, want 0.8 followed by 0.7", controller.rumble)
+	}
+	if !strings.Contains(model.renderHaptics(96), "70%") {
+		t.Fatal("settled slider does not show 70%")
+	}
+
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{
+		Code: 'R',
+		Text: "R",
+	}))
+	if command == nil || !model.rumblePending || model.rumbleTarget {
+		t.Fatal("rumble-off key did not start a disable request")
+	}
+	message, ok = command().(rumbleSetMsg)
+	if !ok {
+		t.Fatal("rumble command returned an unexpected message")
+	}
+	_, _ = model.Update(message)
+	if model.rumbleOn || model.rumblePending {
+		t.Fatal("successful rumble-off request did not update the model")
+	}
+	if len(controller.rumble) != 4 ||
+		controller.rumble[3] != (teleop.Rumble{}) {
+		t.Fatalf("rumble-off calls = %#v, want a zero rumble", controller.rumble)
+	}
+}
+
+func TestMonitorModelClampsRumbleIntensity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	controller := &stubController{
+		descriptor: teleop.Descriptor{
+			Capability: teleop.Capabilities{Rumble: true},
+		},
+	}
+	model := newMonitorModel(
+		ctx,
+		cancel,
+		controller,
+		&stubSubscription{},
+		"",
+	)
+
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+	if command != nil || model.rumbleLevel != rumbleIntensitySteps {
+		t.Fatal("right key moved intensity above 100%")
+	}
+	for range rumbleIntensitySteps + 2 {
+		_, command = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
+		if command != nil {
+			t.Fatal("offline intensity adjustment called the backend")
+		}
+	}
+	if model.rumbleLevel != 0 || !strings.Contains(model.renderHaptics(96), "  0%") {
+		t.Fatal("left key did not clamp intensity at 0%")
+	}
+	for range rumbleIntensitySteps + 2 {
+		_, command = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+		if command != nil {
+			t.Fatal("offline intensity adjustment called the backend")
+		}
+	}
+	if model.rumbleLevel != rumbleIntensitySteps ||
+		!strings.Contains(model.renderHaptics(96), "100%") {
+		t.Fatal("right key did not clamp intensity at 100%")
+	}
+	if len(controller.rumble) != 0 {
+		t.Fatal("offline slider changes reached the backend")
+	}
+}
+
+func TestMonitorModelAlternatesRumbleAtConfiguredInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	controller := &stubController{
+		descriptor: teleop.Descriptor{
+			Capability: teleop.Capabilities{Rumble: true},
+		},
+	}
+	model := newMonitorModel(
+		ctx,
+		cancel,
+		controller,
+		&stubSubscription{},
+		"",
+	)
+
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{
+		Code: 'm',
+		Text: "m",
+	}))
+	if command != nil || model.rumbleMode != rumbleModeAlternate {
+		t.Fatal("mode key did not select alternating rumble")
+	}
+	for _, expected := range []string{
+		"ALTERNATE L/R",
+		"INTERVAL",
+		"5s",
+		"select slider",
+	} {
+		if !strings.Contains(model.renderHaptics(96), expected) {
+			t.Fatalf("alternating haptic controls do not contain %q", expected)
+		}
+	}
+	for _, line := range strings.Split(model.renderHaptics(30), "\n") {
+		if lipgloss.Width(line) > 30 {
+			t.Fatalf(
+				"compact alternating haptic line is %d cells wide, want at most 30",
+				lipgloss.Width(line),
+			)
+		}
+	}
+
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
+	if command != nil || model.hapticSlider != hapticSliderInterval {
+		t.Fatal("tab did not select the interval slider")
+	}
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+	if command != nil ||
+		model.rumbleInterval() != 6*time.Second ||
+		!strings.Contains(model.renderHaptics(96), "6s") {
+		t.Fatal("interval slider did not advance to 6s while rumble was off")
+	}
+
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{
+		Code: 'r',
+		Text: "r",
+	}))
+	if command == nil {
+		t.Fatal("alternating rumble did not start")
+	}
+	message, ok := command().(rumbleSetMsg)
+	if !ok {
+		t.Fatal("alternating start returned an unexpected message")
+	}
+	if message.mode != rumbleModeAlternate ||
+		message.side != rumbleSideLeft {
+		t.Fatalf(
+			"alternating start = mode %d side %d, want alternate left",
+			message.mode,
+			message.side,
+		)
+	}
+	_, timer := model.Update(message)
+	if timer == nil || !model.rumbleOn || model.rumbleSide != rumbleSideLeft {
+		t.Fatal("successful alternating start did not schedule a side switch")
+	}
+	if !strings.Contains(model.renderHaptics(96), "● ON · LEFT") {
+		t.Fatal("alternating status does not show the active left side")
+	}
+	if len(controller.rumble) != 1 ||
+		controller.rumble[0] != (teleop.Rumble{
+			LowFrequency: 1,
+		}) {
+		t.Fatalf("alternating left call = %#v, want low-frequency only", controller.rumble)
+	}
+
+	alternatingRevision := model.rumbleRevision
+	_, command = model.Update(rumbleTickMsg{
+		revision: alternatingRevision,
+	})
+	if command == nil {
+		t.Fatal("alternating tick did not request the right side")
+	}
+	message, ok = command().(rumbleSetMsg)
+	if !ok || message.side != rumbleSideRight {
+		t.Fatal("alternating tick returned an unexpected side request")
+	}
+	_, timer = model.Update(message)
+	if timer == nil || model.rumbleSide != rumbleSideRight {
+		t.Fatal("successful right-side request did not continue oscillation")
+	}
+	if !strings.Contains(model.renderHaptics(96), "● ON · RIGHT") {
+		t.Fatal("alternating status does not show the active right side")
+	}
+	if len(controller.rumble) != 2 ||
+		controller.rumble[1] != (teleop.Rumble{
+			HighFrequency: 1,
+		}) {
+		t.Fatalf("alternating right call = %#v, want high-frequency only", controller.rumble)
+	}
+
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{
+		Code: 'm',
+		Text: "m",
+	}))
+	if command == nil || model.rumbleMode != rumbleModeBoth {
+		t.Fatal("mode key did not switch active rumble back to both")
+	}
+	message, ok = command().(rumbleSetMsg)
+	if !ok || message.mode != rumbleModeBoth {
+		t.Fatal("both-mode change returned an unexpected request")
+	}
+	_, timer = model.Update(message)
+	if timer != nil {
+		t.Fatal("both mode continued scheduling alternating ticks")
+	}
+	if len(controller.rumble) != 3 ||
+		controller.rumble[2] != (teleop.Rumble{
+			LowFrequency:  1,
+			HighFrequency: 1,
+		}) {
+		t.Fatalf("both-mode call = %#v, want both components", controller.rumble)
+	}
+	_, stale := model.Update(rumbleTickMsg{
+		revision: alternatingRevision,
+	})
+	if stale != nil || len(controller.rumble) != 3 {
+		t.Fatal("stale alternating tick survived the mode change")
+	}
+}
+
+func TestMonitorModelClampsRumbleInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	controller := &stubController{
+		descriptor: teleop.Descriptor{
+			Capability: teleop.Capabilities{Rumble: true},
+		},
+	}
+	model := newMonitorModel(
+		ctx,
+		cancel,
+		controller,
+		&stubSubscription{},
+		"",
+	)
+	model.rumbleMode = rumbleModeAlternate
+	model.hapticSlider = hapticSliderInterval
+
+	for range rumbleIntervalSteps + 2 {
+		_, command := model.Update(tea.KeyPressMsg(tea.Key{
+			Code: tea.KeyLeft,
+		}))
+		if command != nil {
+			t.Fatal("offline interval adjustment called the backend")
+		}
+	}
+	if model.rumbleInterval() != time.Second ||
+		!strings.Contains(model.renderHaptics(96), "1s") {
+		t.Fatal("interval slider did not clamp at 1s")
+	}
+	for range rumbleIntervalSteps + 2 {
+		_, command := model.Update(tea.KeyPressMsg(tea.Key{
+			Code: tea.KeyRight,
+		}))
+		if command != nil {
+			t.Fatal("offline interval adjustment called the backend")
+		}
+	}
+	if model.rumbleInterval() != 10*time.Second ||
+		!strings.Contains(model.renderHaptics(96), "10s") {
+		t.Fatal("interval slider did not clamp at 10s")
+	}
+	if len(controller.rumble) != 0 {
+		t.Fatal("offline interval slider changes reached the backend")
+	}
+}
+
+func TestMonitorModelReportsUnavailableAndFailedRumble(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	unsupported := &stubController{
+		descriptor: teleop.Descriptor{Name: "Plain Controller"},
+	}
+	model := newMonitorModel(
+		ctx,
+		cancel,
+		unsupported,
+		&stubSubscription{},
+		"",
+	)
+	for _, expected := range []string{"HAPTIC FEEDBACK", "RUMBLE", "UNAVAILABLE"} {
+		if !strings.Contains(model.render(), expected) {
+			t.Fatalf("unavailable haptic section does not contain %q", expected)
+		}
+	}
+	if strings.Contains(model.renderHaptics(96), "turn on") {
+		t.Fatal("unavailable rumble exposes an enable action")
+	}
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{
+		Code: 'r',
+		Text: "r",
+	}))
+	if command != nil || len(unsupported.rumble) != 0 {
+		t.Fatal("unavailable rumble attempted a backend call")
+	}
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
+	if command != nil || model.rumbleLevel != rumbleIntensitySteps {
+		t.Fatal("unavailable rumble accepted an intensity adjustment")
+	}
+
+	failed := &stubController{
+		descriptor: teleop.Descriptor{
+			Name: "Broken Rumble Controller",
+			Capability: teleop.Capabilities{
+				Rumble: true,
+			},
+		},
+		rumbleErr: errors.New("motor failed\x1b[2J"),
+	}
+	model = newMonitorModel(
+		ctx,
+		cancel,
+		failed,
+		&stubSubscription{},
+		"",
+	)
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{
+		Code: 'r',
+		Text: "r",
+	}))
+	if command == nil {
+		t.Fatal("available rumble did not start a request")
+	}
+	message, ok := command().(rumbleSetMsg)
+	if !ok {
+		t.Fatal("rumble command returned an unexpected message")
+	}
+	_, _ = model.Update(message)
+	if model.rumbleOn || model.rumblePending {
+		t.Fatal("failed rumble request changed the enabled state")
+	}
+	for _, expected := range []string{
+		"HAPTIC FEEDBACK",
+		"○ OFF",
+		"ERROR",
+		"motor failed[2J",
+		"retry",
+		"INTENSITY",
+		"100%",
+	} {
+		if !strings.Contains(model.render(), expected) {
+			t.Fatalf("failed rumble view does not contain %q", expected)
+		}
+	}
+	for _, line := range strings.Split(model.renderHaptics(30), "\n") {
+		if lipgloss.Width(line) > 30 {
+			t.Fatalf(
+				"compact haptic error line is %d cells wide, want at most 30",
+				lipgloss.Width(line),
+			)
+		}
 	}
 }
 

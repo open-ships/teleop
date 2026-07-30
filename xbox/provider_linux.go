@@ -26,6 +26,7 @@ const (
 	evSyn = 0x00
 	evKey = 0x01
 	evAbs = 0x03
+	evFF  = 0x15
 
 	synReport  = 0
 	synDropped = 3
@@ -68,6 +69,9 @@ const (
 	busUSB       = 0x03
 	busBluetooth = 0x05
 
+	ffRumble = 0x50
+	ffMax    = 0x7f
+
 	linuxReadPollInterval = 100 * time.Millisecond
 	// maxLinuxRawBytes bounds a malformed evdev frame that never reaches
 	// SYN_REPORT. Native input is diagnostic data, not unbounded storage.
@@ -95,6 +99,31 @@ type linuxInputEvent struct {
 	Type  uint16
 	Code  uint16
 	Value int32
+}
+
+type linuxFFTrigger struct {
+	Button   uint16
+	Interval uint16
+}
+
+type linuxFFReplay struct {
+	Length uint16
+	Delay  uint16
+}
+
+const linuxFFEffectUnionSize = 24 + int(unsafe.Sizeof(uintptr(0)))
+
+// linuxFFEffect mirrors Linux's struct ff_effect. Its union is represented as
+// raw bytes because rumble only uses the first four; the union is 28 bytes on
+// 32-bit Linux and 32 bytes on 64-bit Linux due to ff_periodic_effect's pointer.
+type linuxFFEffect struct {
+	Type      uint16
+	ID        int16
+	Direction uint16
+	Trigger   linuxFFTrigger
+	Replay    linuxFFReplay
+	Padding   uint16
+	Data      [linuxFFEffectUnionSize]byte
 }
 
 func discoverPlatform(ctx context.Context) ([]teleop.Descriptor, error) {
@@ -190,6 +219,8 @@ func inspectLinuxDevice(path string) (teleop.Descriptor, bool, error) {
 	if !supported[ButtonA] || !supported[teleop.StickLeft] {
 		return teleop.Descriptor{}, false, nil
 	}
+	capability := capabilities(teleop.AuditExactBackendStream, supported)
+	capability.Rumble = linuxRumbleSupported(file)
 	return teleop.Descriptor{
 		ID:        teleop.DeviceID(path),
 		Type:      teleop.ControllerXbox,
@@ -202,7 +233,7 @@ func inspectLinuxDevice(path string) (teleop.Descriptor, bool, error) {
 			"path":      path,
 			"real_path": realPath,
 		},
-		Capability: capabilities(teleop.AuditExactBackendStream, supported),
+		Capability: capability,
 	}, true, nil
 }
 
@@ -221,7 +252,18 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 	if !xboxDevice {
 		return nil, fmt.Errorf("%w: %s is not an Xbox controller", teleop.ErrUnavailable, path)
 	}
-	file, err := os.Open(path)
+	var file *os.File
+	if descriptor.Capability.Rumble {
+		file, err = os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			// Input remains useful when the process has read permission but not
+			// the write permission required by force feedback.
+			file, err = os.Open(path)
+			descriptor.Capability.Rumble = false
+		}
+	} else {
+		file, err = os.Open(path)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -231,10 +273,11 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 		return nil, err
 	}
 	source := &linuxSource{
-		file:       file,
-		descriptor: descriptor,
-		ranges:     ranges,
-		initial:    true,
+		file:         file,
+		descriptor:   descriptor,
+		ranges:       ranges,
+		initial:      true,
+		rumbleEffect: -1,
 	}
 	if err := source.resync(); err != nil {
 		file.Close()
@@ -244,16 +287,19 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 }
 
 type linuxSource struct {
-	file       *os.File
-	descriptor teleop.Descriptor
-	ranges     map[uint16]linuxAbsInfo
-	state      teleop.State
-	raw        bytes.Buffer
-	dropped    bool
-	initial    bool
-	closeOnce  sync.Once
-	closeMu    sync.RWMutex
-	closed     bool
+	file         *os.File
+	descriptor   teleop.Descriptor
+	ranges       map[uint16]linuxAbsInfo
+	state        teleop.State
+	raw          bytes.Buffer
+	dropped      bool
+	initial      bool
+	closeOnce    sync.Once
+	closeMu      sync.RWMutex
+	closed       bool
+	closeErr     error
+	rumbleMu     sync.Mutex
+	rumbleEffect int16
 
 	// pending holds bytes read from the device that do not yet form a complete
 	// event. The kernel can split an event across reads, so a decoder that
@@ -467,6 +513,115 @@ func (s *linuxSource) apply(event linuxInputEvent) {
 	}
 }
 
+func (s *linuxSource) SetRumble(ctx context.Context, rumble teleop.Rumble) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.rumbleMu.Lock()
+	defer s.rumbleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.isClosed() {
+		return teleop.ErrClosed
+	}
+	if !s.descriptor.Capability.Rumble {
+		return teleop.ErrUnsupported
+	}
+	if rumble.LowFrequency == 0 && rumble.HighFrequency == 0 {
+		if err := s.stopRumbleLocked(false); err != nil {
+			return s.normalizeRumbleError(err)
+		}
+		return nil
+	}
+
+	effect := newLinuxRumbleEffect(s.rumbleEffect, rumble)
+	if err := linuxIOCTL(
+		s.file.Fd(),
+		linuxIOW('E', 0x80, unsafe.Sizeof(effect)),
+		unsafe.Pointer(&effect),
+	); err != nil {
+		return s.normalizeRumbleError(err)
+	}
+	if effect.ID < 0 {
+		return fmt.Errorf("%w: evdev did not allocate a rumble effect", teleop.ErrUnavailable)
+	}
+	s.rumbleEffect = effect.ID
+	if err := s.writeRumbleEvent(effect.ID, 1); err != nil {
+		return s.normalizeRumbleError(err)
+	}
+	return nil
+}
+
+func newLinuxRumbleEffect(id int16, rumble teleop.Rumble) linuxFFEffect {
+	effect := linuxFFEffect{
+		Type: ffRumble,
+		ID:   id,
+		// A zero replay length is the evdev representation of an effect that
+		// remains active until an EV_FF stop event is written.
+		Replay: linuxFFReplay{Length: 0},
+	}
+	binary.NativeEndian.PutUint16(effect.Data[0:2], rumbleMagnitude(rumble.LowFrequency))
+	binary.NativeEndian.PutUint16(effect.Data[2:4], rumbleMagnitude(rumble.HighFrequency))
+	return effect
+}
+
+func (s *linuxSource) writeRumbleEvent(effectID int16, value int32) error {
+	event := linuxInputEvent{
+		Type:  evFF,
+		Code:  uint16(effectID),
+		Value: value,
+	}
+	var encoded bytes.Buffer
+	if err := binary.Write(&encoded, binary.NativeEndian, event); err != nil {
+		return err
+	}
+	written, err := s.file.Write(encoded.Bytes())
+	if err != nil {
+		return err
+	}
+	if written != encoded.Len() {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (s *linuxSource) stopRumbleLocked(remove bool) error {
+	if !s.descriptor.Capability.Rumble || s.rumbleEffect < 0 {
+		return nil
+	}
+	var result error
+	if err := s.writeRumbleEvent(s.rumbleEffect, 0); err != nil {
+		result = errors.Join(result, err)
+	}
+	if remove {
+		request := linuxIOW('E', 0x81, unsafe.Sizeof(int32(0)))
+		if err := linuxIOCTLValue(s.file.Fd(), request, uintptr(s.rumbleEffect)); err != nil {
+			result = errors.Join(result, err)
+		} else {
+			s.rumbleEffect = -1
+		}
+	}
+	return result
+}
+
+func (s *linuxSource) normalizeRumbleError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case s.isClosed() || errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EBADF):
+		return teleop.ErrClosed
+	case errors.Is(err, syscall.ENODEV),
+		errors.Is(err, syscall.ENXIO),
+		errors.Is(err, syscall.EIO):
+		return fmt.Errorf("%w: evdev rumble: %v", teleop.ErrDisconnected, err)
+	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
+		return fmt.Errorf("%w: evdev rumble: %v", teleop.ErrPermission, err)
+	default:
+		return fmt.Errorf("%w: evdev rumble: %v", teleop.ErrUnavailable, err)
+	}
+}
+
 func (s *linuxSource) resync() error {
 	keys := make([]byte, 96)
 	if err := linuxIOCTLBytes(s.file.Fd(), linuxIOR('E', 0x18, uintptr(len(keys))), keys); err != nil {
@@ -495,14 +650,26 @@ func (s *linuxSource) resync() error {
 }
 
 func (s *linuxSource) Close() error {
-	var err error
 	s.closeOnce.Do(func() {
 		s.closeMu.Lock()
 		s.closed = true
 		s.closeMu.Unlock()
-		err = s.file.Close()
+		s.rumbleMu.Lock()
+		rumbleErr := s.stopRumbleLocked(true)
+		s.rumbleMu.Unlock()
+		if errors.Is(rumbleErr, syscall.ENODEV) ||
+			errors.Is(rumbleErr, syscall.ENXIO) ||
+			errors.Is(rumbleErr, syscall.EIO) {
+			rumbleErr = nil
+		}
+		closeErr := s.file.Close()
+		s.closeMu.Lock()
+		s.closeErr = errors.Join(rumbleErr, closeErr)
+		s.closeMu.Unlock()
 	})
-	return err
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
+	return s.closeErr
 }
 
 func (s *linuxSource) isClosed() bool {
@@ -627,6 +794,18 @@ func linuxCapabilities(file *os.File) (map[teleop.ControlID]bool, map[uint16]lin
 	return supported, ranges, nil
 }
 
+func linuxRumbleSupported(file *os.File) bool {
+	feedback := make([]byte, ffMax/8+1)
+	if err := linuxIOCTLBytes(
+		file.Fd(),
+		linuxIOR('E', 0x20+evFF, uintptr(len(feedback))),
+		feedback,
+	); err != nil {
+		return false
+	}
+	return linuxBit(feedback, ffRumble)
+}
+
 var linuxControls = map[int]teleop.ControlID{
 	btnSouth: ButtonA,
 	btnEast:  ButtonB,
@@ -690,6 +869,14 @@ func linuxIOCTLBytes(fd, request uintptr, value []byte) error {
 		return nil
 	}
 	return linuxIOCTL(fd, request, unsafe.Pointer(&value[0]))
+}
+
+func linuxIOCTLValue(fd, request, value uintptr) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, request, value)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 func linuxEventTime(event linuxInputEvent) time.Time {

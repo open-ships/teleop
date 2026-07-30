@@ -24,6 +24,21 @@ func TestLinuxInputEventMatchesKernelABI(t *testing.T) {
 	}
 }
 
+func TestLinuxFFEffectMatchesKernelABI(t *testing.T) {
+	t.Parallel()
+
+	wantSize := uintptr(44)
+	if unsafe.Sizeof(uintptr(0)) == 8 {
+		wantSize = 48
+	}
+	if got := unsafe.Sizeof(linuxFFEffect{}); got != wantSize {
+		t.Fatalf("ff_effect size = %d, want %d", got, wantSize)
+	}
+	if got := unsafe.Offsetof(linuxFFEffect{}.Data); got != 16 {
+		t.Fatalf("ff_effect union offset = %d, want 16", got)
+	}
+}
+
 func TestLinuxIORUsesTheHostABI(t *testing.T) {
 	t.Parallel()
 
@@ -34,6 +49,41 @@ func TestLinuxIORUsesTheHostABI(t *testing.T) {
 	}
 	if got := linuxIOR('E', 2, 4); got != want {
 		t.Fatalf("EVIOCGID request = %#x, want %#x", got, want)
+	}
+}
+
+func TestLinuxIOWUsesTheHostABI(t *testing.T) {
+	t.Parallel()
+
+	size := unsafe.Sizeof(linuxFFEffect{})
+	want := uintptr(1)<<30 | size<<16 | uintptr('E')<<8 | 0x80
+	switch runtime.GOARCH {
+	case "ppc", "ppc64", "ppc64le", "mips", "mipsle", "mips64", "mips64le":
+		want = uintptr(1)<<29 | size<<16 | uintptr('E')<<8 | 0x80
+	}
+	if got := linuxIOW('E', 0x80, size); got != want {
+		t.Fatalf("EVIOCSFF request = %#x, want %#x", got, want)
+	}
+}
+
+func TestLinuxRumbleEffectMapping(t *testing.T) {
+	t.Parallel()
+
+	effect := newLinuxRumbleEffect(-1, teleop.Rumble{
+		LowFrequency:  1,
+		HighFrequency: 0.5,
+	})
+	if effect.Type != ffRumble || effect.ID != -1 {
+		t.Fatalf("ff_effect header = type:%#x id:%d", effect.Type, effect.ID)
+	}
+	if effect.Replay.Length != 0 {
+		t.Fatalf("ff_effect replay length = %d, want infinite (zero)", effect.Replay.Length)
+	}
+	if got := binary.NativeEndian.Uint16(effect.Data[0:2]); got != 65535 {
+		t.Fatalf("strong magnitude = %d, want 65535", got)
+	}
+	if got := binary.NativeEndian.Uint16(effect.Data[2:4]); got != 32768 {
+		t.Fatalf("weak magnitude = %d, want 32768", got)
 	}
 }
 

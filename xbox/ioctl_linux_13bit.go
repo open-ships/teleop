@@ -13,3 +13,15 @@ func linuxIOR(kind, number, size uintptr) uintptr {
 	)
 	return uintptr(read)<<directionShift | size<<sizeShift | kind<<typeShift | number
 }
+
+// linuxIOW constructs an _IOW request for Linux architectures whose kernel
+// ABI uses a 13-bit size field and puts direction at bit 29.
+func linuxIOW(kind, number, size uintptr) uintptr {
+	const (
+		write          = 1
+		directionShift = 29
+		sizeShift      = 16
+		typeShift      = 8
+	)
+	return uintptr(write)<<directionShift | size<<sizeShift | kind<<typeShift | number
+}

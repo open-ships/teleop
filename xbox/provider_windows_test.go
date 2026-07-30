@@ -30,6 +30,12 @@ func TestXInputStructsMatchWindowsABI(t *testing.T) {
 	if got := unsafe.Offsetof(xinputState{}.Gamepad); got != 4 {
 		t.Fatalf("XINPUT_STATE.Gamepad offset = %d, want 4", got)
 	}
+	if got := unsafe.Sizeof(xinputVibration{}); got != 4 {
+		t.Fatalf("XINPUT_VIBRATION size = %d, want 4", got)
+	}
+	if got := unsafe.Sizeof(xinputCapabilities{}); got != 20 {
+		t.Fatalf("XINPUT_CAPABILITIES size = %d, want 20", got)
+	}
 }
 
 func TestEncodeXInputState(t *testing.T) {
@@ -120,6 +126,32 @@ func TestNormalizeXInputAxisEndpoints(t *testing.T) {
 		if got := normalizeXInputAxis(test.value); got != test.want {
 			t.Errorf("normalizeXInputAxis(%d) = %f, want %f", test.value, got, test.want)
 		}
+	}
+}
+
+func TestXInputRumbleMapping(t *testing.T) {
+	t.Parallel()
+
+	got := xinputRumble(teleop.Rumble{
+		LowFrequency:  1,
+		HighFrequency: 0.5,
+	})
+	if got.LeftMotorSpeed != 65535 || got.RightMotorSpeed != 32768 {
+		t.Fatalf("XINPUT_VIBRATION = %#v, want left 65535 and right 32768", got)
+	}
+	if got := xinputRumble(teleop.Rumble{}); got != (xinputVibration{}) {
+		t.Fatalf("zero rumble = %#v, want zero vibration", got)
+	}
+}
+
+func TestWindowsDescriptorReportsRumbleCapability(t *testing.T) {
+	t.Parallel()
+
+	if !windowsDescriptor(0, true).Capability.Rumble {
+		t.Fatal("XInput descriptor does not advertise rumble")
+	}
+	if windowsDescriptor(0, false).Capability.Rumble {
+		t.Fatal("XInput descriptor advertises unavailable rumble")
 	}
 }
 

@@ -37,6 +37,28 @@ func TestFakeSourcePushReadAndClose(t *testing.T) {
 	}
 }
 
+func TestFakeSourceRumble(t *testing.T) {
+	source := testkit.NewFakeSource(teleop.Descriptor{
+		Capability: teleop.Capabilities{Rumble: true},
+	}, 1)
+	want := teleop.Rumble{LowFrequency: 0.75, HighFrequency: 0.4}
+	if err := source.SetRumble(t.Context(), want); err != nil {
+		t.Fatal(err)
+	}
+	if got := source.Rumble(); got != want {
+		t.Fatalf("Rumble = %#v, want %#v", got, want)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := source.Rumble(); got != (teleop.Rumble{}) {
+		t.Fatalf("Rumble after Close = %#v, want zero", got)
+	}
+	if err := source.SetRumble(t.Context(), want); !errors.Is(err, teleop.ErrClosed) {
+		t.Fatalf("SetRumble after Close error = %v, want ErrClosed", err)
+	}
+}
+
 func TestReplaySourcePreservesOrderAndHonorsClose(t *testing.T) {
 	observedAt := time.Unix(100, 0)
 	source := testkit.NewReplaySource(

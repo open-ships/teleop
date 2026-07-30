@@ -1,13 +1,13 @@
 # Architecture
 
 Teleop separates controller-independent application code from controller- and
-operating-system-specific input.
+operating-system-specific input and feedback output.
 
 ```text
-OS input API
-    ↓
-xbox.InputSource
-    ↓
+OS controller API
+    ↕
+xbox device source
+    ↕
 teleop.Controller
     ├── authoritative EventSink (audit)
     ├── lossless subscription
@@ -20,8 +20,8 @@ teleop.Controller
 
 ## Package boundaries
 
-- `teleop` owns controller-neutral controls, states, events, subscriptions,
-  provider interfaces, normalization, and lifecycle semantics.
+- `teleop` owns controller-neutral controls, states, rumble output, events,
+  subscriptions, provider interfaces, normalization, and lifecycle semantics.
 - `xbox` supplies Xbox labels and selects the platform backend.
 - `gesture` derives temporal patterns without hiding canonical input.
 - `action` maps physical or gesture events to application-defined identifiers.
@@ -67,10 +67,11 @@ controller-owned event ID, preserving their causal place in the same stream.
 
 ## Extending teleop
 
-A third-party provider implements `teleop.Provider` and returns an
-`teleop.InputSource` wrapped with `teleop.NewController`. New control IDs and
-controller types can be introduced as string-backed values without registering
-them globally.
+A third-party provider implements `teleop.Provider` and returns a
+`teleop.InputSource` wrapped with `teleop.NewController`. A source that
+advertises rumble also implements `teleop.RumbleSource`; the controller exposes
+it through `GameController.SetRumble`. New control IDs and controller types can
+be introduced as string-backed values without registering them globally.
 
 Provider implementations should:
 
@@ -80,6 +81,8 @@ Provider implementations should:
 4. Report actual capabilities instead of synthesizing missing controls.
 5. Turn known loss into `Observation.Gap`.
 6. Make `Close` idempotent and unblock `Read`.
+7. If rumble is advertised, accept concurrent `SetRumble` calls and stop both
+   motors before `Close` releases the device.
 
 Providers that can observe hotplug directly or by inexpensive polling may also
 implement `teleop.WatchingProvider`. Watching is explicit and owns no global

@@ -2,6 +2,8 @@
 // controllers used in teleoperation and autonomy systems.
 //
 // Platform providers normalize OS input into immutable State snapshots and an
-// ordered Event stream. The core package has no third-party dependencies and
-// does not pair Bluetooth or wireless devices itself.
+// ordered Event stream. Controllers with rumble expose normalized low- and
+// high-frequency motor strengths through GameController.SetRumble. The core
+// package has no third-party dependencies and does not pair Bluetooth or
+// wireless devices itself.
 package teleop

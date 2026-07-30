@@ -4,7 +4,7 @@ package xbox
 
 /*
 #cgo CFLAGS: -fblocks
-#cgo LDFLAGS: -framework Foundation -framework GameController
+#cgo LDFLAGS: -framework Foundation -framework GameController -framework CoreHaptics
 #include <stdlib.h>
 #include "native_darwin.h"
 */
@@ -137,6 +137,8 @@ func newDarwinDescriptor(
 	supported[Share] = mask&8 != 0
 	supported[LeftStick] = mask&16 != 0
 	supported[RightStick] = mask&32 != 0
+	capability := capabilities(teleop.AuditExactBackendStream, supported)
+	capability.Rumble = mask&64 != 0
 	properties := map[string]string{
 		"gamecontroller_identifier":       fmt.Sprintf("%016x", identifier),
 		"gamecontroller_product_category": category,
@@ -150,7 +152,7 @@ func newDarwinDescriptor(
 		Name:       darwinControllerName(vendorName, category),
 		Transport:  teleop.TransportUnknown,
 		Backend:    "darwin-gamecontroller",
-		Capability: capabilities(teleop.AuditExactBackendStream, supported),
+		Capability: capability,
 		Properties: properties,
 	}, true
 }
@@ -186,6 +188,7 @@ type darwinSource struct {
 	closed     bool
 	active     sync.WaitGroup
 	closeDone  chan struct{}
+	rumbleMu   sync.Mutex
 }
 
 func (s *darwinSource) Descriptor() teleop.Descriptor {
@@ -288,6 +291,59 @@ func (s *darwinSource) Read(ctx context.Context) (teleop.Observation, error) {
 			}
 		}
 		return observation, nil
+	}
+}
+
+func (s *darwinSource) SetRumble(ctx context.Context, rumble teleop.Rumble) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.rumbleMu.Lock()
+	defer s.rumbleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return teleop.ErrClosed
+	}
+	handle := s.handle
+	s.active.Add(1)
+	s.mu.Unlock()
+
+	message := make([]byte, 512)
+	result := int(C.teleop_gc_set_rumble(
+		handle,
+		C.float(rumble.LowFrequency),
+		C.float(rumble.HighFrequency),
+		(*C.char)(unsafe.Pointer(&message[0])),
+		C.size_t(len(message)),
+	))
+	s.active.Done()
+
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return teleop.ErrClosed
+	}
+	switch result {
+	case 1:
+		return nil
+	case 0:
+		return teleop.ErrUnsupported
+	case -1:
+		return teleop.ErrClosed
+	case -2:
+		return teleop.ErrDisconnected
+	default:
+		detail := nullTerminatedString(message)
+		if detail == "" {
+			detail = "Core Haptics operation failed"
+		}
+		return fmt.Errorf("%w: %s", teleop.ErrUnavailable, detail)
 	}
 }
 
