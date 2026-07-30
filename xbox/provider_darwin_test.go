@@ -53,6 +53,24 @@ func TestNewDarwinDescriptorUsesOpaqueIdentifier(t *testing.T) {
 	}
 }
 
+func TestNewDarwinDescriptorAdvertisesNativeHaptics(t *testing.T) {
+	t.Parallel()
+
+	descriptor, ok := newDarwinDescriptor(
+		1,
+		0,
+		"Xbox Wireless Controller",
+		"Xbox One",
+		64,
+	)
+	if !ok {
+		t.Fatal("Xbox descriptor rejected")
+	}
+	if !descriptor.Capability.Rumble {
+		t.Fatal("Game Controller haptics were not exposed as rumble")
+	}
+}
+
 func TestIsXboxIdentity(t *testing.T) {
 	t.Parallel()
 

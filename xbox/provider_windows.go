@@ -34,6 +34,7 @@ const (
 	xinputX             = 0x4000
 	xinputY             = 0x8000
 
+	xinputCapsFFBSupported  = 0x0001
 	errorDeviceNotConnected = 1167
 	xinputPollInterval      = 4 * time.Millisecond
 )
@@ -53,6 +54,19 @@ type xinputState struct {
 	Gamepad      xinputGamepad
 }
 
+type xinputVibration struct {
+	LeftMotorSpeed  uint16
+	RightMotorSpeed uint16
+}
+
+type xinputCapabilities struct {
+	Type      uint8
+	Subtype   uint8
+	Flags     uint16
+	Gamepad   xinputGamepad
+	Vibration xinputVibration
+}
+
 var (
 	_ [12 - unsafe.Sizeof(xinputGamepad{})]byte
 	_ [unsafe.Sizeof(xinputGamepad{}) - 12]byte
@@ -60,6 +74,10 @@ var (
 	_ [unsafe.Sizeof(xinputState{}) - 16]byte
 	_ [4 - unsafe.Offsetof(xinputState{}.Gamepad)]byte
 	_ [unsafe.Offsetof(xinputState{}.Gamepad) - 4]byte
+	_ [4 - unsafe.Sizeof(xinputVibration{})]byte
+	_ [unsafe.Sizeof(xinputVibration{}) - 4]byte
+	_ [20 - unsafe.Sizeof(xinputCapabilities{})]byte
+	_ [unsafe.Sizeof(xinputCapabilities{}) - 20]byte
 )
 
 func discoverPlatform(ctx context.Context) ([]teleop.Descriptor, error) {
@@ -75,7 +93,11 @@ func discoverPlatform(ctx context.Context) ([]teleop.Descriptor, error) {
 		var state xinputState
 		err := callXInputGetState(getState, slot, &state)
 		if err == nil {
-			devices = append(devices, windowsDescriptor(slot))
+			rumble, err := xinputRumbleSupported(slot)
+			if err != nil {
+				return nil, err
+			}
+			devices = append(devices, windowsDescriptor(slot, rumble))
 			continue
 		}
 		if !errors.Is(err, teleop.ErrDisconnected) {
@@ -101,17 +123,22 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 	if err := callXInputGetState(getState, slot, &state); err != nil {
 		return nil, fmt.Errorf("open %s: %w", id, err)
 	}
+	rumble, err := xinputRumbleSupported(slot)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", id, err)
+	}
 	return &windowsSource{
 		slot:       slot,
 		getState:   getState,
-		descriptor: windowsDescriptor(slot),
+		setState:   xinputSetState,
+		descriptor: windowsDescriptor(slot, rumble),
 		lastPacket: ^uint32(0),
 		ticker:     time.NewTicker(xinputPollInterval),
 		done:       make(chan struct{}),
 	}, nil
 }
 
-func windowsDescriptor(slot uint32) teleop.Descriptor {
+func windowsDescriptor(slot uint32, rumble bool) teleop.Descriptor {
 	supported := map[teleop.ControlID]bool{
 		ButtonA: true, ButtonB: true, ButtonX: true, ButtonY: true,
 		LeftBumper: true, RightBumper: true, LeftStick: true, RightStick: true,
@@ -122,6 +149,7 @@ func windowsDescriptor(slot uint32) teleop.Descriptor {
 		teleop.TriggerLeft: true, teleop.TriggerRight: true,
 	}
 	capability := capabilities(teleop.AuditSampledState, supported)
+	capability.Rumble = rumble
 	return teleop.Descriptor{
 		ID:         teleop.DeviceID(fmt.Sprintf("xinput:%d", slot)),
 		Type:       teleop.ControllerXbox,
@@ -139,11 +167,15 @@ func windowsDescriptor(slot uint32) teleop.Descriptor {
 type windowsSource struct {
 	slot       uint32
 	getState   *windows.LazyProc
+	setState   *windows.LazyProc
 	descriptor teleop.Descriptor
 	lastPacket uint32
 	ticker     *time.Ticker
 	done       chan struct{}
 	closeOnce  sync.Once
+	rumbleMu   sync.Mutex
+	closed     bool
+	closeErr   error
 }
 
 func (s *windowsSource) Descriptor() teleop.Descriptor {
@@ -203,12 +235,41 @@ func xinputPacketGap(previous, current uint32) *teleop.SourceGap {
 	}
 }
 
+func (s *windowsSource) SetRumble(ctx context.Context, rumble teleop.Rumble) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.rumbleMu.Lock()
+	defer s.rumbleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return teleop.ErrClosed
+	}
+	if !s.descriptor.Capability.Rumble || s.setState == nil {
+		return teleop.ErrUnsupported
+	}
+	vibration := xinputRumble(rumble)
+	return callXInputSetState(s.setState, s.slot, &vibration)
+}
+
 func (s *windowsSource) Close() error {
 	s.closeOnce.Do(func() {
+		s.rumbleMu.Lock()
+		defer s.rumbleMu.Unlock()
+		s.closed = true
+		if s.descriptor.Capability.Rumble && s.setState != nil {
+			vibration := xinputVibration{}
+			err := callXInputSetState(s.setState, s.slot, &vibration)
+			if err != nil && !errors.Is(err, teleop.ErrDisconnected) {
+				s.closeErr = err
+			}
+		}
 		s.ticker.Stop()
 		close(s.done)
 	})
-	return nil
+	return s.closeErr
 }
 
 func xinputTeleopState(gamepad xinputGamepad) teleop.State {
@@ -252,6 +313,13 @@ func normalizeXInputAxis(value int16) float32 {
 	return float32(value) / 32767
 }
 
+func xinputRumble(rumble teleop.Rumble) xinputVibration {
+	return xinputVibration{
+		LeftMotorSpeed:  rumbleMagnitude(rumble.LowFrequency),
+		RightMotorSpeed: rumbleMagnitude(rumble.HighFrequency),
+	}
+}
+
 func encodeXInputState(state xinputState) []byte {
 	data := make([]byte, 16)
 	binary.LittleEndian.PutUint32(data[0:4], state.PacketNumber)
@@ -266,9 +334,11 @@ func encodeXInputState(state xinputState) []byte {
 }
 
 var (
-	xinputLoadOnce sync.Once
-	xinputGetState *windows.LazyProc
-	xinputLoadErr  error
+	xinputLoadOnce        sync.Once
+	xinputGetState        *windows.LazyProc
+	xinputGetCapabilities *windows.LazyProc
+	xinputSetState        *windows.LazyProc
+	xinputLoadErr         error
 )
 
 func loadXInput() (*windows.LazyProc, error) {
@@ -288,7 +358,19 @@ func loadXInput() (*windows.LazyProc, error) {
 				loadErrors = append(loadErrors, err.Error())
 				continue
 			}
+			capabilitiesProcedure := library.NewProc("XInputGetCapabilities")
+			if err := capabilitiesProcedure.Find(); err != nil {
+				loadErrors = append(loadErrors, err.Error())
+				continue
+			}
+			setProcedure := library.NewProc("XInputSetState")
+			if err := setProcedure.Find(); err != nil {
+				loadErrors = append(loadErrors, err.Error())
+				continue
+			}
 			xinputGetState = procedure
+			xinputGetCapabilities = capabilitiesProcedure
+			xinputSetState = setProcedure
 			return
 		}
 		xinputLoadErr = fmt.Errorf(
@@ -312,7 +394,43 @@ func callXInputGetState(
 	return xinputResultError(result)
 }
 
+func callXInputSetState(
+	procedure *windows.LazyProc,
+	slot uint32,
+	vibration *xinputVibration,
+) error {
+	result, _, _ := procedure.Call(
+		uintptr(slot),
+		uintptr(unsafe.Pointer(vibration)),
+	)
+	return xinputSetStateResultError(result)
+}
+
+func xinputRumbleSupported(slot uint32) (bool, error) {
+	if xinputGetCapabilities == nil {
+		return false, teleop.ErrUnsupported
+	}
+	var capabilities xinputCapabilities
+	result, _, _ := xinputGetCapabilities.Call(
+		uintptr(slot),
+		0,
+		uintptr(unsafe.Pointer(&capabilities)),
+	)
+	if err := xinputOperationResultError("XInputGetCapabilities", result); err != nil {
+		return false, err
+	}
+	return capabilities.Flags&xinputCapsFFBSupported != 0, nil
+}
+
 func xinputResultError(result uintptr) error {
+	return xinputOperationResultError("XInputGetState", result)
+}
+
+func xinputSetStateResultError(result uintptr) error {
+	return xinputOperationResultError("XInputSetState", result)
+}
+
+func xinputOperationResultError(operation string, result uintptr) error {
 	switch result {
 	case 0:
 		return nil
@@ -322,8 +440,9 @@ func xinputResultError(result uintptr) error {
 		// XInputGetState returns a Win32 status directly; Proc.Call's third
 		// value is GetLastError and is not the status for this API.
 		return fmt.Errorf(
-			"%w: XInputGetState: %w",
+			"%w: %s: %w",
 			teleop.ErrUnavailable,
+			operation,
 			syscall.Errno(result),
 		)
 	}

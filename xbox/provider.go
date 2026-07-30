@@ -153,3 +153,7 @@ func capabilities(auditGrade teleop.AuditGrade, supported map[teleop.ControlID]b
 		AuditGrade: auditGrade,
 	}
 }
+
+func rumbleMagnitude(strength float32) uint16 {
+	return uint16(float64(strength)*65535 + 0.5)
+}

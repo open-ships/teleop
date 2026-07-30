@@ -12,3 +12,14 @@ func linuxIOR(kind, number, size uintptr) uintptr {
 	)
 	return uintptr(read)<<directionShift | size<<sizeShift | kind<<typeShift | number
 }
+
+// linuxIOW constructs an _IOW request using Linux's asm-generic ioctl layout.
+func linuxIOW(kind, number, size uintptr) uintptr {
+	const (
+		write          = 1
+		directionShift = 30
+		sizeShift      = 16
+		typeShift      = 8
+	)
+	return uintptr(write)<<directionShift | size<<sizeShift | kind<<typeShift | number
+}

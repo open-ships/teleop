@@ -2,7 +2,9 @@
 
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
+#import <CoreHaptics/CoreHaptics.h>
 #import <objc/runtime.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +29,8 @@ typedef struct teleop_gc_handle {
     int closed;
     uint64_t generation;
     size_t active_callbacks;
+    CHHapticEngine *haptic_engine;
+    id<CHHapticPatternPlayer> haptic_player;
     struct teleop_gc_handle *next;
 } teleop_gc_handle;
 
@@ -237,6 +241,9 @@ int teleop_gc_info(
         if ([gamepad respondsToSelector:share_selector] && [gamepad valueForKey:@"buttonShare"] != nil) result |= 8;
         if (gamepad.leftThumbstickButton != nil) result |= 16;
         if (gamepad.rightThumbstickButton != nil) result |= 32;
+        if (@available(macOS 11.0, *)) {
+            if (controller.haptics != nil) result |= 64;
+        }
         if (features != NULL) *features = result;
         return 1;
     }
@@ -274,6 +281,9 @@ int teleop_gc_info_by_id(
         if ([gamepad respondsToSelector:share_selector] && [gamepad valueForKey:@"buttonShare"] != nil) result |= 8;
         if (gamepad.leftThumbstickButton != nil) result |= 16;
         if (gamepad.rightThumbstickButton != nil) result |= 32;
+        if (@available(macOS 11.0, *)) {
+            if (controller.haptics != nil) result |= 64;
+        }
         if (features != NULL) *features = result;
         return 1;
     }
@@ -405,6 +415,151 @@ int teleop_gc_next(void *opaque, teleop_gc_state *state, int timeout_ms) {
     return 1;
 }
 
+static void teleop_gc_copy_haptic_error(
+    NSError *error,
+    char *destination,
+    size_t size
+) {
+    NSString *message = error.localizedDescription ?: @"Core Haptics operation failed";
+    teleop_gc_copy_string(message, destination, size);
+}
+
+static void teleop_gc_stop_haptics(teleop_gc_handle *handle) {
+    if (handle->haptic_player != nil) {
+        [handle->haptic_player
+            stopAtTime:CHHapticTimeImmediate
+            error:nil];
+        [(id)handle->haptic_player release];
+        handle->haptic_player = nil;
+    }
+    if (handle->haptic_engine != nil) {
+        [handle->haptic_engine stopWithCompletionHandler:nil];
+        [handle->haptic_engine release];
+        handle->haptic_engine = nil;
+    }
+}
+
+int teleop_gc_set_rumble(
+    void *opaque,
+    float low_frequency,
+    float high_frequency,
+    char *error_message,
+    size_t error_size
+) {
+    teleop_gc_handle *handle = (teleop_gc_handle *)opaque;
+    if (handle == NULL) return -1;
+    if (error_message != NULL && error_size > 0) error_message[0] = '\0';
+
+    @autoreleasepool {
+        pthread_mutex_lock(&handle->mutex);
+        int closed = handle->closed;
+        int disconnected = handle->disconnected;
+        pthread_mutex_unlock(&handle->mutex);
+        if (closed) return -1;
+        if (disconnected) return -2;
+
+        if (@available(macOS 11.0, *)) {
+            GCDeviceHaptics *haptics = handle->controller.haptics;
+            if (haptics == nil) return 0;
+
+            teleop_gc_stop_haptics(handle);
+            if (low_frequency == 0.0f && high_frequency == 0.0f) {
+                return 1;
+            }
+
+            CHHapticEngine *engine = [[haptics
+                createEngineWithLocality:GCHapticsLocalityDefault] retain];
+            if (engine == nil) {
+                teleop_gc_copy_string(
+                    @"Game Controller could not create a haptic engine",
+                    error_message,
+                    error_size
+                );
+                return -3;
+            }
+            engine.playsHapticsOnly = YES;
+            engine.autoShutdownEnabled = NO;
+
+            NSError *operation_error = nil;
+            if (![engine startAndReturnError:&operation_error]) {
+                teleop_gc_copy_haptic_error(
+                    operation_error,
+                    error_message,
+                    error_size
+                );
+                [engine release];
+                return -3;
+            }
+
+            float intensity = fmaxf(low_frequency, high_frequency);
+            float total = low_frequency + high_frequency;
+            float sharpness = total == 0.0f ? 0.0f : high_frequency / total;
+            CHHapticEventParameter *intensity_parameter = [[CHHapticEventParameter alloc]
+                initWithParameterID:CHHapticEventParameterIDHapticIntensity
+                value:intensity];
+            CHHapticEventParameter *sharpness_parameter = [[CHHapticEventParameter alloc]
+                initWithParameterID:CHHapticEventParameterIDHapticSharpness
+                value:sharpness];
+            CHHapticEvent *event = [[CHHapticEvent alloc]
+                initWithEventType:CHHapticEventTypeHapticContinuous
+                parameters:@[intensity_parameter, sharpness_parameter]
+                relativeTime:0
+                duration:GCHapticDurationInfinite];
+            [intensity_parameter release];
+            [sharpness_parameter release];
+
+            CHHapticPattern *pattern = [[CHHapticPattern alloc]
+                initWithEvents:@[event]
+                parameters:@[]
+                error:&operation_error];
+            [event release];
+            if (pattern == nil) {
+                teleop_gc_copy_haptic_error(
+                    operation_error,
+                    error_message,
+                    error_size
+                );
+                [engine stopWithCompletionHandler:nil];
+                [engine release];
+                return -3;
+            }
+
+            id<CHHapticPatternPlayer> player = [[engine
+                createPlayerWithPattern:pattern
+                error:&operation_error] retain];
+            [pattern release];
+            if (player == nil) {
+                teleop_gc_copy_haptic_error(
+                    operation_error,
+                    error_message,
+                    error_size
+                );
+                [engine stopWithCompletionHandler:nil];
+                [engine release];
+                return -3;
+            }
+            if (![player
+                startAtTime:CHHapticTimeImmediate
+                error:&operation_error]) {
+                teleop_gc_copy_haptic_error(
+                    operation_error,
+                    error_message,
+                    error_size
+                );
+                [(id)player release];
+                [engine stopWithCompletionHandler:nil];
+                [engine release];
+                return -3;
+            }
+
+            handle->haptic_engine = engine;
+            handle->haptic_player = player;
+            return 1;
+        }
+        return 0;
+    }
+}
+
 void teleop_gc_close(void *opaque) {
     teleop_gc_handle *handle = (teleop_gc_handle *)opaque;
     if (handle == NULL) return;
@@ -423,6 +578,7 @@ void teleop_gc_close(void *opaque) {
         if (dispatch_get_specific(&teleop_gc_handler_queue_key) != handle) {
             dispatch_sync(handle->handler_queue, ^{});
         }
+        teleop_gc_stop_haptics(handle);
 
         pthread_mutex_lock(&teleop_gc_registry_mutex);
         teleop_gc_handle **candidate = &teleop_gc_active_handles;

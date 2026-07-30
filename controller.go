@@ -72,6 +72,7 @@ type GameController interface {
 	Snapshot() State
 	SnapshotWithMeta() (State, StateMeta)
 	Subscribe(SubscriptionOptions) (Subscription, error)
+	SetRumble(context.Context, Rumble) error
 	RecordCommand(context.Context, Command) error
 	Session() SessionID
 	Done() <-chan struct{}
@@ -132,6 +133,7 @@ type Controller struct {
 	sourceCloseMu  sync.Mutex
 	sourceCloseErr error
 	sourceClosed   chan struct{}
+	rumbleMu       sync.Mutex
 
 	sinks []*sinkRunner
 
@@ -183,11 +185,15 @@ func NewController(source InputSource, options ...OpenOption) (*Controller, erro
 	if configured.clock == nil {
 		configured.clock = systemClock{}
 	}
+	descriptor := source.Descriptor().Clone()
+	if _, ok := source.(RumbleSource); !ok {
+		descriptor.Capability.Rumble = false
+	}
 	sourceCtx, cancelSource := context.WithCancel(configured.context)
 	pipelineCtx, cancelPipe := context.WithCancel(context.Background())
 	controller := &Controller{
 		source:       source,
-		descriptor:   source.Descriptor().Clone(),
+		descriptor:   descriptor,
 		options:      configured,
 		clock:        configured.clock,
 		sourceCtx:    sourceCtx,

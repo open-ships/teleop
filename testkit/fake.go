@@ -17,6 +17,8 @@ type FakeSource struct {
 	observations chan teleop.Observation
 	done         chan struct{}
 	closeOnce    sync.Once
+	rumbleMu     sync.RWMutex
+	rumble       teleop.Rumble
 }
 
 // NewFakeSource returns a fake source with sensible virtual-device defaults.
@@ -87,9 +89,44 @@ func (f *FakeSource) PushObservation(ctx context.Context, observation teleop.Obs
 	}
 }
 
+// SetRumble implements teleop.RumbleSource when the fake descriptor advertises
+// rumble. It retains the latest value for assertions through Rumble.
+func (f *FakeSource) SetRumble(ctx context.Context, rumble teleop.Rumble) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !f.descriptor.Capability.Rumble {
+		return teleop.ErrUnsupported
+	}
+	f.rumbleMu.Lock()
+	defer f.rumbleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-f.done:
+		return teleop.ErrClosed
+	default:
+	}
+	f.rumble = rumble
+	return nil
+}
+
+// Rumble returns the latest vibration applied to the fake source.
+func (f *FakeSource) Rumble() teleop.Rumble {
+	f.rumbleMu.RLock()
+	defer f.rumbleMu.RUnlock()
+	return f.rumble
+}
+
 // Close implements teleop.InputSource.
 func (f *FakeSource) Close() error {
-	f.closeOnce.Do(func() { close(f.done) })
+	f.closeOnce.Do(func() {
+		f.rumbleMu.Lock()
+		defer f.rumbleMu.Unlock()
+		f.rumble = teleop.Rumble{}
+		close(f.done)
+	})
 	return nil
 }
 
