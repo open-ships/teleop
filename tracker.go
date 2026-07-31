@@ -1,6 +1,6 @@
 package teleop
 
-import "sort"
+import "slices"
 
 func diffEvents(previous, current State, header func() Header) []Event {
 	var events []Event
@@ -26,24 +26,16 @@ func diffEvents(previous, current State, header func() Header) []Event {
 	}
 
 	var extensions []ControlID
-	for id := range previous.Buttons.Extensions {
-		if !isStandardButton(id) {
-			extensions = append(extensions, id)
+	for _, set := range []map[ControlID]bool{previous.Buttons.Extensions, current.Buttons.Extensions} {
+		for id := range set {
+			if !isStandardButton(id) {
+				extensions = append(extensions, id)
+			}
 		}
 	}
-	for id := range current.Buttons.Extensions {
-		if !isStandardButton(id) {
-			extensions = append(extensions, id)
-		}
-	}
-	sort.Slice(extensions, func(i, j int) bool { return extensions[i] < extensions[j] })
-	var previousID ControlID
-	for index, id := range extensions {
-		if index > 0 && id == previousID {
-			continue
-		}
+	slices.Sort(extensions)
+	for _, id := range slices.Compact(extensions) {
 		appendButton(id)
-		previousID = id
 	}
 
 	if previous.LeftStick != current.LeftStick {
@@ -88,10 +80,5 @@ func diffEvents(previous, current State, header func() Header) []Event {
 }
 
 func isStandardButton(id ControlID) bool {
-	for _, standard := range standardButtons {
-		if id == standard {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(standardButtons, id)
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sync"
 	"time"
 )
@@ -522,10 +523,7 @@ func (c *Controller) onTick(now time.Time) error {
 	if meta.ReceivedAt.IsZero() {
 		meta.ReceivedAt = c.startedAt
 	}
-	age := now.Sub(meta.ReceivedAt)
-	if age < 0 {
-		age = 0
-	}
+	age := max(now.Sub(meta.ReceivedAt), 0)
 	stale := c.options.staleAfter > 0 && age >= c.options.staleAfter
 	if stale && !meta.Stale && c.options.neutralizeOnStale {
 		if err := c.neutralize(now, "input stale"); err != nil {
@@ -755,7 +753,7 @@ func (c *Controller) nextHeaderAt(
 		Monotonic:         c.clocks.since(publishedAt),
 		ReceivedMonotonic: c.clocks.since(receivedAt),
 		DeviceTimestamp:   deviceTimestamp,
-		Causes:            append([]EventID(nil), causes...),
+		Causes:            slices.Clone(causes),
 		Synthetic:         synthetic,
 	}
 }
@@ -826,7 +824,7 @@ func (c *Controller) publishTerminal(event Event) {
 		if c.processorDisabled[index] {
 			continue
 		}
-		stageInputs := append([]Event(nil), visible...)
+		stageInputs := slices.Clone(visible)
 		var derived []Event
 		failed := false
 		for _, input := range stageInputs {
@@ -865,13 +863,13 @@ func (c *Controller) dispatchTerminal(event Event) (completed bool) {
 }
 
 func (c *Controller) processStages(inputs []Event, start int) error {
-	visible := append([]Event(nil), inputs...)
+	visible := slices.Clone(inputs)
 	for index := start; index < len(c.options.processors); index++ {
 		if c.processorDisabled[index] {
 			continue
 		}
 		processor := c.options.processors[index]
-		stageInputs := append([]Event(nil), visible...)
+		stageInputs := slices.Clone(visible)
 		derived := make([]Event, 0, len(stageInputs))
 		for _, input := range stageInputs {
 			output, err := c.callProcessor(processor, input)

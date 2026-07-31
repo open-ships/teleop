@@ -10,13 +10,7 @@ func Clamp(value, minimum, maximum float32) float32 {
 		}
 		return minimum
 	}
-	if value < minimum {
-		return minimum
-	}
-	if value > maximum {
-		return maximum
-	}
-	return value
+	return min(max(value, minimum), maximum)
 }
 
 // NormalizeAxis converts an integer absolute axis into [-1,+1].

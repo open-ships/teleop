@@ -5,6 +5,7 @@ package testkit
 import (
 	"context"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -143,7 +144,7 @@ type ReplaySource struct {
 func NewReplaySource(descriptor teleop.Descriptor, observations []teleop.Observation) *ReplaySource {
 	return &ReplaySource{
 		descriptor:   descriptor.Clone(),
-		observations: append([]teleop.Observation(nil), observations...),
+		observations: slices.Clone(observations),
 	}
 }
 

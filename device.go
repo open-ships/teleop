@@ -2,6 +2,8 @@ package teleop
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"time"
 )
 
@@ -69,18 +71,15 @@ func (c Capabilities) Clone() Capabilities {
 	if !c.AuditGrade.Valid() {
 		c.AuditGrade = AuditUnavailable
 	}
-	c.Controls = append([]ControlDescriptor(nil), c.Controls...)
+	c.Controls = slices.Clone(c.Controls)
 	return c
 }
 
 // Supports reports whether id appears in the discovered control list.
 func (c Capabilities) Supports(id ControlID) bool {
-	for _, control := range c.Controls {
-		if control.ID == id {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(c.Controls, func(control ControlDescriptor) bool {
+		return control.ID == id
+	})
 }
 
 // Descriptor contains the stable metadata and capabilities of one discovered
@@ -100,12 +99,7 @@ type Descriptor struct {
 // Clone returns an isolated copy of the device descriptor.
 func (d Descriptor) Clone() Descriptor {
 	d.Capability = d.Capability.Clone()
-	if d.Properties != nil {
-		d.Properties = make(map[string]string, len(d.Properties))
-		for key, value := range d.Properties {
-			d.Properties[key] = value
-		}
-	}
+	d.Properties = maps.Clone(d.Properties)
 	return d
 }
 

@@ -3,10 +3,13 @@
 package gesture
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"math"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +58,7 @@ func (Event) Kind() teleop.EventKind { return EventKind }
 // CloneEvent implements teleop.EventCloner.
 func (e Event) CloneEvent() teleop.Event {
 	e.Meta = e.Meta.Clone()
-	e.Controls = append([]teleop.ControlID(nil), e.Controls...)
+	e.Controls = slices.Clone(e.Controls)
 	return e
 }
 
@@ -155,7 +158,7 @@ func New(config Config) *Recognizer {
 	if config.TriggerHysteresis == 0 {
 		config.TriggerHysteresis = defaults.TriggerHysteresis
 	}
-	config.Chords = append([]ChordSpec(nil), config.Chords...)
+	config.Chords = slices.Clone(config.Chords)
 	for index := range config.Chords {
 		config.Chords[index].Buttons = canonicalControls(config.Chords[index].Buttons)
 	}
@@ -211,11 +214,7 @@ func validateConfig(config Config) error {
 // Process implements teleop.Processor.
 func (r *Recognizer) Process(input teleop.Event) []teleop.Event {
 	recognized := r.Recognize(input)
-	result := make([]teleop.Event, len(recognized))
-	for index := range recognized {
-		result[index] = recognized[index]
-	}
-	return result
+	return asEvents(recognized)
 }
 
 // ProcessContext implements teleop.ContextProcessor.
@@ -229,21 +228,13 @@ func (r *Recognizer) ProcessContext(
 	r.processing = processing
 	defer func() { r.processing = nil }()
 	recognized := r.recognizeLocked(input)
-	result := make([]teleop.Event, len(recognized))
-	for index := range recognized {
-		result[index] = recognized[index]
-	}
-	return result, nil
+	return asEvents(recognized), nil
 }
 
 // Advance implements teleop.AdvancingProcessor.
 func (r *Recognizer) Advance(now time.Time) []teleop.Event {
 	recognized := r.AdvanceGestures(now)
-	result := make([]teleop.Event, len(recognized))
-	for index := range recognized {
-		result[index] = recognized[index]
-	}
-	return result
+	return asEvents(recognized)
 }
 
 // AdvanceContext implements teleop.ContextAdvancingProcessor.
@@ -257,11 +248,7 @@ func (r *Recognizer) AdvanceContext(
 	r.processing = processing
 	defer func() { r.processing = nil }()
 	recognized := r.advanceLocked(now)
-	result := make([]teleop.Event, len(recognized))
-	for index := range recognized {
-		result[index] = recognized[index]
-	}
-	return result, nil
+	return asEvents(recognized), nil
 }
 
 // Recognize consumes one canonical input event.
@@ -309,14 +296,11 @@ func (r *Recognizer) AdvanceGestures(now time.Time) []Event {
 }
 
 func (r *Recognizer) advanceLocked(now time.Time) []Event {
-	keys := make([]streamKey, 0, len(r.states))
-	for key := range r.states {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		left := keys[i].session.String() + string(keys[i].device)
-		right := keys[j].session.String() + string(keys[j].device)
-		return left < right
+	keys := slices.SortedFunc(maps.Keys(r.states), func(left, right streamKey) int {
+		return cmp.Or(
+			bytes.Compare(left.session[:], right.session[:]),
+			cmp.Compare(left.device, right.device),
+		)
 	})
 	var result []Event
 	for _, key := range keys {
@@ -325,7 +309,7 @@ func (r *Recognizer) advanceLocked(now time.Time) []Event {
 		buttons := sortedPressed(state.pressed)
 		for _, button := range buttons {
 			pressState := state.pressed[button]
-			duration := nonNegative(now.Sub(pressState.at))
+			duration := max(now.Sub(pressState.at), 0)
 			if pressState.consumed || pressState.holdSent || duration < r.config.HoldMinimum {
 				continue
 			}
@@ -480,7 +464,7 @@ func (r *Recognizer) startedChords(
 			event.Meta.ObservedAt,
 			Chord,
 			teleop.PhaseStarted,
-			append([]teleop.ControlID(nil), chord.Buttons...),
+			slices.Clone(chord.Buttons),
 			0,
 			chord.Name,
 			0,
@@ -514,7 +498,7 @@ func (r *Recognizer) endedChords(
 			event.Meta.ObservedAt,
 			Chord,
 			teleop.PhaseEnded,
-			append([]teleop.ControlID(nil), chord.Buttons...),
+			slices.Clone(chord.Buttons),
 			0,
 			chord.Name,
 			0,
@@ -594,7 +578,7 @@ func (r *Recognizer) reset(
 		}
 		ended := r.event(
 			cause, cause.ObservedAt, Chord, teleop.PhaseEnded,
-			append([]teleop.ControlID(nil), chord.Buttons...), 0, chord.Name, 0,
+			slices.Clone(chord.Buttons), 0, chord.Name, 0,
 		)
 		ended.Meta.Causes = []teleop.EventID{startedID, cause.ID}
 		result = append(result, ended)
@@ -604,7 +588,7 @@ func (r *Recognizer) reset(
 		if value.consumed || !value.holdSent {
 			continue
 		}
-		duration := nonNegative(cause.ObservedAt.Sub(value.at))
+		duration := max(cause.ObservedAt.Sub(value.at), 0)
 		ended := r.event(
 			cause, cause.ObservedAt, Hold, teleop.PhaseEnded,
 			[]teleop.ControlID{button}, duration, "", 0,
@@ -618,7 +602,7 @@ func (r *Recognizer) reset(
 			sticks = append(sticks, string(stick))
 		}
 	}
-	sort.Strings(sticks)
+	slices.Sort(sticks)
 	for _, raw := range sticks {
 		stick := teleop.StickID(raw)
 		control, ok := stickControl(stick)
@@ -635,7 +619,7 @@ func (r *Recognizer) reset(
 			triggers = append(triggers, string(trigger))
 		}
 	}
-	sort.Strings(triggers)
+	slices.Sort(triggers)
 	for _, raw := range triggers {
 		trigger := teleop.TriggerID(raw)
 		control, ok := triggerControl(trigger)
@@ -690,7 +674,7 @@ func (r *Recognizer) event(
 		Meta:     header,
 		Type:     kind,
 		Phase:    phase,
-		Controls: append([]teleop.ControlID(nil), controls...),
+		Controls: slices.Clone(controls),
 		Duration: duration,
 		Region:   region,
 		Value:    value,
@@ -723,47 +707,32 @@ func (r *Recognizer) expireTaps(state *streamState, now time.Time) {
 	}
 }
 
-func sortedPressed(values map[teleop.ControlID]press) []teleop.ControlID {
-	result := make([]teleop.ControlID, 0, len(values))
-	for value := range values {
-		result = append(result, value)
+// asEvents widens recognized gestures to the open teleop.Event interface.
+func asEvents[T teleop.Event](values []T) []teleop.Event {
+	result := make([]teleop.Event, len(values))
+	for index, value := range values {
+		result[index] = value
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
 	return result
+}
+
+func sortedPressed(values map[teleop.ControlID]press) []teleop.ControlID {
+	return slices.Sorted(maps.Keys(values))
 }
 
 func canonicalControls(values []teleop.ControlID) []teleop.ControlID {
-	seen := make(map[teleop.ControlID]struct{}, len(values))
-	result := make([]teleop.ControlID, 0, len(values))
-	for _, value := range values {
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		result = append(result, value)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
-	return result
+	sorted := slices.Compact(slices.Sorted(slices.Values(values)))
+	return slices.DeleteFunc(sorted, func(value teleop.ControlID) bool { return value == "" })
 }
 
 func equalControls(left, right []teleop.ControlID) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(left, right)
 }
 
+// contains reports membership in a canonical (sorted, deduplicated) control list.
 func contains(values []teleop.ControlID, value teleop.ControlID) bool {
-	index := sort.Search(len(values), func(index int) bool { return values[index] >= value })
-	return index < len(values) && values[index] == value
+	_, found := slices.BinarySearch(values, value)
+	return found
 }
 
 func appendChordCauses(
@@ -804,13 +773,6 @@ func triggerControl(trigger teleop.TriggerID) (teleop.ControlID, bool) {
 	default:
 		return "", false
 	}
-}
-
-func nonNegative(duration time.Duration) time.Duration {
-	if duration < 0 {
-		return 0
-	}
-	return duration
 }
 
 func stickRegion(stick teleop.Stick, threshold float32) string {
