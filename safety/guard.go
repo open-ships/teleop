@@ -37,6 +37,7 @@ package safety
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -134,9 +135,8 @@ type Guard struct {
 	mu     sync.Mutex
 	source Source
 
-	armed   bool
-	latched bool
-	estop   bool
+	// lifecycle is the operator's standing intent, moved only through gate.
+	lifecycle lifecycle
 
 	// heartbeat and deadManSince are monotonic readings from the bound
 	// controller's session clock. Zero is a legitimate reading at the start of
@@ -170,9 +170,10 @@ func New(opts ...Option) *Guard {
 		}
 	}
 	return &Guard{
-		options: configured,
-		state:   StateSafe,
-		reasons: []Reason{ReasonUnbound},
+		options:   configured,
+		lifecycle: lifecycleIdle,
+		state:     StateSafe,
+		reasons:   []Reason{ReasonUnbound},
 	}
 }
 
@@ -190,14 +191,17 @@ func (g *Guard) Bind(source Source) {
 func (g *Guard) Arm() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.source == nil {
-		return ErrUnbound
+	next, err := gate.Fire(context.Background(), g.lifecycle, commandArm, g)
+	if err != nil {
+		// Report this package's own errors rather than the machine's refusal,
+		// so a caller comparing against ErrUnbound keeps working and safety's
+		// error contract stays independent of the machine.
+		if errors.Is(err, ErrUnbound) {
+			return ErrUnbound
+		}
+		return errArmDuringStop
 	}
-	if g.estop {
-		return errors.New("teleop/safety: cannot arm during an emergency stop")
-	}
-	g.armed = true
-	g.latched = false
+	g.lifecycle = next
 	g.detail = ""
 	return nil
 }
@@ -206,8 +210,7 @@ func (g *Guard) Arm() error {
 func (g *Guard) Disarm(detail string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.armed = false
-	g.latched = true
+	g.fire(commandDisarm)
 	g.detail = detail
 }
 
@@ -215,9 +218,7 @@ func (g *Guard) Disarm(detail string) {
 func (g *Guard) EmergencyStop(detail string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.estop = true
-	g.armed = false
-	g.latched = true
+	g.fire(commandStop)
 	g.detail = detail
 }
 
@@ -225,7 +226,7 @@ func (g *Guard) EmergencyStop(detail string) {
 func (g *Guard) Reset(detail string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.estop = false
+	g.fire(commandReset)
 	g.detail = detail
 }
 
@@ -286,10 +287,7 @@ func (g *Guard) evaluateLocked() Decision {
 		reasons = append(reasons, ReasonNoInput)
 		age = now
 	default:
-		age = now - meta.ReceivedMonotonic
-		if age < 0 {
-			age = 0
-		}
+		age = max(now-meta.ReceivedMonotonic, 0)
 		if age >= g.options.commandTimeout {
 			reasons = append(reasons, ReasonCommandTimeout)
 		}
@@ -322,19 +320,18 @@ func (g *Guard) evaluateLocked() Decision {
 		}
 	}
 
-	if g.estop {
+	if g.lifecycle == lifecycleStopped {
 		reasons = append(reasons, ReasonEmergencyStop)
 	}
-	if !g.armed {
+	if g.lifecycle != lifecycleArmed {
 		reasons = append(reasons, ReasonNotArmed)
 	}
 
 	// Any unmet condition latches, so a transient fault cannot silently
 	// restore authority when it clears.
-	if len(reasons) > 0 && g.options.latching && g.armed {
+	if len(reasons) > 0 && g.options.latching && g.lifecycle == lifecycleArmed {
 		if !onlyDeadManEngagement(reasons) {
-			g.armed = false
-			g.latched = true
+			g.fire(commandTrip)
 			reasons = appendUnique(reasons, ReasonNotArmed)
 		}
 	}
@@ -357,7 +354,7 @@ func (g *Guard) evaluateLocked() Decision {
 	}
 
 	g.state = decision.State
-	g.reasons = append([]Reason(nil), reasons...)
+	g.reasons = slices.Clone(reasons)
 	return decision
 }
 
@@ -379,16 +376,14 @@ func onlyDeadManEngagement(reasons []Reason) bool {
 }
 
 func appendUnique(reasons []Reason, reason Reason) []Reason {
-	for _, candidate := range reasons {
-		if candidate == reason {
-			return reasons
-		}
+	if slices.Contains(reasons, reason) {
+		return reasons
 	}
 	return append(reasons, reason)
 }
 
 func (g *Guard) copyReasons() []Reason {
-	return append([]Reason(nil), g.reasons...)
+	return slices.Clone(g.reasons)
 }
 
 // Process implements teleop.Processor for callers that cannot supply a
@@ -487,22 +482,14 @@ func (g *Guard) transitionLocked(
 		Meta:     header,
 		State:    decision.State,
 		Permit:   decision.Permit,
-		Reasons:  append([]Reason(nil), decision.Reasons...),
+		Reasons:  slices.Clone(decision.Reasons),
 		InputAge: decision.InputAge,
 		Detail:   g.detail,
 	}}
 }
 
 func (g *Guard) changedLocked(decision Decision) bool {
-	if decision.State != g.lastPublished.State ||
+	return decision.State != g.lastPublished.State ||
 		decision.Permit != g.lastPublished.Permit ||
-		len(decision.Reasons) != len(g.lastPublished.Reasons) {
-		return true
-	}
-	for index, reason := range decision.Reasons {
-		if g.lastPublished.Reasons[index] != reason {
-			return true
-		}
-	}
-	return false
+		!slices.Equal(decision.Reasons, g.lastPublished.Reasons)
 }
