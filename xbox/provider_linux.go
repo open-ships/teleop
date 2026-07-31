@@ -11,7 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -178,7 +178,7 @@ func linuxInputPaths() ([]string, error) {
 		seen[realPath] = true
 		paths = append(paths, path)
 	}
-	sort.Strings(paths)
+	slices.Sort(paths)
 	return paths, nil
 }
 
@@ -349,7 +349,7 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 				if err := s.resync(); err != nil {
 					return teleop.Observation{}, s.normalizeReadError(err)
 				}
-				raw := append([]byte(nil), s.raw.Bytes()...)
+				raw := slices.Clone(s.raw.Bytes())
 				s.raw.Reset()
 				s.dropped = false
 				return teleop.Observation{
@@ -371,7 +371,7 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 
 		s.apply(event)
 		if event.Type == evSyn && event.Code == synReport {
-			raw := append([]byte(nil), s.raw.Bytes()...)
+			raw := slices.Clone(s.raw.Bytes())
 			s.raw.Reset()
 			return teleop.Observation{
 				State:           s.state.Clone(),
@@ -693,9 +693,7 @@ func (s *linuxSource) waitReadable(ctx context.Context) error {
 			if remaining <= 0 {
 				return ctx.Err()
 			}
-			if remaining < timeout {
-				timeout = remaining
-			}
+			timeout = min(timeout, remaining)
 		}
 		timeoutMillis := int((timeout + time.Millisecond - 1) / time.Millisecond)
 		pollFDs := []unix.PollFd{{

@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 )
 
@@ -93,7 +95,7 @@ type Header struct {
 
 // Clone returns an isolated copy of the header.
 func (h Header) Clone() Header {
-	h.Causes = append([]EventID(nil), h.Causes...)
+	h.Causes = slices.Clone(h.Causes)
 	return h
 }
 
@@ -118,13 +120,8 @@ type NativeInput struct {
 }
 
 func (n NativeInput) clone() NativeInput {
-	n.Data = append([]byte(nil), n.Data...)
-	if n.Fields != nil {
-		n.Fields = make(map[string]int64, len(n.Fields))
-		for key, value := range n.Fields {
-			n.Fields[key] = value
-		}
-	}
+	n.Data = slices.Clone(n.Data)
+	n.Fields = maps.Clone(n.Fields)
 	return n
 }
 
@@ -418,6 +415,10 @@ func cloneEvent(event Event) Event {
 
 // ControlOf returns the physical control associated with a standard input
 // event. Not every event has one.
+//
+// Each case appears in both its value and pointer form because an event may be
+// published either way; field access auto-dereferences, so the two arms of a
+// pair are the same expression.
 func ControlOf(event Event) (ControlID, bool) {
 	switch value := event.(type) {
 	case ButtonEvent:
@@ -425,37 +426,37 @@ func ControlOf(event Event) (ControlID, bool) {
 	case *ButtonEvent:
 		return value.Button, true
 	case StickEvent:
-		if value.Stick == LeftStick {
-			return StickLeft, true
-		}
-		if value.Stick == RightStick {
-			return StickRight, true
-		}
-		return "", false
+		return stickControl(value.Stick)
 	case *StickEvent:
-		if value.Stick == LeftStick {
-			return StickLeft, true
-		}
-		if value.Stick == RightStick {
-			return StickRight, true
-		}
-		return "", false
+		return stickControl(value.Stick)
 	case TriggerEvent:
-		if value.Trigger == LeftTrigger {
-			return TriggerLeft, true
-		}
-		if value.Trigger == RightTrigger {
-			return TriggerRight, true
-		}
-		return "", false
+		return triggerControl(value.Trigger)
 	case *TriggerEvent:
-		if value.Trigger == LeftTrigger {
-			return TriggerLeft, true
-		}
-		if value.Trigger == RightTrigger {
-			return TriggerRight, true
-		}
+		return triggerControl(value.Trigger)
+	default:
 		return "", false
+	}
+}
+
+// stickControl maps a stick to its control identity.
+func stickControl(stick StickID) (ControlID, bool) {
+	switch stick {
+	case LeftStick:
+		return StickLeft, true
+	case RightStick:
+		return StickRight, true
+	default:
+		return "", false
+	}
+}
+
+// triggerControl maps a trigger to its control identity.
+func triggerControl(trigger TriggerID) (ControlID, bool) {
+	switch trigger {
+	case LeftTrigger:
+		return TriggerLeft, true
+	case RightTrigger:
+		return TriggerRight, true
 	default:
 		return "", false
 	}

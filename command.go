@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -69,7 +70,7 @@ func (c *Controller) RecordCommand(ctx context.Context, command Command) error {
 		payload:  payload,
 		issuedAt: c.clock.Now(),
 	}
-	request.command.Causes = append([]EventID(nil), command.Causes...)
+	request.command.Causes = slices.Clone(command.Causes)
 	request.command.Payload = nil
 
 	// A caller may use a deferred controller solely for audit-backed command

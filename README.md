@@ -51,7 +51,7 @@ and Lip Gloss.
 
 ## Install
 
-`teleop` currently requires Go 1.25 or newer.
+`teleop` currently requires Go 1.26 or newer.
 
 ```sh
 go get github.com/open-ships/teleop

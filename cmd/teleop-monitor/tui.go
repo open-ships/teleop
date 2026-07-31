@@ -922,10 +922,7 @@ func keyHint(key, action string) string {
 }
 
 func padBetween(left, right string, width int) string {
-	spaces := width - lipgloss.Width(left) - lipgloss.Width(right)
-	if spaces < 1 {
-		spaces = 1
-	}
+	spaces := max(width-lipgloss.Width(left)-lipgloss.Width(right), 1)
 	return left + strings.Repeat(" ", spaces) + right
 }
 

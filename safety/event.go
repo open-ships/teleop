@@ -1,6 +1,7 @@
 package safety
 
 import (
+	"slices"
 	"time"
 
 	"github.com/open-ships/teleop"
@@ -91,7 +92,7 @@ func (Event) Kind() teleop.EventKind { return EventDecision }
 // CloneEvent implements teleop.EventCloner.
 func (e Event) CloneEvent() teleop.Event {
 	e.Meta = e.Meta.Clone()
-	e.Reasons = append([]Reason(nil), e.Reasons...)
+	e.Reasons = slices.Clone(e.Reasons)
 	return e
 }
 
@@ -116,10 +117,5 @@ type Decision struct {
 
 // Has reports whether the decision carries a specific reason.
 func (d Decision) Has(reason Reason) bool {
-	for _, candidate := range d.Reasons {
-		if candidate == reason {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(d.Reasons, reason)
 }

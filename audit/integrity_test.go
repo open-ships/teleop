@@ -863,7 +863,7 @@ func TestManifestBindsSession(t *testing.T) {
 func splitLines(t *testing.T, raw []byte) [][]byte {
 	t.Helper()
 	var lines [][]byte
-	for _, line := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(string(raw), "\n"), "\n") {
 		lines = append(lines, []byte(line))
 	}
 	return lines

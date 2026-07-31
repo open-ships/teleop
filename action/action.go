@@ -5,7 +5,7 @@ package action
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -45,7 +45,7 @@ func (Event) Kind() teleop.EventKind { return EventKind }
 // CloneEvent implements teleop.EventCloner.
 func (e Event) CloneEvent() teleop.Event {
 	e.Meta = e.Meta.Clone()
-	e.Controls = append([]teleop.ControlID(nil), e.Controls...)
+	e.Controls = slices.Clone(e.Controls)
 	if e.Value.Vector != nil {
 		vector := *e.Value.Vector
 		e.Value.Vector = &vector
@@ -148,7 +148,7 @@ type Mapper struct {
 // New validates and copies bindings. Invalid bindings panic instead of silently
 // matching a different control.
 func New(bindings ...Binding) *Mapper {
-	copied := append([]Binding(nil), bindings...)
+	copied := slices.Clone(bindings)
 	for index := range copied {
 		copied[index].Controls = canonicalControls(copied[index].Controls)
 		if err := validateBinding(copied[index]); err != nil {
@@ -203,11 +203,7 @@ func validateBinding(binding Binding) error {
 // Process implements teleop.Processor.
 func (m *Mapper) Process(input teleop.Event) []teleop.Event {
 	mapped := m.Map(input)
-	result := make([]teleop.Event, len(mapped))
-	for index := range mapped {
-		result[index] = mapped[index]
-	}
-	return result
+	return asEvents(mapped)
 }
 
 // ProcessContext implements teleop.ContextProcessor.
@@ -217,11 +213,7 @@ func (m *Mapper) ProcessContext(
 	input teleop.Event,
 ) ([]teleop.Event, error) {
 	mapped := m.mapInput(input, processing)
-	result := make([]teleop.Event, len(mapped))
-	for index := range mapped {
-		result[index] = mapped[index]
-	}
-	return result, nil
+	return asEvents(mapped), nil
 }
 
 // Map returns strongly typed application actions using an instance-unique
@@ -285,7 +277,7 @@ func (m *Mapper) mapInput(
 			Action:   binding.Action,
 			Phase:    values.phase,
 			Control:  values.control,
-			Controls: append([]teleop.ControlID(nil), values.controls...),
+			Controls: slices.Clone(values.controls),
 			Value:    values.value,
 		})
 	}
@@ -387,28 +379,20 @@ func triggerControl(trigger teleop.TriggerID) (teleop.ControlID, bool) {
 	}
 }
 
-func canonicalControls(values []teleop.ControlID) []teleop.ControlID {
-	result := append([]teleop.ControlID(nil), values...)
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
-	write := 0
-	for _, value := range result {
-		if value == "" || write > 0 && result[write-1] == value {
-			continue
-		}
-		result[write] = value
-		write++
+// asEvents widens mapped actions to the open teleop.Event interface.
+func asEvents[T teleop.Event](values []T) []teleop.Event {
+	result := make([]teleop.Event, len(values))
+	for index, value := range values {
+		result[index] = value
 	}
-	return result[:write]
+	return result
+}
+
+func canonicalControls(values []teleop.ControlID) []teleop.ControlID {
+	sorted := slices.Compact(slices.Sorted(slices.Values(values)))
+	return slices.DeleteFunc(sorted, func(value teleop.ControlID) bool { return value == "" })
 }
 
 func equalControls(left, right []teleop.ControlID) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(left, right)
 }

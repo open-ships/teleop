@@ -354,7 +354,7 @@ func TestMonitorModelTogglesRumble(t *testing.T) {
 	if repeated != nil {
 		t.Fatal("repeated rumble key started a second request")
 	}
-	for _, line := range strings.Split(model.renderHaptics(30), "\n") {
+	for line := range strings.SplitSeq(model.renderHaptics(30), "\n") {
 		if lipgloss.Width(line) > 30 {
 			t.Fatalf(
 				"compact haptic line is %d cells wide, want at most 30",
@@ -523,7 +523,7 @@ func TestMonitorModelAlternatesRumbleAtConfiguredInterval(t *testing.T) {
 			t.Fatalf("alternating haptic controls do not contain %q", expected)
 		}
 	}
-	for _, line := range strings.Split(model.renderHaptics(30), "\n") {
+	for line := range strings.SplitSeq(model.renderHaptics(30), "\n") {
 		if lipgloss.Width(line) > 30 {
 			t.Fatalf(
 				"compact alternating haptic line is %d cells wide, want at most 30",
@@ -756,7 +756,7 @@ func TestMonitorModelReportsUnavailableAndFailedRumble(t *testing.T) {
 			t.Fatalf("failed rumble view does not contain %q", expected)
 		}
 	}
-	for _, line := range strings.Split(model.renderHaptics(30), "\n") {
+	for line := range strings.SplitSeq(model.renderHaptics(30), "\n") {
 		if lipgloss.Width(line) > 30 {
 			t.Fatalf(
 				"compact haptic error line is %d cells wide, want at most 30",

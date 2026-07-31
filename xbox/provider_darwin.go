@@ -27,7 +27,7 @@ import (
 func discoverPlatform(ctx context.Context) ([]teleop.Descriptor, error) {
 	count := int(C.teleop_gc_count())
 	var devices []teleop.Descriptor
-	for index := 0; index < count; index++ {
+	for index := range count {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}

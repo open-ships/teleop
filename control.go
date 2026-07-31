@@ -1,5 +1,7 @@
 package teleop
 
+import "slices"
+
 // ControllerType identifies a family of game controllers. It is string-backed
 // so third-party providers can add controller types without changing teleop.
 type ControllerType string
@@ -89,7 +91,7 @@ var standardButtons = []ControlID{
 
 // StandardButtonIDs returns the standard physical buttons in a stable order.
 func StandardButtonIDs() []ControlID {
-	return append([]ControlID(nil), standardButtons...)
+	return slices.Clone(standardButtons)
 }
 
 // StickID selects one of the two standard analog sticks.

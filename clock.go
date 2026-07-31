@@ -65,10 +65,7 @@ func (m *clockMonitor) observe(now time.Time) clockSample {
 	wallDelta := now.Round(0).Sub(m.lastWall.Round(0))
 	monoDelta := monotonic - m.lastMono
 	divergence := wallDelta - monoDelta
-	magnitude := divergence
-	if magnitude < 0 {
-		magnitude = -magnitude
-	}
+	magnitude := divergence.Abs()
 	if magnitude >= m.threshold {
 		m.steps++
 		sample.Step = divergence

@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"maps"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -88,19 +89,7 @@ func CaptureProvenance() Provenance {
 // Clone returns a deep copy so a recorder cannot observe later mutation of a
 // caller's maps.
 func (p Provenance) Clone() Provenance {
-	if p.Config != nil {
-		config := make(map[string]any, len(p.Config))
-		for key, value := range p.Config {
-			config[key] = value
-		}
-		p.Config = config
-	}
-	if p.Platform != nil {
-		platform := make(map[string]string, len(p.Platform))
-		for key, value := range p.Platform {
-			platform[key] = value
-		}
-		p.Platform = platform
-	}
+	p.Config = maps.Clone(p.Config)
+	p.Platform = maps.Clone(p.Platform)
 	return p
 }

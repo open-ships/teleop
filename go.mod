@@ -1,10 +1,11 @@
 module github.com/open-ships/teleop
 
-go 1.25.0
+go 1.26.0
 
 require (
 	charm.land/bubbletea/v2 v2.0.8
 	charm.land/lipgloss/v2 v2.0.5
+	github.com/open-ships/statemachine v1.0.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
 )

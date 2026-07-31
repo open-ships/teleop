@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"sync"
 )
 
@@ -43,13 +44,8 @@ func (r *Registry) Register(provider Provider) {
 // provider-specific errors.
 func (r *Registry) Discover(ctx context.Context) ([]Descriptor, error) {
 	r.mu.RLock()
-	types := make([]ControllerType, 0, len(r.providers))
-	for controllerType := range r.providers {
-		types = append(types, controllerType)
-	}
-	sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
-	providers := make([]Provider, 0, len(types))
-	for _, controllerType := range types {
+	providers := make([]Provider, 0, len(r.providers))
+	for _, controllerType := range slices.Sorted(maps.Keys(r.providers)) {
 		providers = append(providers, r.providers[controllerType])
 	}
 	r.mu.RUnlock()

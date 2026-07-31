@@ -1,5 +1,7 @@
 package teleop
 
+import "maps"
+
 // Stick is a normalized two-dimensional stick position. Both axes are in
 // [-1,+1]. Positive X is right and positive Y is up.
 type Stick struct {
@@ -130,14 +132,8 @@ func (b *Buttons) Set(id ControlID, pressed bool) {
 }
 
 func (b Buttons) clone() Buttons {
-	result := b
-	if b.Extensions != nil {
-		result.Extensions = make(map[ControlID]bool, len(b.Extensions))
-		for id, pressed := range b.Extensions {
-			result.Extensions[id] = pressed
-		}
-	}
-	return result
+	b.Extensions = maps.Clone(b.Extensions)
+	return b
 }
 
 // State is a canonical, transport-independent controller snapshot.

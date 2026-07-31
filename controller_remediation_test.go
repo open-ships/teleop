@@ -240,7 +240,7 @@ func TestSubscriptionCloseBroadcastsToAllBlockedReaders(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	for index := 0; index < 2; index++ {
+	for range 2 {
 		if _, err := subscription.Next(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -248,21 +248,21 @@ func TestSubscriptionCloseBroadcastsToAllBlockedReaders(t *testing.T) {
 
 	started := make(chan struct{}, 4)
 	finished := make(chan error, 4)
-	for index := 0; index < 4; index++ {
+	for range 4 {
 		go func() {
 			started <- struct{}{}
 			_, err := subscription.Next(context.Background())
 			finished <- err
 		}()
 	}
-	for index := 0; index < 4; index++ {
+	for range 4 {
 		<-started
 	}
 	time.Sleep(10 * time.Millisecond)
 	if err := subscription.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; index < 4; index++ {
+	for index := range 4 {
 		select {
 		case err := <-finished:
 			if !errors.Is(err, teleop.ErrClosed) {
@@ -642,7 +642,7 @@ func TestSlowSinkDoesNotDelayCanonicalSnapshot(t *testing.T) {
 	waitForSnapshot(t, controller, func(_ teleop.State, meta teleop.StateMeta) bool {
 		return meta.Connected
 	})
-	for index := 0; index < 8; index++ {
+	for index := range 8 {
 		if err := source.Push(context.Background(), teleop.State{
 			LeftTrigger: float32(index) / 7,
 		}); err != nil {
