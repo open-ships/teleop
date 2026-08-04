@@ -81,11 +81,12 @@ var gate = statemachine.MustCompile([]transition{
 	{From: lifecycleArmed, Event: commandStop, To: lifecycleStopped},
 	{From: lifecycleStopped, Event: commandStop, To: lifecycleStopped},
 
-	// Reset clears a stop and leaves output inhibited until the next Arm. On a
-	// gate with no stop latched it changes nothing.
+	// Reset always leaves output inhibited until the next Arm. Making Reset from
+	// an armed state idle avoids a reset request unexpectedly preserving live
+	// authority.
 	{From: lifecycleStopped, Event: commandReset, To: lifecycleIdle},
 	{From: lifecycleIdle, Event: commandReset, To: lifecycleIdle},
-	{From: lifecycleArmed, Event: commandReset, To: lifecycleArmed},
+	{From: lifecycleArmed, Event: commandReset, To: lifecycleIdle},
 })
 
 // requireBound declines while the Guard has no controller. Binding is checked
@@ -107,10 +108,18 @@ func refuseArmDuringStop(ctx context.Context, g *Guard) error {
 	return errArmDuringStop
 }
 
-// fire applies a command that every lifecycle state accepts. Such a command
-// cannot be refused, and assigning Fire's result is correct even if one ever
-// were: the machine reports the state it was given whenever it reports an
-// error. The caller must hold g.mu.
+// fire applies an internal or inhibiting command. It preserves the current
+// state if the transition table refuses the command, and clears every piece of
+// authorization proof after any accepted authority-revoking transition. The
+// caller must hold g.mu.
 func (g *Guard) fire(event command) {
-	g.lifecycle, _ = gate.Fire(context.Background(), g.lifecycle, event, g)
+	next, err := gate.Fire(context.Background(), g.lifecycle, event, g)
+	if err != nil {
+		return
+	}
+	g.lifecycle = next
+	switch event {
+	case commandDisarm, commandTrip, commandStop, commandReset:
+		g.clearAuthorizationProofLocked()
+	}
 }

@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -172,6 +174,111 @@ func TestLinuxReadCancellation(t *testing.T) {
 
 	if _, err := source.Read(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Read error = %v, want context.DeadlineExceeded", err)
+	}
+	if health := source.TransportHealth(); health.Sequence != 0 || health.SilenceVerifiable {
+		t.Fatalf("unprobed poll timeout manufactured transport health: %+v", health)
+	}
+}
+
+func TestLinuxPollTimeoutProbesFreshEvdevAttachment(t *testing.T) {
+	t.Parallel()
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var probes atomic.Int64
+	source := &linuxSource{
+		file: reader,
+		probeAttachment: func() error {
+			probes.Add(1)
+			return nil
+		},
+	}
+	defer source.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Millisecond)
+	defer cancel()
+	if _, err := source.Read(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Read error = %v, want deadline after attachment probes", err)
+	}
+	if probes.Load() == 0 {
+		t.Fatal("poll timeout advanced without invoking EVIOCGID attachment probe")
+	}
+	health := source.TransportHealth()
+	if health.Sequence == 0 || !health.Connected || !health.SilenceVerifiable || health.CheckedAt.IsZero() {
+		t.Fatalf("fresh attachment health = %+v", health)
+	}
+}
+
+func TestLinuxBusyStreamRefreshesAttachmentEvidence(t *testing.T) {
+	t.Parallel()
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var probes atomic.Int64
+	source := &linuxSource{
+		file: reader,
+		probeAttachment: func() error {
+			probes.Add(1)
+			return nil
+		},
+	}
+	defer source.Close()
+	if err := source.checkEvdevAttachment(); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 8 {
+		report := []linuxInputEvent{
+			{Type: evKey, Code: btnSouth, Value: int32(index % 2)},
+			{Type: evSyn, Code: synReport},
+		}
+		for _, event := range report {
+			if err := binary.Write(writer, binary.NativeEndian, event); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := source.Read(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	probeCount := probes.Load()
+	if probeCount <= 1 {
+		t.Fatalf("busy stream attachment probes = %d, want refreshes after initial probe", probeCount)
+	}
+	health := source.TransportHealth()
+	if health.Sequence != uint64(probeCount) ||
+		!health.Connected || !health.SilenceVerifiable || health.CheckedAt.IsZero() {
+		t.Fatalf("busy stream lost established transport capability: %+v", health)
+	}
+}
+
+func TestLinuxFailedAttachmentProbeReportsDisconnect(t *testing.T) {
+	t.Parallel()
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	source := &linuxSource{
+		file: reader,
+		probeAttachment: func() error {
+			return syscall.ENODEV
+		},
+	}
+	defer source.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := source.Read(ctx); !errors.Is(err, teleop.ErrDisconnected) {
+		t.Fatalf("Read error = %v, want failed EVIOCGID disconnect", err)
+	}
+	health := source.TransportHealth()
+	if health.Sequence != 1 || health.Connected || !health.SilenceVerifiable {
+		t.Fatalf("failed attachment health = %+v", health)
 	}
 }
 

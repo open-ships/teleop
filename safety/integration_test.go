@@ -3,6 +3,8 @@ package safety_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -111,17 +113,26 @@ func TestGuardedSessionIsFullyRecorded(t *testing.T) {
 	}
 	guard.Bind(controller)
 
+	// Establish an observed released baseline, arm while every control is
+	// neutral, and only then accept a fresh dead-man press.
+	if err := source.Push(t.Context(), teleop.State{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, controller, "released baseline", func(teleop.State) bool {
+		_, meta := controller.SnapshotWithMeta()
+		return meta.Sequence > 0 && !meta.Synthetic
+	})
+
+	guard.Heartbeat()
+	if err := guard.Arm(); err != nil {
+		t.Fatal(err)
+	}
 	var held teleop.State
 	held.SetButton(deadMan, true)
 	if err := source.Push(t.Context(), held); err != nil {
 		t.Fatal(err)
 	}
 	waitForState(t, controller, "dead-man held", deadManHeld)
-
-	guard.Heartbeat()
-	if err := guard.Arm(); err != nil {
-		t.Fatal(err)
-	}
 	decision := waitForPermit(t, guard)
 
 	_, meta := controller.SnapshotWithMeta()
@@ -304,4 +315,102 @@ func TestGuardTripsWithoutApplicationInvolvement(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatal("guard did not trip on its own timer")
+}
+
+func TestInitialHeldDeadManDoesNotCountAsEngagement(t *testing.T) {
+	source := testkit.NewFakeSource(descriptor(), 16)
+	guard := safety.New(
+		safety.WithCommandTimeout(time.Second),
+		safety.WithDeadMan(deadMan),
+	)
+	controller, err := teleop.NewController(source, teleop.WithProcessor(guard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = controller.Close() })
+	if err := guard.Bind(controller); err != nil {
+		t.Fatal(err)
+	}
+
+	var held teleop.State
+	held.SetButton(deadMan, true)
+	if err := source.Push(t.Context(), held); err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, controller, "initial dead-man hold", deadManHeld)
+	if err := guard.Arm(); !errors.Is(err, safety.ErrUnsafeToArm) {
+		t.Fatalf("Arm error = %v, want ErrUnsafeToArm", err)
+	}
+	decision := guard.Evaluate()
+	if decision.Permit || !decision.Has(safety.ReasonDeadManReleaseRequired) {
+		t.Fatalf("initial-hold decision = %+v", decision)
+	}
+
+	if err := source.Push(t.Context(), teleop.State{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, controller, "dead-man release", deadManClear)
+	deadline := time.Now().Add(time.Second)
+	for {
+		err = guard.Arm()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Arm after observed release: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := source.Push(t.Context(), held); err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, controller, "fresh post-arm press", deadManHeld)
+	waitForPermit(t, guard)
+}
+
+func TestInvalidFiniteAnalogObservationTripsGuard(t *testing.T) {
+	source := testkit.NewFakeSource(descriptor(), 16)
+	guard := safety.New(safety.WithCommandTimeout(time.Second))
+	controller, err := teleop.NewController(source, teleop.WithProcessor(guard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = controller.Close() })
+	if err := guard.Bind(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Push(t.Context(), teleop.State{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, controller, "valid neutral observation", func(teleop.State) bool {
+		_, meta := controller.SnapshotWithMeta()
+		return meta.Sequence > 0 && !meta.Synthetic
+	})
+	if err := guard.Arm(); err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := teleop.State{
+		LeftStick:    teleop.Stick{X: 2},
+		RightTrigger: 1,
+	}
+	if err := source.Push(t.Context(), invalid); err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, controller, "invalid observation neutralized", func(state teleop.State) bool {
+		_, meta := controller.SnapshotWithMeta()
+		return meta.Invalid && meta.Synthetic && reflect.DeepEqual(state, teleop.State{})
+	})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		decision := guard.Evaluate()
+		if decision.Has(safety.ReasonInvalidInput) && decision.Has(safety.ReasonNotArmed) {
+			if decision.Permit || !reflect.DeepEqual(decision.Command, teleop.State{}) {
+				t.Fatalf("invalid-input decision = %+v", decision)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("Guard did not latch invalid input: %+v", guard.Evaluate())
 }

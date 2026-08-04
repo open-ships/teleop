@@ -3,6 +3,7 @@ package teleop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -39,6 +40,12 @@ type commandRequest struct {
 	command  Command
 	payload  json.RawMessage
 	issuedAt time.Time
+	response chan commandResult
+}
+
+type commandResult struct {
+	id  EventID
+	err error
 }
 
 // RecordCommand publishes a CommandEvent to every subscription and audit sink.
@@ -48,20 +55,141 @@ type commandRequest struct {
 // should treat that error as a fault and inhibit output, because the command
 // it just issued is not in the record.
 func (c *Controller) RecordCommand(ctx context.Context, command Command) error {
-	if err := ctx.Err(); err != nil {
+	request, err := c.prepareCommand(ctx, command, false)
+	if err != nil {
 		return err
+	}
+
+	// A caller may use a deferred controller solely for audit-backed command
+	// recording. Starting here preserves the method's promise to publish rather
+	// than leaving an accepted request stranded until some unrelated Snapshot or
+	// Subscribe call.
+	c.start()
+	accepted, open, _ := c.tryEnqueueCommand(request)
+	if accepted {
+		return nil
+	}
+	if !open {
+		return c.closedError()
+	}
+	return fmt.Errorf("%w: command queue is full", ErrPipelineOverflow)
+}
+
+// RecordCommandSync publishes a CommandEvent and waits until every attached
+// sink callback has completed for it. Because sink queues are FIFO, success
+// also establishes that each sink completed every event admitted before this
+// command. A sink still defines its own durability semantics; for example,
+// audit.Recorder returns only after its local store has been synchronized.
+//
+// Once the request enters the controller queue, cancellation cannot retract
+// it. A caller that stops waiting receives ErrCommandPublicationUncertain
+// joined with its context error; the command may finish publication later.
+// A processor failure after the command event itself was recorded and exposed
+// carries the same marker. Treat either case as indeterminate and fail safe.
+//
+// This method is intentionally available on the concrete Controller without
+// expanding GameController. Safety integrations can opt into the stronger
+// contract without breaking third-party GameController implementations.
+func (c *Controller) RecordCommandSync(ctx context.Context, command Command) (EventID, error) {
+	request, err := c.prepareCommand(ctx, command, true)
+	if err != nil {
+		return EventID{}, err
+	}
+
+	c.start()
+	for {
+		accepted, open, space := c.tryEnqueueCommand(request)
+		if accepted {
+			break
+		}
+		if !open {
+			return EventID{}, c.closedError()
+		}
+		select {
+		case <-space:
+		case <-c.commandClosed:
+			return EventID{}, c.closedError()
+		case <-ctx.Done():
+			return EventID{}, ctx.Err()
+		case <-c.done:
+			return EventID{}, c.closedError()
+		}
+	}
+	return c.waitForCommandResult(ctx, request.response)
+}
+
+func (c *Controller) waitForCommandResult(
+	ctx context.Context,
+	response <-chan commandResult,
+) (EventID, error) {
+	select {
+	case result := <-response:
+		return result.id, result.err
+	case <-ctx.Done():
+		// Completion may have become ready with cancellation. Preserve the exact
+		// outcome whenever it is already buffered before declaring uncertainty.
+		select {
+		case result := <-response:
+			return result.id, result.err
+		default:
+		}
+		return EventID{}, errors.Join(ErrCommandPublicationUncertain, ctx.Err())
+	case <-c.done:
+		// A buffered response may have raced with terminal completion. Prefer
+		// the exact command outcome when it is already available.
+		select {
+		case result := <-response:
+			return result.id, result.err
+		default:
+			return EventID{}, errors.Join(
+				ErrCommandPublicationUncertain,
+				c.closedError(),
+			)
+		}
+	}
+}
+
+// tryEnqueueCommand makes queue admission indivisible from the terminal
+// admission gate. terminate closes that gate under the same mutex before it
+// drains, so accepted commands cannot arrive after the final drain.
+func (c *Controller) tryEnqueueCommand(
+	request commandRequest,
+) (accepted bool, open bool, space <-chan struct{}) {
+	c.commandMu.Lock()
+	defer c.commandMu.Unlock()
+	if !c.commandAccepting {
+		return false, false, nil
+	}
+	select {
+	case c.external <- request:
+		return true, true, nil
+	default:
+		return false, true, c.commandSpace
+	}
+}
+
+func (c *Controller) prepareCommand(
+	ctx context.Context,
+	command Command,
+	synchronous bool,
+) (commandRequest, error) {
+	if ctx == nil {
+		return commandRequest{}, fmt.Errorf("%w: nil command context", ErrInvalidState)
+	}
+	if err := ctx.Err(); err != nil {
+		return commandRequest{}, err
 	}
 	if command.Name == "" {
-		return fmt.Errorf("%w: command name is empty", ErrInvalidState)
+		return commandRequest{}, fmt.Errorf("%w: command name is empty", ErrInvalidState)
 	}
 	if err := c.validateCommandCauses(command.Causes); err != nil {
-		return err
+		return commandRequest{}, err
 	}
 	var payload json.RawMessage
 	if command.Payload != nil {
 		encoded, err := json.Marshal(command.Payload)
 		if err != nil {
-			return fmt.Errorf("marshal command payload: %w", err)
+			return commandRequest{}, fmt.Errorf("marshal command payload: %w", err)
 		}
 		payload = encoded
 	}
@@ -70,43 +198,30 @@ func (c *Controller) RecordCommand(ctx context.Context, command Command) error {
 		payload:  payload,
 		issuedAt: c.clock.Now(),
 	}
+	if synchronous {
+		request.response = make(chan commandResult, 1)
+	}
 	request.command.Causes = slices.Clone(command.Causes)
 	request.command.Payload = nil
+	return request, nil
+}
 
-	// A caller may use a deferred controller solely for audit-backed command
-	// recording. Starting here preserves the method's promise to publish rather
-	// than leaving an accepted request stranded until some unrelated Snapshot or
-	// Subscribe call.
-	c.start()
-	select {
-	case <-c.done:
-		if err := c.Err(); err != nil {
-			return err
-		}
-		return ErrClosed
-	default:
+func (c *Controller) closedError() error {
+	if err := c.Err(); err != nil {
+		return err
 	}
-	select {
-	case c.external <- request:
-		return nil
-	case <-c.done:
-		if err := c.Err(); err != nil {
-			return err
-		}
-		return ErrClosed
-	default:
-		return fmt.Errorf("%w: command queue is full", ErrPipelineOverflow)
-	}
+	return ErrClosed
 }
 
 func (c *Controller) validateCommandCauses(causes []EventID) error {
 	if len(causes) == 0 {
 		return nil
 	}
-	c.knownMu.RLock()
-	defer c.knownMu.RUnlock()
+	c.publishedMu.RLock()
+	defer c.publishedMu.RUnlock()
 	for _, cause := range causes {
-		if _, ok := c.known[cause]; !ok {
+		if cause.Session != c.session ||
+			!c.published.Contains(cause.Stream, cause.Sequence) {
 			return fmt.Errorf(
 				"%w: command cause %s/%s/%d has not been published",
 				ErrInvalidState,
@@ -120,7 +235,7 @@ func (c *Controller) validateCommandCauses(causes []EventID) error {
 }
 
 func (c *Controller) handleCommand(request commandRequest) error {
-	return c.publish(CommandEvent{
+	event := CommandEvent{
 		Meta: c.nextHeaderAt(
 			"command",
 			request.issuedAt,
@@ -133,5 +248,13 @@ func (c *Controller) handleCommand(request commandRequest) error {
 		Payload:    request.payload,
 		Authorized: request.command.Authorized,
 		Reason:     request.command.Reason,
-	})
+	}
+	var err error
+	if request.response == nil {
+		err = c.publish(event)
+	} else {
+		err = c.publishSynchronous(event)
+		request.response <- commandResult{id: event.Meta.ID, err: err}
+	}
+	return err
 }

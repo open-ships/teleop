@@ -59,6 +59,24 @@ func TestFakeSourceRumble(t *testing.T) {
 	}
 }
 
+func TestFakeSourceTransportHealthIsExplicitAndIsolated(t *testing.T) {
+	source := testkit.NewFakeSource(teleop.Descriptor{ID: "health"}, 1)
+	if health := source.TransportHealth(); health.Sequence != 0 || health.SilenceVerifiable {
+		t.Fatalf("default health = %+v, want unverifiable zero", health)
+	}
+
+	want := teleop.TransportHealth{
+		Sequence:          7,
+		CheckedAt:         time.Now(),
+		Connected:         true,
+		SilenceVerifiable: true,
+	}
+	source.SetTransportHealth(want)
+	if got := source.TransportHealth(); got != want {
+		t.Fatalf("health = %+v, want %+v", got, want)
+	}
+}
+
 func TestReplaySourcePreservesOrderAndHonorsClose(t *testing.T) {
 	observedAt := time.Unix(100, 0)
 	source := testkit.NewReplaySource(

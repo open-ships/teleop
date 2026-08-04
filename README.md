@@ -8,22 +8,23 @@ applications.
 `teleop` separates controller hardware and operating-system APIs from
 application control logic. It exposes transport-independent state snapshots,
 an ordered event stream, optional gestures and semantic actions, fail-closed
-output gating, and signed, hash-chained audit recording. The included `xbox`
-provider works on Linux, macOS, and Windows.
+output authority with expiring command leases, and signed, externally witnessed
+audit recording. The included `xbox` provider works on Linux, macOS, and
+Windows.
 
 > [!IMPORTANT]
-> `teleop` transports operator input and can gate it, but it is not a certified
-> safety controller. The `safety` package provides a command timeout, dead-man
-> switch, loop watchdog, and latching emergency stop. It does not replace a
-> hardware emergency stop, a safety-rated interlock, or an actuator that reaches
-> a safe state on its own when commands stop arriving — that last one is the
-> control that actually protects people, and it lives in the receiving system,
-> not here. A backend cannot report input that the operating system, driver,
-> radio, or polling API never delivered.
+> `teleop` is not a certified safety controller. Its strict path combines
+> fresh OS/framework connection evidence, a dead-man switch, loop watchdog,
+> latching stop, durable evidence, an engineered safe state, and
+> receiver-enforced command leases. It does not replace a hardware emergency
+> stop, safety-rated interlocks, physical feedback, vessel-specific command
+> validation, or an actuator that reaches a safe state when lease renewal stops.
+> A backend also cannot report input that the device, radio, driver, or OS never
+> delivered.
 
-The API has completed its pre-v1 review, and hardware mappings have been
-validated across the supported controller generations and operating systems.
-The `v1.0.0` tag begins the Go module compatibility commitment.
+The API has completed its pre-v1 review. The `v1.0.0` tag begins the Go module
+compatibility commitment. Validate backend mappings on the exact controller,
+OS/driver, radio, and actuator combination before deployment.
 
 ## Features
 
@@ -37,11 +38,14 @@ The `v1.0.0` tag begins the Go module compatibility commitment.
 - Tap, double-tap, hold, chord, stick-region, and trigger-threshold gestures
 - Application-defined action bindings with causal event IDs
 - Application command records linked to the input that caused them
-- Command timeout, dead-man switch, and loop watchdog that fail closed
+- Strict maritime interlocks with release-neutral-arm-fresh-press sequencing
+- Independent backend connection checks distinct from unchanged operator state
+- Serialized Safety Authority with expiring leases and acknowledged fallback
+- Assured Session composition that hides raw hazardous-output seams
 - Monotonic event timing and wall-clock step detection
-- Append-only, hash-chained JSON Lines audit logs
-- Ed25519-signed Merkle tree heads, checkpoints, and external anchoring
-- Build, configuration, and operator provenance recorded per session
+- Immutable-at-admission, hash-chained JSON Lines audit logs with sync barriers
+- Ed25519-signed Merkle heads, witness receipts, quorum anchoring, and strict close
+- Build/configuration provenance and caller-declared operator/grant metadata
 - Fake and replay input sources for tests
 - Interactive terminal monitor and machine-readable JSON output
 
@@ -124,12 +128,22 @@ forward := teleop.ApplyRadialDeadZone(state.LeftStick, 0.12).Y
 armed := state.Button(xbox.ButtonA)
 ```
 
-`SnapshotWithMeta` also returns the last physical observation and receive
-times, connection state, and whether the snapshot was synthesized. Use those
-timestamps to enforce an application-specific command timeout. Game-controller
-backends are change-driven, so a held control can legitimately produce no new
-observations; observation age alone is not proof of disconnect. Confirmed
-disconnects always synthesize a neutral state and release events.
+`SnapshotWithMeta` also returns observation, state-change, and independent
+transport-check timing; connection, invalid, stale, and synthetic flags; and
+whether silence is verifiable for this source. Game-controller backends are
+change-driven, so a held control can legitimately produce no new observations.
+The strict safety profile relies on independent Transport Health instead of
+mistaking unchanged operator state for disconnect. Confirmed disconnects always
+synthesize a neutral state and release events.
+
+The scope of that evidence is deliberately narrow. Linux performs a fresh
+`EVIOCGID` ioctl against the retained evdev descriptor to check that the kernel
+still recognizes the attachment. macOS checks that the exact retained
+controller remains in `GCController.controllers` to establish current
+GameController-framework membership. Neither check challenges the physical
+controller or radio, and operating-system disconnect-detection latency still
+applies. Each backend descriptor's `transport_health_scope` property records
+the checked seam.
 
 ## Controller rumble
 
@@ -233,6 +247,15 @@ err := controller.RecordCommand(ctx, teleop.Command{
 command could not be admitted to the bounded audit pipeline and should be
 treated as a safety fault.
 
+The concrete `*teleop.Controller` also provides `RecordCommandSync`, which
+waits until every configured sink callback has completed for the command and
+all earlier FIFO events. A sink determines what callback completion means;
+`audit.Recorder` synchronizes its local store by default. Cancellation after
+queue admission returns `teleop.ErrCommandPublicationUncertain` because it
+cannot retract a command that may finish recording later. The `assured` package
+uses this barrier and validates the recorder's achieved durability before
+hazardous actuation.
+
 Recognized `gesture.Event` and mapped `action.Event` values appear in the same
 subscriptions and audit sinks as the input events that caused them.
 
@@ -289,9 +312,14 @@ emits a `GapEvent`.
 
 ## Auditing and replay
 
-The controller accepts every canonical and derived event into each bounded
-audit queue before delivering it to subscribers. Sink I/O runs independently
-so filesystem latency does not delay the input path:
+By default, the controller freezes every event for canonical sinks before
+asynchronous handoff and accepts it into each bounded audit queue before
+delivering it to subscribers. This keeps ordinary input decoupled from
+filesystem latency. `teleop.WithSynchronousAudit()` instead makes every event
+wait for every sink callback before state, subscriber, or processor exposure;
+`assured.Session` requires that stronger mode. The explicit command barrier is
+also available to applications assembling their own evidence-before-actuation
+path:
 
 ```go
 file, err := os.OpenFile(
@@ -314,10 +342,10 @@ controller, err := provider.Open(
 )
 ```
 
-`audit.ReadAll` verifies a completed log's integrity chain and footer. An
-unkeyed SHA-256 chain detects corruption but can be recomputed by an attacker;
-use `audit.WithHMAC(key)` and `audit.ReadAuthenticated` when adversarial
-tamper-evidence is required. Use `audit.ReadPartial` for a running or
+`audit.ReadAll` verifies a completed log's integrity chain and footer. The
+simple example above detects corruption only: an attacker can replace an
+unkeyed chain. Use origin-authenticated signing and independent witnessing for
+adversarial tamper-evidence. Use `audit.ReadPartial` for a running or
 interrupted log. `audit.Observations` and `testkit.NewReplaySource` can then
 reproduce its canonical input without controller hardware.
 For forensic playback, `audit.Events` decodes the recorded canonical,
@@ -333,6 +361,7 @@ recorder := audit.NewRecorder(
     audit.WithSigner(signer),        // Ed25519; prefer a TPM or HSM key
     audit.WithCheckpoints(10*time.Second, 10000),
     audit.WithAnchor(anchor),        // publish heads outside this host
+    audit.WithRequiredWitness(true), // final footer must be acknowledged
     audit.WithProvenance(provenance),
 )
 ```
@@ -346,6 +375,17 @@ build, configuration, and operator without which recorded input cannot be
 turned back into behavior.
 Records also form an RFC 6962 Merkle tree, so a single record can be proved to
 a signed head without disclosing the rest of the log.
+
+`Recorder.EvidenceStatus` separates queue acceptance, local durability, and
+the witnessed high-water mark; `WaitForWitness` waits for a receipt covering a
+specific event count. `audit.NewQuorumAnchor` can require acknowledgements from
+multiple independent custody domains. A timer emits checkpoints even when an
+operator holds a steady control and no later input arrives.
+
+Those durability and receipt levels report successful configured adapter
+barriers. Validate custom `Sync` implementations, remote custody, witness
+identity, and trusted receipt time in the deployed system; the process cannot
+independently prove that an adapter which returned success told the truth.
 
 Verify completed signed logs with
 `audit.ReadTrusted(reader, trustedPublicKey)`. The public key must come from a
@@ -361,59 +401,84 @@ controller pipeline, and lossless subscriber overflow is explicit. See
 [the audit guide](docs/audit.md) for the full guarantee boundary and replay
 workflow.
 
-Every mechanism above detects records that were altered, removed, or
-misattributed. None detects input the operating system never delivered, which
-is the failure most likely to injure someone. That is what the next section is
-for.
+No producer-controlled mechanism is literally tamper-proof: a compromised
+producer can omit an event before the recorder sees it. The assured claim is
+immutable admission, local crash durability, origin authentication, an
+observable externally witnessed high-water mark, explicit gaps, and a required
+witnessed footer. A recent locally durable suffix remains vulnerable to loss or
+replacement until an independent witness acknowledges a covering checkpoint;
+configure frequent checkpoints and monitor `EvidenceStatus` when that window
+must be small.
 
-## Command timeout and dead-man switch
+Within their stated key, adapter, and custody assumptions, these mechanisms
+detect alteration and make replacement or truncation of a witnessed prefix
+evident. They do not detect input the operating system never delivered or prove
+that an application produced a safe vessel command. That is what the next
+section addresses.
 
-The `safety` package gates output on conditions it can affirmatively establish,
-and inhibits on anything it cannot:
+## Assured safety authority
+
+For hazardous output, use `assured.Session`. It composes the strict
+`safety.NewMaritime` profile, audit recorder, external witness, and one
+serialized `safety.Authority`; it does not expose the raw controller or
+actuator path.
+
+The operator sequence is deliberately strict:
+
+1. Start the single continuous `Session.Apply` loop; before live authority is
+   established it exercises the software/adapter path while applying only the
+   Engineered Safe State. An acknowledgement is not physical-state proof.
+2. Observe the dead-man released and every control neutral.
+3. Call `Session.Arm`.
+4. Observe a fresh post-arm dead-man press.
+5. Keep submitting each intent through that loop at an interval comfortably
+   shorter than the loop watchdog and Command Lease.
+
+`Apply` evaluates interlocks at the actuation boundary, durably records the
+decision and intent, transmits a session-bound command with an expiry lease,
+and validates the matching actuator acknowledgement. Assured configuration
+requires the adapter to assert an application time inside that lease. When any
+configured teleop condition is unproven, the authority substitutes the
+vessel-specific Engineered Safe State.
+
+Authority does not validate a command's actuator mapping, units, bounds,
+rate/slew, vessel-mode constraints, or operator permission. In this fragment,
+`validatedThrottle` must already have passed an authenticated, vessel-specific
+command policy:
 
 ```go
-guard := safety.New(
-    safety.WithCommandTimeout(150*time.Millisecond),
-    safety.WithDeadMan(xbox.ButtonBumperRight),
-    safety.WithDeadManReactuation(30*time.Second),
-    safety.WithLoopWatchdog(100*time.Millisecond),
-)
-
-controller, err := provider.Open(ctx, deviceID,
-    teleop.WithProcessor(guard),
-    teleop.WithLiveness(20*time.Millisecond, 100*time.Millisecond),
-)
+// This is one iteration of the already-running authoritative Apply loop.
+result, err := session.Apply(ctx, safety.ApplyRequest{
+    Intent: safety.VesselCommand{
+        Name:    "propulsion.set",
+        Payload: map[string]any{"throttle": validatedThrottle},
+    },
+    Causes: []teleop.EventID{inputEvent.Header().ID},
+    Detail: "captain propulsion request",
+})
 if err != nil {
-    return err
+    return err // stop ordinary output; receiver-side lease expiry is mandatory
 }
-guard.Bind(controller)
-
-for range ticker.C {
-    guard.Heartbeat()
-    decision := guard.Evaluate()
-    drive(decision.Command) // neutral whenever inhibited
+if result.Fallback {
+    log.Printf("request inhibited: %v", result.Decision.Reasons)
 }
 ```
 
-`Evaluate` is authoritative and must be called immediately before acting.
-`Decision.Command` is the neutral state whenever output is inhibited, so a
-stale decision cannot leak live input into an actuator. Input age is measured
-on a monotonic clock, so a wall-clock step cannot make stale input look fresh.
+Transport Health is independent of input changes, so a steady held command can
+remain valid only while the backend keeps confirming its documented
+OS/framework connection condition. This does not establish fresh physical or
+radio responsiveness.
+Missing, stale, regressing, timestamp-less, or disconnected health fails
+closed. Invalid analog input neutralizes the entire observation; gaps, source
+errors, synthetic state, a stalled loop, defeated dead-man, and emergency stop
+also inhibit and latch.
 
-Faults latch: a dropout revokes authority until an operator calls `Arm` again,
-because automatic resumption is how a transient dropout becomes an unexpected
-movement. Releasing the dead-man control is normal operation and does not
-latch, while holding it past the re-actuation deadline is treated as a defeated
-switch and does. The guard also re-evaluates on the controller's own ticker, so
-it trips even if the application stops calling `Evaluate`.
-
-Transitions are published into the same subscriptions and audit sinks as input.
-Pair the guard with `controller.RecordCommand` so the log shows both what the
-operator did and what the gate permitted.
-
-A `safety.Guard` is not a certified safety controller and does not replace a
-hardware emergency stop or an actuator that reaches a safe state on its own
-when commands stop arriving. See [the safety guide](docs/safety.md).
+The receiver must reject expired or out-of-order leases, enforce independent
+hard command/mode limits, and enter its safe state without this process. An
+independent hardware emergency stop, safety-rated interlocks, authenticated
+physical feedback, authenticated operator authorization, and vessel-specific
+hazard analysis remain mandatory deployment controls. See the complete [safety
+guide](docs/safety.md) and [safety case](docs/safety-case.md).
 
 ## Terminal monitor
 
@@ -449,6 +514,10 @@ Record while monitoring:
 go run ./cmd/teleop-monitor --audit controller.jsonl
 ```
 
+The monitor flag creates a local unkeyed integrity log for diagnostics; it is
+not an Assured Session and does not provide origin authentication or external
+witnessing.
+
 The interactive TUI uses latest-value delivery and reports any coalesced
 events, keeping the recent canonical event list responsive. Use `--device ID`
 to select a controller. To losslessly stream every published event, including
@@ -469,8 +538,9 @@ redirected.
 | `xbox` | Cross-platform Xbox provider and familiar control aliases |
 | `gesture` | Optional gesture recognition |
 | `action` | Optional mapping from physical input or gestures to semantic actions |
-| `safety` | Command timeout, dead-man switch, and fail-closed output gating |
+| `safety` | Strict interlocks, serialized actuation authority, leases, and safe fallback |
 | `audit` | Signed, hash-chained JSON Lines recording, verification, and replay extraction |
+| `assured` | Strict safety, durable evidence, witnessing, and ordered-session composition |
 | `testkit` | Deterministic fake and replay input sources |
 
 Further reading:
@@ -480,6 +550,8 @@ Further reading:
   they do not cover
 - [Audit guide](docs/audit.md) — what each integrity mechanism actually proves,
   and the guarantee boundary
+- [Safety case](docs/safety-case.md) — claims, evidence, hazards, and deployment
+  assumptions
 
 ## License
 

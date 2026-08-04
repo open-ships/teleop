@@ -23,6 +23,9 @@ var (
 	// ErrPipelineOverflow reports that a bounded controller pipeline could not
 	// keep pace with the device stream.
 	ErrPipelineOverflow = errors.New("teleop: pipeline overflow")
+	// ErrPipelineAttestation reports that a controller's effective callbacks
+	// and safety-relevant settings do not match an option seal supplied at open.
+	ErrPipelineAttestation = errors.New("teleop: controller pipeline attestation failed")
 	// ErrCallbackPanic reports a panic recovered from an InputSource, EventSink,
 	// Processor, or third-party event implementation.
 	ErrCallbackPanic = errors.New("teleop: callback panic")
@@ -31,6 +34,12 @@ var (
 	ErrCallbackTimeout = errors.New("teleop: callback timeout")
 	// ErrInvalidState reports a non-finite or out-of-range backend state.
 	ErrInvalidState = errors.New("teleop: invalid controller state")
+	// ErrCommandPublicationUncertain reports that a synchronous command crossed
+	// queue admission but its caller stopped waiting, or that a later processor
+	// failed after the command itself became visible. The command may be present
+	// in subscriptions and evidence; callers must reconcile by EventID or treat
+	// the outcome as a safety fault rather than retrying it as definitely absent.
+	ErrCommandPublicationUncertain = errors.New("teleop: command publication outcome uncertain")
 )
 
 // SourceGap describes input known or suspected to be missing before an
@@ -127,7 +136,9 @@ type controllerOptions struct {
 	shutdownTimeout    time.Duration
 	clockStepThreshold time.Duration
 	neutralizeOnStale  bool
+	synchronousAudit   bool
 	deferredStart      bool
+	pipelineNonce      [32]byte
 }
 
 // OpenOption configures a controller session.
@@ -135,12 +146,29 @@ type OpenOption func(*controllerOptions)
 
 // WithAuditSink attaches an authoritative ingress sink. The controller accepts
 // each event into every bounded sink queue before publishing it to
-// subscriptions; sink I/O runs independently of device ingest.
+// subscriptions; sink I/O runs independently of ordinary device ingest. A
+// CanonicalEventSink receives immutable bytes captured before queue handoff.
+// RecordCommandSync provides the explicit callback-completion barrier when an
+// application must establish sink durability before actuation.
 func WithAuditSink(sink EventSink) OpenOption {
 	return func(options *controllerOptions) {
 		if sink != nil {
 			options.sinks = append(options.sinks, sink)
 		}
+	}
+}
+
+// WithSynchronousAudit requires every event to complete every configured audit
+// sink callback before the controller commits corresponding snapshot state,
+// exposes the event to subscribers, or runs processors. It converts sink
+// latency into controller latency and can therefore trip configured deadlines;
+// use it when evidence completeness is more important than decoupled ingest.
+//
+// Callback completion is only as strong as each EventSink contract. Pair this
+// option with a sync-capable recorder when local crash durability is required.
+func WithSynchronousAudit() OpenOption {
+	return func(options *controllerOptions) {
+		options.synchronousAudit = true
 	}
 }
 

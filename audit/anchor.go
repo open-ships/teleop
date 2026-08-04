@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -13,13 +14,12 @@ import (
 	"github.com/open-ships/teleop"
 )
 
-// A hash chain proves that a log was not edited. It proves nothing about a log
-// that was deleted, truncated before its final records, or never written at
-// all — the failure mode most likely to matter when a session ends badly.
-// Publishing each signed tree head to storage the recorder does not control
-// converts those from invisible losses into detectable ones: a log that cannot
-// produce a consistency proof against its last published head has been
-// rewritten, and a missing log whose head was published is provably missing.
+// A hash chain detects edits relative to a retained head; an unkeyed chain can
+// be recomputed by an attacker. It also says nothing by itself about a log that
+// was deleted, truncated before its final records, or never written. Retaining
+// signed tree heads in an independently controlled system can expose those
+// failures: a later log must extend the witnessed head consistently, and the
+// external head remains evidence that a now-missing log existed.
 
 // Checkpoint is a self-describing tree head suitable for publication outside
 // the log. A recorder configured with WithSigner populates its key and
@@ -48,6 +48,23 @@ type Checkpoint struct {
 	PublicKey string `json:"public_key,omitempty"`
 	// Signature is the hex-encoded detached signature over the tree head.
 	Signature string `json:"signature,omitempty"`
+}
+
+// WitnessReceipt records that an Anchor adapter returned success for one
+// checkpoint. AcknowledgedAt is observed by this process and is not trusted
+// time; stronger receipt timestamps and custody guarantees belong to the
+// concrete Anchor implementation.
+type WitnessReceipt struct {
+	Checkpoint     Checkpoint
+	AcknowledgedAt time.Time
+}
+
+func cloneWitnessReceipt(receipt *WitnessReceipt) *WitnessReceipt {
+	if receipt == nil {
+		return nil
+	}
+	cloned := *receipt
+	return &cloned
 }
 
 // VerifyCheckpoint verifies checkpoint against public, which must be obtained
@@ -132,7 +149,8 @@ func VerifyCheckpoint(public ed25519.PublicKey, checkpoint Checkpoint) error {
 // log, or simply a host under separate custody.
 //
 // Publish is called from a dedicated goroutine and never blocks the input
-// path. Implementations should apply their own timeouts.
+// path. Implementations must honor context cancellation; the recorder recovers
+// panics at this adapter boundary and reports them as publication failures.
 type Anchor interface {
 	Publish(context.Context, Checkpoint) error
 }
@@ -142,6 +160,9 @@ type AnchorFunc func(context.Context, Checkpoint) error
 
 // Publish implements Anchor.
 func (fn AnchorFunc) Publish(ctx context.Context, checkpoint Checkpoint) error {
+	if fn == nil {
+		return fmt.Errorf("teleop/audit: nil anchor function")
+	}
 	return fn(ctx, checkpoint)
 }
 
@@ -153,13 +174,31 @@ type FileAnchor struct {
 	writer io.Writer
 }
 
-// NewFileAnchor returns an Anchor that appends to writer.
+// NewFileAnchor returns an Anchor that appends to writer. After each complete
+// line it calls Flush and then Sync when writer exposes those methods. A
+// buffering wrapper that needs durable acknowledgement should expose both and
+// delegate Sync to its underlying durable store.
 func NewFileAnchor(writer io.Writer) *FileAnchor {
 	return &FileAnchor{writer: writer}
 }
 
 // Publish implements Anchor.
-func (a *FileAnchor) Publish(ctx context.Context, checkpoint Checkpoint) error {
+func (a *FileAnchor) Publish(ctx context.Context, checkpoint Checkpoint) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf(
+				"%w: file anchor writer callback: %v",
+				teleop.ErrCallbackPanic,
+				recovered,
+			)
+		}
+	}()
+	if a == nil {
+		return fmt.Errorf("teleop/audit: nil file anchor")
+	}
+	if ctx == nil {
+		return fmt.Errorf("teleop/audit: nil anchor context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -169,8 +208,21 @@ func (a *FileAnchor) Publish(ctx context.Context, checkpoint Checkpoint) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if _, err := a.writer.Write(append(encoded, '\n')); err != nil {
+	if a.writer == nil {
+		return fmt.Errorf("teleop/audit: file anchor writer is nil")
+	}
+	line := append(encoded, '\n')
+	written, err := a.writer.Write(line)
+	if err != nil {
 		return fmt.Errorf("write checkpoint: %w", err)
+	}
+	if written != len(line) {
+		return fmt.Errorf("write checkpoint: %w", io.ErrShortWrite)
+	}
+	if flusher, ok := a.writer.(interface{ Flush() error }); ok {
+		if err := flusher.Flush(); err != nil {
+			return fmt.Errorf("flush checkpoint: %w", err)
+		}
 	}
 	if syncer, ok := a.writer.(interface{ Sync() error }); ok {
 		if err := syncer.Sync(); err != nil {
@@ -190,11 +242,21 @@ type anchorRunner struct {
 	done    chan struct{}
 	timeout time.Duration
 
-	mu       sync.Mutex
-	failure  error
-	failures uint64
-	dropped  uint64
-	sent     uint64
+	mu          sync.Mutex
+	failure     error
+	failures    uint64
+	dropped     uint64
+	sent        uint64
+	lastReceipt *WitnessReceipt
+	// Exact outcomes let the recorder distinguish failure of its latest head
+	// from an older queued head. Only the latest outcome of each kind is needed:
+	// one recorder serializes publications and newer heads supersede older ones.
+	lastFailureCheckpoint *Checkpoint
+	lastFailureErr        error
+	lastDroppedCheckpoint *Checkpoint
+	circuitOpen           bool
+	changed               chan struct{}
+	stopped               bool
 }
 
 func newAnchorRunner(anchor Anchor, depth int, timeout time.Duration) *anchorRunner {
@@ -209,28 +271,96 @@ func newAnchorRunner(anchor Anchor, depth int, timeout time.Duration) *anchorRun
 		queue:   make(chan Checkpoint, depth),
 		done:    make(chan struct{}),
 		timeout: timeout,
+		changed: make(chan struct{}),
 	}
 	go runner.run()
 	return runner
 }
 
 func (r *anchorRunner) run() {
-	defer close(r.done)
+	defer func() {
+		r.mu.Lock()
+		r.stopped = true
+		r.signalChangedLocked()
+		r.mu.Unlock()
+		close(r.done)
+	}()
 	for checkpoint := range r.queue {
+		r.mu.Lock()
+		circuitOpen := r.circuitOpen
+		r.mu.Unlock()
+		if circuitOpen {
+			// A timed-out adapter may still own its worker because it violated the
+			// context contract. Do not create one leaked goroutine per later head;
+			// keep draining the queue and report those unattempted publications.
+			r.mu.Lock()
+			r.dropped++
+			dropped := checkpoint
+			r.lastDroppedCheckpoint = &dropped
+			r.signalChangedLocked()
+			r.mu.Unlock()
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
-		err := r.anchor.Publish(ctx, checkpoint)
+		published := make(chan error, 1)
+		go func() {
+			// Recovery belongs inside the worker: a panic in one goroutine cannot
+			// be recovered by the runner goroutine waiting below.
+			published <- publishAnchor(r.anchor, ctx, checkpoint)
+		}()
+		var (
+			err      error
+			timedOut bool
+		)
+		select {
+		case err = <-published:
+		case <-ctx.Done():
+			err = ctx.Err()
+			timedOut = true
+		}
 		cancel()
 		r.mu.Lock()
+		if timedOut {
+			r.circuitOpen = true
+		}
 		if err != nil {
 			r.failures++
 			if r.failure == nil {
 				r.failure = err
 			}
+			failed := checkpoint
+			r.lastFailureCheckpoint = &failed
+			r.lastFailureErr = err
 		} else {
 			r.sent++
+			r.lastReceipt = &WitnessReceipt{
+				Checkpoint:     checkpoint,
+				AcknowledgedAt: time.Now().UTC(),
+			}
 		}
+		r.signalChangedLocked()
 		r.mu.Unlock()
 	}
+}
+
+// publishAnchor is the process-safety boundary around externally implemented
+// Anchor adapters. A witness fault must degrade evidence health and wake
+// waiters; it must never take down the controller process.
+func publishAnchor(anchor Anchor, ctx context.Context, checkpoint Checkpoint) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%w: anchor publish: %v", teleop.ErrCallbackPanic, recovered)
+		}
+	}()
+	if anchor == nil {
+		return fmt.Errorf("teleop/audit: nil anchor")
+	}
+	return anchor.Publish(ctx, checkpoint)
+}
+
+func (r *anchorRunner) signalChangedLocked() {
+	close(r.changed)
+	r.changed = make(chan struct{})
 }
 
 func (r *anchorRunner) publish(checkpoint Checkpoint) {
@@ -241,13 +371,67 @@ func (r *anchorRunner) publish(checkpoint Checkpoint) {
 		default:
 		}
 		select {
-		case <-r.queue:
+		case dropped := <-r.queue:
 			r.mu.Lock()
 			r.dropped++
+			droppedCheckpoint := dropped
+			r.lastDroppedCheckpoint = &droppedCheckpoint
+			r.signalChangedLocked()
 			r.mu.Unlock()
 		default:
 		}
 	}
+}
+
+type anchorRetryState uint8
+
+const (
+	anchorRetryPending anchorRetryState = iota
+	anchorRetryAcknowledged
+	anchorRetryEligible
+	anchorRetryTerminal
+)
+
+// retryState classifies one exact publication without clearing historical
+// degradation. An ordinary adapter error or queue eviction may recover on one
+// later head. A panic, an open timeout circuit, or a stopped runner must not
+// spawn another adapter worker automatically.
+func (r *anchorRunner) retryState(target Checkpoint) anchorRetryState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lastReceipt != nil && checkpointWitnessCovers(
+		r.lastReceipt.Checkpoint,
+		target,
+	) {
+		return anchorRetryAcknowledged
+	}
+	if sameCheckpoint(r.lastFailureCheckpoint, target) {
+		if r.circuitOpen || errors.Is(r.lastFailureErr, teleop.ErrCallbackPanic) {
+			return anchorRetryTerminal
+		}
+		return anchorRetryEligible
+	}
+	if sameCheckpoint(r.lastDroppedCheckpoint, target) {
+		if r.circuitOpen {
+			return anchorRetryTerminal
+		}
+		return anchorRetryEligible
+	}
+	if r.stopped {
+		return anchorRetryTerminal
+	}
+	return anchorRetryPending
+}
+
+func sameCheckpoint(candidate *Checkpoint, target Checkpoint) bool {
+	if candidate == nil {
+		return false
+	}
+	return candidate.RecordType == target.RecordType &&
+		candidate.Session == target.Session &&
+		candidate.Size == target.Size &&
+		candidate.ChainHead == target.ChainHead &&
+		candidate.EventCount == target.EventCount
 }
 
 func (r *anchorRunner) stop() {
@@ -259,10 +443,59 @@ func (r *anchorRunner) stats() AnchorStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return AnchorStats{
-		Published: r.sent,
-		Failed:    r.failures,
-		Dropped:   r.dropped,
-		Err:       r.failure,
+		Published:   r.sent,
+		Failed:      r.failures,
+		Dropped:     r.dropped,
+		Err:         r.failure,
+		LastReceipt: cloneWitnessReceipt(r.lastReceipt),
+	}
+}
+
+func (r *anchorRunner) observation() (AnchorStats, <-chan struct{}, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return AnchorStats{
+		Published:   r.sent,
+		Failed:      r.failures,
+		Dropped:     r.dropped,
+		Err:         r.failure,
+		LastReceipt: cloneWitnessReceipt(r.lastReceipt),
+	}, r.changed, r.stopped
+}
+
+func (r *anchorRunner) wait(
+	ctx context.Context,
+	eventCount uint64,
+) (WitnessReceipt, error) {
+	for {
+		stats, changed, stopped := r.observation()
+		if stats.LastReceipt != nil &&
+			stats.LastReceipt.Checkpoint.EventCount >= eventCount {
+			return *cloneWitnessReceipt(stats.LastReceipt), nil
+		}
+		if stats.Failed > 0 {
+			return WitnessReceipt{}, errors.Join(ErrWitnessRequired, stats.Err)
+		}
+		if stats.Dropped > 0 {
+			return WitnessReceipt{}, fmt.Errorf(
+				"%w: %d witness publication(s) were dropped",
+				ErrWitnessRequired,
+				stats.Dropped,
+			)
+		}
+		if stopped {
+			return WitnessReceipt{}, fmt.Errorf(
+				"%w: recorder closed before event count %d was acknowledged",
+				ErrWitnessRequired,
+				eventCount,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return WitnessReceipt{}, ctx.Err()
+		case <-changed:
+		case <-r.done:
+		}
 	}
 }
 
@@ -278,4 +511,7 @@ type AnchorStats struct {
 	Dropped uint64
 	// Err is the first publication error observed.
 	Err error
+	// LastReceipt is the high-water acknowledgement returned by the Anchor.
+	// Its checkpoint is isolated from the runner's internal state.
+	LastReceipt *WitnessReceipt
 }

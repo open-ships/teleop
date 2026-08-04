@@ -127,6 +127,7 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", id, err)
 	}
+	now := time.Now()
 	return &windowsSource{
 		slot:       slot,
 		getState:   getState,
@@ -135,6 +136,12 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 		lastPacket: ^uint32(0),
 		ticker:     time.NewTicker(xinputPollInterval),
 		done:       make(chan struct{}),
+		health: teleop.TransportHealth{
+			Sequence:          1,
+			CheckedAt:         now,
+			Connected:         true,
+			SilenceVerifiable: true,
+		},
 	}, nil
 }
 
@@ -158,8 +165,9 @@ func windowsDescriptor(slot uint32, rumble bool) teleop.Descriptor {
 		Backend:    "windows-xinput",
 		Capability: capability,
 		Properties: map[string]string{
-			"xinput_slot": strconv.FormatUint(uint64(slot), 10),
-			"audit_note":  "XInput exposes sampled state, not a complete event history",
+			"xinput_slot":            strconv.FormatUint(uint64(slot), 10),
+			"audit_note":             "XInput exposes sampled state, not a complete event history",
+			"transport_health_scope": "fresh XInputGetState slot poll; not physical link response",
 		},
 	}
 }
@@ -174,12 +182,29 @@ type windowsSource struct {
 	done       chan struct{}
 	closeOnce  sync.Once
 	rumbleMu   sync.Mutex
+	healthMu   sync.RWMutex
+	health     teleop.TransportHealth
 	closed     bool
 	closeErr   error
 }
 
 func (s *windowsSource) Descriptor() teleop.Descriptor {
 	return s.descriptor.Clone()
+}
+
+func (s *windowsSource) TransportHealth() teleop.TransportHealth {
+	s.healthMu.RLock()
+	defer s.healthMu.RUnlock()
+	return s.health
+}
+
+func (s *windowsSource) updateTransportHealth(checkedAt time.Time, connected bool) {
+	s.healthMu.Lock()
+	s.health.Sequence++
+	s.health.CheckedAt = checkedAt
+	s.health.Connected = connected
+	s.health.SilenceVerifiable = true
+	s.healthMu.Unlock()
 }
 
 func (s *windowsSource) Read(ctx context.Context) (teleop.Observation, error) {
@@ -191,9 +216,13 @@ func (s *windowsSource) Read(ctx context.Context) (teleop.Observation, error) {
 			return teleop.Observation{}, teleop.ErrClosed
 		case <-s.ticker.C:
 			var state xinputState
-			if err := callXInputGetState(s.getState, s.slot, &state); err != nil {
-				return teleop.Observation{}, err
+			checkErr := callXInputGetState(s.getState, s.slot, &state)
+			checkedAt := time.Now()
+			if checkErr != nil {
+				s.updateTransportHealth(checkedAt, false)
+				return teleop.Observation{}, checkErr
 			}
+			s.updateTransportHealth(checkedAt, true)
 			select {
 			case <-s.done:
 				return teleop.Observation{}, teleop.ErrClosed
@@ -206,7 +235,7 @@ func (s *windowsSource) Read(ctx context.Context) (teleop.Observation, error) {
 			s.lastPacket = state.PacketNumber
 			return teleop.Observation{
 				State:      xinputTeleopState(state.Gamepad),
-				ObservedAt: time.Now(),
+				ObservedAt: checkedAt,
 				Native: teleop.NativeInput{
 					Format: "windows-xinput-state",
 					Data:   encodeXInputState(state),
@@ -259,6 +288,7 @@ func (s *windowsSource) Close() error {
 		s.rumbleMu.Lock()
 		defer s.rumbleMu.Unlock()
 		s.closed = true
+		s.updateTransportHealth(time.Now(), false)
 		if s.descriptor.Capability.Rumble && s.setState != nil {
 			vibration := xinputVibration{}
 			err := callXInputSetState(s.setState, s.slot, &vibration)

@@ -27,13 +27,24 @@ The audit log is versioned newline-delimited JSON. Each record contains its
 event kind, full event payload, controller session and sequence, observation
 time, causes, and a cryptographic hash linked to the preceding record.
 
+Recorder admission is strict: the event must serialize faithfully, its JSON
+header must equal `Event.Header`, each stream must begin at sequence one and be
+contiguous, every cause must already exist, and the controller session cannot
+change. Invalid or ambiguous events fail the recorder instead of being reduced
+to a misleading header-only record. When attached to a Controller, Recorder's
+`CanonicalEventSink` path receives immutable bytes captured before asynchronous
+handoff.
+
 `audit.ReadAll` rejects missing hashes, broken links, reordering, deletion, and
 truncation of a completed stream. Its default unkeyed SHA-256 chain provides
 integrity against corruption, not authenticity: an attacker able to rewrite
-the file can recompute the entire chain. For adversarial tamper-evidence, create
-the recorder with `audit.WithHMAC(key)` and verify it with
+the file can recompute the entire chain. `audit.WithHMAC(key)` authenticates a
+writer to another holder of the same key; verify it with
 `audit.ReadAuthenticated(reader, key)`. Generate at least 32 random key bytes
-with a cryptographically secure source and keep them outside the log.
+with a cryptographically secure source and keep them outside the log. Where the
+history may become evidence, prefer asymmetric signing plus an independent
+witness so verification does not grant signing capability and destruction is
+detectable.
 
 Use `audit.ReadPartial` only when inspecting an interrupted or currently open
 log; it returns the integrity-checked prefix and does not require signature
@@ -63,6 +74,16 @@ published event IDs that caused it. A command queue overflow means that command
 was not admitted to the audit pipeline and must be handled as an application
 safety fault.
 
+`RecordCommand` reports bounded queue admission, not durability. The concrete
+`*teleop.Controller.RecordCommandSync` waits for every sink callback and all
+earlier FIFO records; Recorder's default callback synchronizes a sync-capable
+writer. Cancellation after controller-queue admission returns
+`teleop.ErrCommandPublicationUncertain`, because already admitted work may
+still be recorded. `teleop.WithSynchronousAudit()` applies the callback barrier
+to every event before Snapshot, subscriber, or processor exposure. Hazardous
+applications should use `assured.Session`, which requires that mode and checks
+`Recorder.EvidenceStatus` before actuation.
+
 Finite `testkit.ReplaySource` instances should be opened with
 `teleop.WithDeferredStart()`; the first subscription then attaches before the
 replay source starts returning observations.
@@ -74,10 +95,13 @@ adding a stronger one does not make a weaker one redundant.
 
 | Property | Question it answers | Mechanism |
 | --- | --- | --- |
-| Integrity | Was the log edited? | hash chain |
+| Integrity | Do the record bytes still match the stored chain? | hash chain |
+| Immutable admission | Can later caller mutation change accepted bytes? | `CanonicalEventSink` |
+| Local durability | Did accepted bytes cross the store's sync barrier? | `EvidenceStatus.LocallyDurableEvents` |
 | Authenticity | Did a holder of the key write it? | `WithHMAC` |
-| Origin authentication | Did the provisioned signing key write it? | `WithSigner` |
-| Existence | Was a log destroyed or truncated? | `WithAnchor` |
+| Origin authentication | Did the provisioned signing key attest the tree head? | `WithSigner` |
+| External existence evidence | Did an external adapter acknowledge this prefix? | `WithAnchor` |
+| Completion witness | Did an external adapter acknowledge the exact footer? | `WithRequiredWitness` |
 | Disclosure | Can one record be proved without the rest? | Merkle inclusion proof |
 | Reconstruction | What code and configuration interpreted this input? | `WithProvenance` |
 
@@ -153,8 +177,9 @@ needs both trust inputs. Use `audit.Read` with `RequireFooter`, `PublicKey`, and
 
 ## Checkpoints and external anchoring
 
-A hash chain proves a log was not edited. It proves nothing about a log that
-was deleted, truncated before its final records, or never written at all — the
+An unkeyed hash chain detects accidental edits but can be recomputed by an
+attacker. Even an authenticated chain says nothing about a log that was
+deleted, truncated before its final records, or never written at all — the
 failure most likely to matter when a session ends badly, and the one an
 append-only structure inherently cannot see.
 
@@ -168,6 +193,7 @@ recorder := audit.NewRecorder(
     audit.WithSigner(signer),
     audit.WithCheckpoints(10*time.Second, 10000),
     audit.WithAnchor(audit.NewFileAnchor(remote)),
+    audit.WithRequiredWitness(true),
 )
 ```
 
@@ -182,7 +208,13 @@ signature algorithm. Verify it against an independently trusted key:
 err := audit.VerifyCheckpoint(trustedKey, checkpoint)
 ```
 
-Checkpoint publication is asynchronous and never blocks the input path.
+Checkpoint publication is asynchronous and never blocks the input path. The
+interval timer emits a head even when no later event arrives, so a steady held
+control does not leave the final active suffix indefinitely uncheckpointed.
+After an ordinary publish error or queue eviction, that timer permits one
+bounded retry head for the same unchanged event prefix. Panics and timed-out
+adapters are not retried automatically, and all failure/drop counters remain
+sticky after a later success.
 Because a later head supersedes an earlier one, a saturated anchor queue drops
 the oldest pending checkpoint rather than the freshest. Drops and failures are
 counted, never hidden:
@@ -193,6 +225,34 @@ if stats := recorder.AnchorStats(); stats.Failed > 0 || stats.Dropped > 0 {
     // are integrity protected but not protected against destruction.
 }
 ```
+
+`Recorder.EvidenceStatus` reports accepted, locally durable, and witnessed
+event counts separately. `WaitForWitness(ctx, count)` returns the receipt that
+covers a requested event high-water mark. A successful return proves only that
+the configured adapter acknowledged the head; custody, persistence, and trusted
+receipt time are properties of that adapter.
+
+`WitnessReceipt` is deliberately an in-process record of that successful
+adapter return, not a witness-signed protocol object. Deployments that require
+cryptographic proof of witness identity or trusted acknowledgement time must
+make the Anchor verify and durably retain the remote system's authenticated
+receipt before `Publish` returns success.
+
+Until such a receipt arrives, the locally durable suffix after the witnessed
+high-water mark is still vulnerable to destruction or replacement with the
+producer. Checkpoint frequency limits the nominal lag only while the recorder,
+network, and witness remain healthy; it is not a maximum bound during an
+outage. Use a count threshold of one (`WithCheckpoints(interval, 1)` or
+`assured.Config.CheckpointEvery`) where the added signing and witness load is
+justified, and alarm on `EvidenceStatus` lag, failures, and drops.
+
+`WithRequiredWitness(true)` makes `Close` fail unless every attempted
+publication succeeded and the external adapter acknowledged the exact footer
+(signed when a signer is configured). The locally written footer remains
+structurally complete and verifiable at its configured integrity level even
+when that policy fails. `audit.NewQuorumAnchor` can require a threshold across
+several independent adapters; several endpoints in one account or storage
+system are not independent custody domains.
 
 An anchor failure does not stop recording. A network problem should not stop a
 vessel; it should be visible. Call `recorder.Checkpoint(reason)` directly at
@@ -247,6 +307,11 @@ means the revision does not fully describe the running code.
 parameters that turn input into actuation, a replay reproduces the operator's
 thumb but not the machine's behavior.
 
+`Operator` and `Authorization` are caller-supplied labels. Recording and signing
+them does not authenticate a person, validate a grant, or enforce access. Bind
+them to external identity and authorization evidence. Likewise, recording a
+mapping or rate limit in `Config` does not enforce that policy.
+
 Recording `Operator` is workplace surveillance and is treated as personal data
 under the GDPR and comparable regimes. Decide that deliberately, with a
 retention policy, rather than enabling it by default.
@@ -269,11 +334,23 @@ readings remain valid across it.
 The recorder stores every event received from the selected backend. It cannot
 store input that the operating system or transport did not expose.
 
-The controller places an event into the recorder's bounded queue before
-publishing it to subscribers, but recording and `fsync` happen asynchronously.
-The recorder flushes every event by default. A sink failure, timeout, or queue
-overflow terminates the controller and is observable through `Done`, `Err`,
-and `Close`; it cannot retract events a subscriber already received.
+The controller freezes an event and places it into the recorder's bounded queue
+before publishing it to subscribers or committing a new Snapshot. Recording
+and `fsync` remain asynchronous for ordinary input by default. A
+`WithSynchronousAudit` controller waits for callback completion before either
+form of live exposure. The recorder flushes every event by default. A
+queue-admission failure suppresses live exposure and terminates the controller;
+a callback failure discovered after asynchronous admission cannot retract an
+event already received by a subscriber.
+
+The synchronous command barrier waits for callback completion, but success is
+meaningful only when the sink reports a real durability level. A writer without
+`Sync` reaches `flush-every-record`, not `fsync-every-record`. Assured Session
+forces the every-event callback barrier, rejects that weaker store, requires a
+signer and external witness, and requires a witnessed footer on close.
+For a custom store, `fsync-every-record` means its configured `Sync` method
+returned success; verify the implementation and deployed filesystem with
+power-loss testing rather than treating the interface name as hardware proof.
 
 - `AuditExactBackendStream` means the backend consumes an OS event stream.
 - `AuditSampledState` means intermediate transitions can occur between polls.
@@ -289,13 +366,17 @@ state.
 An audit log is evidence and post-incident learning. It is not a safety
 function, and no amount of cryptography in this package makes a system safer.
 
-Every mechanism here detects **errors of transcription**: records altered,
-substituted, removed, or attributed to the wrong key. None detects an **error
-of omission** — input the operating system, driver, radio, or polling API never
+Under their stated key, adapter, and custody assumptions, these mechanisms
+detect **errors of transcription**: records altered, substituted, removed from
+a covered prefix, or attributed to the wrong key. None detects an **error of
+omission** — input the operating system, driver, radio, or polling API never
 delivered. A log cannot record what was never observed, and a perfectly signed,
 anchored, provable log of nothing is exactly what a silent transport failure
 produces.
 
 Omission is the failure most likely to injure someone. It is addressed by
 command timeout, liveness, and a dead-man switch, not by recording. See
-[the safety guide](safety.md).
+[the safety guide](safety.md). Backend Transport Health can narrow silent
+failure at a documented OS/framework seam, but an evdev attachment or
+GameController-registry check is not proof that a physical controller or radio
+answered.

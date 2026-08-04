@@ -345,7 +345,7 @@ func TestRecorderFailureIsSticky(t *testing.T) {
 	}
 }
 
-func TestDecodeEventPreservesEncodingFailureAndDerivedTypes(t *testing.T) {
+func TestRecorderRejectsUnrepresentableEvent(t *testing.T) {
 	t.Parallel()
 
 	var output bytes.Buffer
@@ -354,17 +354,33 @@ func TestDecodeEventPreservesEncodingFailureAndDerivedTypes(t *testing.T) {
 		Meta:  testHeader("bad", 1),
 		Value: math.NaN(),
 	}
-	if err := recorder.Record(context.Background(), unrepresentable); err != nil {
-		t.Fatal(err)
+	if err := recorder.Record(context.Background(), unrepresentable); !errors.Is(
+		err,
+		audit.ErrInvalidEvent,
+	) || !errors.Is(err, audit.ErrFailed) {
+		t.Fatalf("Record error = %v, want ErrInvalidEvent and ErrFailed", err)
 	}
-	if err := recorder.Close(); err != nil {
-		t.Fatal(err)
+	if output.Len() != 0 {
+		t.Fatalf("invalid event wrote %d bytes", output.Len())
 	}
-	records, err := audit.ReadAll(bytes.NewReader(output.Bytes()))
-	if err != nil {
-		t.Fatal(err)
+	if err := recorder.Close(); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Fatalf("Close error = %v, want sticky ErrInvalidEvent", err)
 	}
-	decoded, err := audit.DecodeEvent(records[0])
+}
+
+func TestDecodeEventPreservesLegacyEncodingFailureAndDerivedTypes(t *testing.T) {
+	t.Parallel()
+
+	unrepresentable := badEvent{
+		Meta:  testHeader("bad", 1),
+		Value: math.NaN(),
+	}
+	decoded, err := audit.DecodeEvent(audit.Record{
+		Kind:          unrepresentable.Kind(),
+		Header:        unrepresentable.Header(),
+		Payload:       json.RawMessage(`{"header":{}}`),
+		EncodingError: "json: unsupported value: NaN",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

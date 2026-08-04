@@ -7,6 +7,8 @@ import (
 	"maps"
 	"slices"
 	"time"
+
+	"github.com/open-ships/teleop/internal/eventorder"
 )
 
 // EventKind is the stable persisted discriminator for an event payload.
@@ -39,6 +41,12 @@ const (
 
 // SessionID is the random 128-bit identity of one open controller session.
 type SessionID [16]byte
+
+// MaxEventStreamsPerSession is the maximum number of distinct event streams a
+// controller, recorder, or verifier admits in one session. Stream names remain
+// application-defined; the finite ceiling prevents a stream-per-event workload
+// from turning causal validation state back into O(events) memory.
+const MaxEventStreamsPerSession = eventorder.DefaultMaxStreams
 
 // String returns the lowercase hexadecimal session identity.
 func (id SessionID) String() string {
@@ -247,6 +255,16 @@ type LivenessEvent struct {
 	LastObserved time.Time     `json:"last_observed,omitempty"`
 	LastReceived time.Time     `json:"last_received,omitempty"`
 	Age          time.Duration `json:"age"`
+	// LastStateChangeMonotonic separates operator-state stability from source
+	// transport health.
+	LastStateChangeMonotonic time.Duration `json:"last_state_change_monotonic"`
+	// TransportCheckSequence and LastTransportCheckMonotonic identify the newest
+	// transport evidence observed by the controller. SilenceVerifiable states
+	// whether independent checks continue when observations stop.
+	TransportCheckSequence      uint64        `json:"transport_check_sequence,omitempty"`
+	LastTransportCheckMonotonic time.Duration `json:"last_transport_check_monotonic"`
+	TransportAge                time.Duration `json:"transport_age"`
+	TransportSilenceVerifiable  bool          `json:"transport_silence_verifiable"`
 }
 
 // Header implements Event.

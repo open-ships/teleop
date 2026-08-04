@@ -1,10 +1,16 @@
 package audit
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"maps"
 	"os"
+	"reflect"
 	"runtime"
 	"runtime/debug"
+
+	"github.com/open-ships/teleop"
 )
 
 // A record that an operator pressed a control is not by itself evidence of
@@ -86,10 +92,147 @@ func CaptureProvenance() Provenance {
 	return provenance
 }
 
-// Clone returns a deep copy so a recorder cannot observe later mutation of a
-// caller's maps.
+// Clone recursively isolates ordinary reference-backed configuration values.
+// Recorder construction additionally normalizes Config through JSON once so
+// custom marshalers with hidden mutable state cannot change a manifest later.
 func (p Provenance) Clone() Provenance {
-	p.Config = maps.Clone(p.Config)
+	if p.Config != nil {
+		config := make(map[string]any, len(p.Config))
+		visited := make(map[cloneVisit]reflect.Value)
+		for key, value := range p.Config {
+			cloned := cloneProvenanceValue(reflect.ValueOf(value), visited)
+			if cloned.IsValid() {
+				config[key] = cloned.Interface()
+			} else {
+				config[key] = nil
+			}
+		}
+		p.Config = config
+	}
 	p.Platform = maps.Clone(p.Platform)
 	return p
+}
+
+// freezeProvenance crosses the open-ended Config callback boundary exactly
+// once, then decodes the resulting JSON into reference-isolated, JSON-native
+// values. Reflection alone cannot clone reference-backed unexported fields
+// consulted by a custom Marshaler, and invoking such a Marshaler separately
+// for hashing and writing could produce two different manifests.
+func freezeProvenance(provenance Provenance) (frozen Provenance, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			frozen = Provenance{}
+			err = fmt.Errorf(
+				"%w: provenance JSON callback: %v",
+				teleop.ErrCallbackPanic,
+				recovered,
+			)
+		}
+	}()
+	encoded, err := json.Marshal(provenance)
+	if err != nil {
+		return Provenance{}, fmt.Errorf("marshal audit provenance: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&frozen); err != nil {
+		return Provenance{}, fmt.Errorf("normalize audit provenance: %w", err)
+	}
+	return frozen, nil
+}
+
+// cloneVisit identifies reference-backed values while recursively cloning a
+// provenance configuration. Config is intentionally open to application-defined
+// JSON values, so a shallow map clone would still let a caller mutate a nested
+// map, slice, or pointer after the manifest was configured.
+type cloneVisit struct {
+	typeOf  reflect.Type
+	pointer uintptr
+}
+
+func cloneProvenanceValue(value reflect.Value, visited map[cloneVisit]reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneProvenanceValue(value.Elem(), visited)
+		result := reflect.New(value.Type()).Elem()
+		result.Set(cloned)
+		return result
+
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typeOf: value.Type(), pointer: value.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.New(value.Type().Elem())
+		visited[visit] = result
+		result.Elem().Set(cloneProvenanceValue(value.Elem(), visited))
+		return result
+
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typeOf: value.Type(), pointer: value.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.MakeMapWithSize(value.Type(), value.Len())
+		visited[visit] = result
+		iterator := value.MapRange()
+		for iterator.Next() {
+			key := cloneProvenanceValue(iterator.Key(), visited)
+			item := cloneProvenanceValue(iterator.Value(), visited)
+			result.SetMapIndex(key, item)
+		}
+		return result
+
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typeOf: value.Type(), pointer: value.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		visited[visit] = result
+		for index := range value.Len() {
+			result.Index(index).Set(cloneProvenanceValue(value.Index(index), visited))
+		}
+		return result
+
+	case reflect.Array:
+		result := reflect.New(value.Type()).Elem()
+		for index := range value.Len() {
+			result.Index(index).Set(cloneProvenanceValue(value.Index(index), visited))
+		}
+		return result
+
+	case reflect.Struct:
+		// Copy the whole value first so immutable structs with unexported state,
+		// such as time.Time, retain that state. Exported reference-backed fields
+		// are then recursively isolated.
+		result := reflect.New(value.Type()).Elem()
+		result.Set(value)
+		for index := range value.NumField() {
+			if result.Field(index).CanSet() && value.Type().Field(index).IsExported() {
+				result.Field(index).Set(cloneProvenanceValue(value.Field(index), visited))
+			}
+		}
+		return result
+
+	default:
+		return value
+	}
 }

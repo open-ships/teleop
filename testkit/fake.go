@@ -18,6 +18,8 @@ type FakeSource struct {
 	observations chan teleop.Observation
 	done         chan struct{}
 	closeOnce    sync.Once
+	healthMu     sync.RWMutex
+	health       teleop.TransportHealth
 	rumbleMu     sync.RWMutex
 	rumble       teleop.Rumble
 }
@@ -49,6 +51,24 @@ func NewFakeSource(descriptor teleop.Descriptor, buffer int) *FakeSource {
 // Descriptor implements teleop.InputSource.
 func (f *FakeSource) Descriptor() teleop.Descriptor {
 	return f.descriptor.Clone()
+}
+
+// TransportHealth implements teleop.TransportHealthSource. The zero value is
+// intentionally unverifiable; tests opt into stronger claims with
+// SetTransportHealth and advance Sequence for each simulated successful
+// transport check.
+func (f *FakeSource) TransportHealth() teleop.TransportHealth {
+	f.healthMu.RLock()
+	defer f.healthMu.RUnlock()
+	return f.health
+}
+
+// SetTransportHealth replaces the fake source's independently sampled health
+// evidence. It is safe to call while the Controller is reading observations.
+func (f *FakeSource) SetTransportHealth(health teleop.TransportHealth) {
+	f.healthMu.Lock()
+	f.health = health
+	f.healthMu.Unlock()
 }
 
 func (f *FakeSource) Read(ctx context.Context) (teleop.Observation, error) {

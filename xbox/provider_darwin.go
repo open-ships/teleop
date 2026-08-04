@@ -56,9 +56,10 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 		return nil, fmt.Errorf("%w: open %s", teleop.ErrUnavailable, id)
 	}
 	return &darwinSource{
-		handle:     handle,
-		descriptor: descriptor,
-		closeDone:  make(chan struct{}),
+		handle:          handle,
+		descriptor:      descriptor,
+		closeDone:       make(chan struct{}),
+		probeMembership: darwinRetainedControllerPresent,
 	}, nil
 }
 
@@ -142,6 +143,7 @@ func newDarwinDescriptor(
 	properties := map[string]string{
 		"gamecontroller_identifier":       fmt.Sprintf("%016x", identifier),
 		"gamecontroller_product_category": category,
+		"transport_health_scope":          "fresh exact GCController.controllers membership check; not physical link response",
 	}
 	if index >= 0 {
 		properties["gamecontroller_index"] = strconv.Itoa(index)
@@ -189,10 +191,61 @@ type darwinSource struct {
 	active     sync.WaitGroup
 	closeDone  chan struct{}
 	rumbleMu   sync.Mutex
+	healthMu   sync.RWMutex
+	health     teleop.TransportHealth
+	// probeMembership verifies that the exact retained GCController remains in
+	// GameController's current registry. It checks framework-reported presence,
+	// not responsiveness of the underlying USB, Bluetooth, or radio link.
+	probeMembership func(unsafe.Pointer) bool
 }
 
 func (s *darwinSource) Descriptor() teleop.Descriptor {
 	return s.descriptor.Clone()
+}
+
+func (s *darwinSource) TransportHealth() teleop.TransportHealth {
+	s.healthMu.RLock()
+	defer s.healthMu.RUnlock()
+	return s.health
+}
+
+func (s *darwinSource) updateTransportHealth(
+	checkedAt time.Time,
+	connected bool,
+	verifiable bool,
+) {
+	s.healthMu.Lock()
+	s.health.Sequence++
+	s.health.CheckedAt = checkedAt
+	s.health.Connected = connected
+	s.health.SilenceVerifiable = verifiable
+	s.healthMu.Unlock()
+}
+
+func darwinRetainedControllerPresent(handle unsafe.Pointer) bool {
+	return C.teleop_gc_retained_controller_present(handle) != 0
+}
+
+func (s *darwinSource) checkFrameworkMembership(
+	handle unsafe.Pointer,
+) bool {
+	if s.probeMembership == nil {
+		// Without the native exact-membership probe, a timed wait proves only
+		// that this process's queue remained empty. Keep silence unverifiable.
+		s.healthMu.Lock()
+		s.health.SilenceVerifiable = false
+		s.healthMu.Unlock()
+		return true
+	}
+	connected := s.probeMembership(handle)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
+	s.updateTransportHealth(time.Now(), connected, true)
+	s.mu.Unlock()
+	return connected
 }
 
 func (s *darwinSource) Read(ctx context.Context) (teleop.Observation, error) {
@@ -211,6 +264,15 @@ func (s *darwinSource) Read(ctx context.Context) (teleop.Observation, error) {
 
 		var native C.teleop_gc_state
 		result := int(C.teleop_gc_next(handle, &native, 100))
+		membership := true
+		if result >= 0 {
+			// Keep the active-handle reference until the native membership probe
+			// has finished. Run it for busy as well as quiet streams so state
+			// traffic cannot let the independent evidence age out. Close waits on
+			// active before freeing the handle.
+			membership = s.checkFrameworkMembership(handle)
+		}
+		checkedAt := time.Now()
 		s.active.Done()
 		s.mu.Lock()
 		closed := s.closed
@@ -220,12 +282,21 @@ func (s *darwinSource) Read(ctx context.Context) (teleop.Observation, error) {
 		}
 		switch result {
 		case 0:
+			if !membership {
+				return teleop.Observation{}, teleop.ErrDisconnected
+			}
 			continue
 		case -1:
+			s.updateTransportHealth(checkedAt, false, s.probeMembership != nil)
 			return teleop.Observation{}, teleop.ErrClosed
 		case -2:
+			s.updateTransportHealth(checkedAt, false, s.probeMembership != nil)
 			return teleop.Observation{}, teleop.ErrDisconnected
 		}
+		if !membership {
+			return teleop.Observation{}, teleop.ErrDisconnected
+		}
+		// checkFrameworkMembership recorded the successful independent check.
 
 		state := teleop.State{
 			Buttons: teleop.Buttons{
@@ -275,7 +346,7 @@ func (s *darwinSource) Read(ctx context.Context) (teleop.Observation, error) {
 		})
 		observation := teleop.Observation{
 			State:           state,
-			ObservedAt:      time.Now(),
+			ObservedAt:      checkedAt,
 			DeviceTimestamp: int64(float64(native.timestamp) * float64(time.Second)),
 			Native: teleop.NativeInput{
 				Format: "darwin-gamecontroller-state",
@@ -358,6 +429,7 @@ func (s *darwinSource) Close() error {
 	s.closed = true
 	handle := s.handle
 	s.mu.Unlock()
+	s.updateTransportHealth(time.Now(), false, s.probeMembership != nil)
 
 	// teleop_gc_next uses the native handle during its timed wait. Prevent new
 	// reads, wait for existing calls to return, and only then release it.
