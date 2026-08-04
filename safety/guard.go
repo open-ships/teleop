@@ -416,9 +416,7 @@ func (g *Guard) Bind(source Source) error {
 	// A complete released snapshot is a valid startup baseline. A held startup
 	// snapshot deliberately establishes no engagement proof.
 	state, meta := source.SnapshotWithMeta()
-	if g.options.deadMan != "" &&
-		meta.Sequence > 0 && meta.Connected && !meta.Stale &&
-		!meta.Synthetic && !meta.Invalid && !state.Button(g.options.deadMan) {
+	if releasedPhysicalBaseline(state, meta, g.options.deadMan) {
 		g.deadManReleased = true
 	}
 	return nil
@@ -440,6 +438,12 @@ func (g *Guard) Arm() error {
 	}
 	sample := g.sampleLocked()
 	reasons := slices.Clone(sample.reasons)
+	// Snapshot is committed only after authoritative audit admission. Consume a
+	// released physical baseline here as well as in the processor so Arm cannot
+	// race the processor stage for that already-admitted observation.
+	if releasedPhysicalBaseline(sample.state, sample.meta, g.options.deadMan) {
+		g.deadManReleased = true
+	}
 	if !neutralForArm(
 		sample.state,
 		g.options.armStickTolerance,
@@ -914,6 +918,15 @@ func (g *Guard) pressFollowsArmLocked(header teleop.Header, received time.Durati
 	}
 	session := identified.Session()
 	return session != (teleop.SessionID{}) && header.ID.Session == session
+}
+
+func releasedPhysicalBaseline(
+	state teleop.State,
+	meta teleop.StateMeta,
+	deadMan teleop.ControlID,
+) bool {
+	return deadMan != "" && meta.Sequence > 0 && meta.Connected && !meta.Stale &&
+		!meta.Synthetic && !meta.Invalid && !state.Button(deadMan)
 }
 
 func neutralForArm(state teleop.State, stickTolerance, triggerTolerance float32) bool {

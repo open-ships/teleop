@@ -274,6 +274,29 @@ func TestDeadManPressAtArmTickUsesControllerEventOrder(t *testing.T) {
 	}
 }
 
+func TestArmConsumesCommittedReleaseBeforeProcessor(t *testing.T) {
+	source := newFakeSource()
+	source.observe(heldState())
+	guard := New(
+		WithCommandTimeout(time.Second),
+		WithDeadMan(deadMan),
+	)
+	if err := guard.Bind(source); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model Snapshot commit occurring immediately before the processor handles
+	// the same canonical release observation.
+	source.observe(teleop.State{})
+	if err := guard.Arm(); err != nil {
+		t.Fatalf("Arm with committed release baseline: %v", err)
+	}
+	if decision := guard.Evaluate(); decision.Permit ||
+		!decision.Has(ReasonDeadManReleased) {
+		t.Fatalf("released Arm decision = %+v", decision)
+	}
+}
+
 func TestDeadManRejectsMalformedReceivedMonotonic(t *testing.T) {
 	tests := []struct {
 		name     string
