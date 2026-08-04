@@ -239,6 +239,11 @@ type Guard struct {
 	deadManHeld     bool
 	deadManReleased bool
 	armedAt         time.Duration
+	// armedInputSequence disambiguates a post-Arm event that shares the same
+	// monotonic clock tick as Arm on a coarse-resolution platform. Time remains
+	// authoritative when it differs; exact controller order is only the
+	// tie-breaker.
+	armedInputSequence uint64
 
 	invalidInput bool
 	inputGap     bool
@@ -463,6 +468,7 @@ func (g *Guard) Arm() error {
 	g.deadManHeld = false
 	g.deadManSince = 0
 	g.armedAt = sample.now
+	g.armedInputSequence = sample.meta.Sequence
 	g.detail = ""
 	g.evaluateLocked()
 	return nil
@@ -846,7 +852,7 @@ func (g *Guard) observeLocked(event teleop.Event) {
 		// of operator engagement.
 		if g.lifecycle == lifecycleArmed &&
 			g.deadManReleased &&
-			received > g.armedAt &&
+			g.pressFollowsArmLocked(button.Meta, received) &&
 			!g.deadManHeld {
 			g.deadManHeld = true
 			g.deadManSince = received
@@ -890,6 +896,24 @@ func (g *Guard) clearAuthorizationProofLocked() {
 	g.deadManHeld = false
 	g.deadManReleased = false
 	g.armedAt = 0
+	g.armedInputSequence = 0
+}
+
+func (g *Guard) pressFollowsArmLocked(header teleop.Header, received time.Duration) bool {
+	if received > g.armedAt {
+		return true
+	}
+	if received != g.armedAt || g.armedInputSequence == 0 ||
+		header.ID.Stream != "input" ||
+		header.ID.Sequence <= g.armedInputSequence {
+		return false
+	}
+	identified, ok := g.source.(interface{ Session() teleop.SessionID })
+	if !ok {
+		return false
+	}
+	session := identified.Session()
+	return session != (teleop.SessionID{}) && header.ID.Session == session
 }
 
 func neutralForArm(state teleop.State, stickTolerance, triggerTolerance float32) bool {

@@ -22,6 +22,13 @@ type fakeSource struct {
 	done  chan struct{}
 }
 
+type identifiedFakeSource struct {
+	*fakeSource
+	session teleop.SessionID
+}
+
+func (source *identifiedFakeSource) Session() teleop.SessionID { return source.session }
+
 func newFakeSource() *fakeSource {
 	return &fakeSource{
 		meta: teleop.StateMeta{Connected: true, Sequence: 1},
@@ -224,6 +231,46 @@ func TestDeadManPressMustBeReceivedStrictlyAfterArm(t *testing.T) {
 	})
 	if decision := guard.Evaluate(); !decision.Permit {
 		t.Fatalf("genuine post-Arm press was refused: %+v", decision)
+	}
+}
+
+func TestDeadManPressAtArmTickUsesControllerEventOrder(t *testing.T) {
+	base := newFakeSource()
+	identified := &identifiedFakeSource{
+		fakeSource: base,
+		session:    teleop.SessionID{1},
+	}
+	guard := New(
+		WithCommandTimeout(time.Second),
+		WithDeadMan(deadMan),
+	)
+	if err := guard.Bind(identified); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Arm(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model a platform clock whose next observation has the same monotonic
+	// reading as Arm. Its controller-owned input identity still orders it after
+	// the observation on which Arm was based.
+	base.observe(heldState())
+	_, meta := base.SnapshotWithMeta()
+	guard.Process(teleop.ButtonEvent{
+		Meta: teleop.Header{
+			ID: teleop.EventID{
+				Session:  identified.session,
+				Stream:   "input",
+				Sequence: meta.Sequence + 1,
+			},
+			ReceivedMonotonic: base.Monotonic(),
+		},
+		Button:  deadMan,
+		Pressed: true,
+		Phase:   teleop.PhasePressed,
+	})
+	if decision := guard.Evaluate(); !decision.Permit {
+		t.Fatalf("same-tick post-Arm press was not accepted: %+v", decision)
 	}
 }
 
