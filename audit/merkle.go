@@ -11,9 +11,10 @@ import (
 // This file implements the Merkle tree defined by RFC 6962 (Certificate
 // Transparency).
 //
-// A linear hash chain proves only that a log was not edited in place: to
-// establish that any single record is authentic, a verifier must be handed the
-// entire log. A Merkle tree additionally supports
+// A linear hash chain detects edits relative to a retained trusted head, but an
+// unkeyed chain can be recomputed. To establish that any single record belongs
+// to a signed head, a verifier would otherwise need the entire log. A Merkle
+// tree additionally supports
 //
 //   - inclusion proofs, which show that one record belongs to a signed tree
 //     head in O(log n) hashes, without disclosing the other records, and

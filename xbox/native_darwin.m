@@ -415,6 +415,27 @@ int teleop_gc_next(void *opaque, teleop_gc_state *state, int timeout_ms) {
     return 1;
 }
 
+int teleop_gc_retained_controller_present(void *opaque) {
+    teleop_gc_handle *handle = (teleop_gc_handle *)opaque;
+    if (handle == NULL) return 0;
+
+    @autoreleasepool {
+        pthread_mutex_lock(&handle->mutex);
+        int unavailable = handle->closed || handle->disconnected;
+        GCController *retained_controller = handle->controller;
+        pthread_mutex_unlock(&handle->mutex);
+        if (unavailable || retained_controller == nil) return 0;
+
+        // This is deliberately an exact object-membership check at Apple's
+        // GameController registry seam. It does not claim that the physical
+        // controller or its wireless link answered a fresh challenge.
+        for (GCController *candidate in [GCController controllers]) {
+            if (candidate == retained_controller) return 1;
+        }
+        return 0;
+    }
+}
+
 static void teleop_gc_copy_haptic_error(
     NSError *error,
     char *destination,

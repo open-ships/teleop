@@ -40,6 +40,25 @@ const (
 	// ReasonCommandTimeout reports that the newest observation is older than
 	// the configured command timeout, measured on the monotonic clock.
 	ReasonCommandTimeout Reason = "command_timeout"
+	// ReasonInputStale reports that the controller has independently marked its
+	// latest observation stale.
+	ReasonInputStale Reason = "input_stale"
+	// ReasonInvalidInput reports that an observation contained a non-finite or
+	// out-of-range analog value and was neutralized.
+	ReasonInvalidInput Reason = "invalid_input"
+	// ReasonInputGap reports known or suspected loss in the physical input
+	// stream. A subsequent complete observation clears the condition, but the
+	// trip remains latched until the operator re-arms.
+	ReasonInputGap Reason = "input_gap"
+	// ReasonSourceError reports an input or controller pipeline error.
+	ReasonSourceError Reason = "source_error"
+	// ReasonTransportUnverifiable reports a source that cannot independently
+	// establish liveness while controller state is unchanged. Strict maritime guards
+	// refuse to infer health from silence.
+	ReasonTransportUnverifiable Reason = "transport_unverifiable"
+	// ReasonTransportTimeout reports that the newest independently verified
+	// transport check is older than the strict profile's deadline.
+	ReasonTransportTimeout Reason = "transport_timeout"
 	// ReasonNoInput reports that no observation has ever arrived, so the input
 	// path has never been proven to work.
 	ReasonNoInput Reason = "no_input"
@@ -51,6 +70,10 @@ const (
 	// propagating through the pipeline, so it inhibits without latching and
 	// clears on the next observed press.
 	ReasonDeadManUnconfirmed Reason = "dead_man_unconfirmed"
+	// ReasonDeadManReleaseRequired reports that no released state has been
+	// observed since the current session or fault recovery began. A dead-man
+	// control already held at startup is therefore never treated as engagement.
+	ReasonDeadManReleaseRequired Reason = "dead_man_release_required"
 	// ReasonDeadManStale reports a dead-man control held continuously past the
 	// re-actuation deadline, which is the signature of a defeated switch.
 	ReasonDeadManStale Reason = "dead_man_stale"
@@ -64,8 +87,12 @@ const (
 	ReasonSynthetic Reason = "synthetic_state"
 	// ReasonControllerFault reports a terminated controller pipeline.
 	ReasonControllerFault Reason = "controller_fault"
-	// ReasonOperator reports an explicit Disarm.
+	// ReasonOperator reports an operator- or Safety Authority-originated
+	// inhibit, including invalid-intent fallback.
 	ReasonOperator Reason = "operator_disarmed"
+	// ReasonControlsNotNeutral reports that an Arm was refused because one or
+	// more controls were active.
+	ReasonControlsNotNeutral Reason = "controls_not_neutral"
 )
 
 // Event records a change in authorization. Guards publish one on every
@@ -111,6 +138,10 @@ type Decision struct {
 	Command teleop.State
 	// InputAge is the age of the newest observation on the monotonic clock.
 	InputAge time.Duration
+	// InputSequence identifies the exact controller observation on which this
+	// decision was based. Authority rejects a permit if a newer observation
+	// arrives before Send, even when the newer state would also be permitted.
+	InputSequence uint64
 	// EvaluatedAt is the monotonic reading at which this decision was made.
 	EvaluatedAt time.Duration
 }

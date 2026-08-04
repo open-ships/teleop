@@ -68,16 +68,23 @@ type signingKey struct {
 	id     string
 }
 
-func newSigningKey(signer crypto.Signer) (*signingKey, error) {
+func newSigningKey(signer crypto.Signer) (key *signingKey, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			key = nil
+			err = fmt.Errorf("%w: signer public key callback: %v", teleop.ErrCallbackPanic, recovered)
+		}
+	}()
 	if signer == nil {
 		return nil, fmt.Errorf("%w: nil signer", ErrSignature)
 	}
-	public, ok := signer.Public().(ed25519.PublicKey)
+	publicValue := signer.Public()
+	public, ok := publicValue.(ed25519.PublicKey)
 	if !ok {
 		return nil, fmt.Errorf(
 			"%w: signer public key is %T, want ed25519.PublicKey",
 			ErrSignature,
-			signer.Public(),
+			publicValue,
 		)
 	}
 	if len(public) != ed25519.PublicKeySize {
@@ -93,7 +100,16 @@ func newSigningKey(signer crypto.Signer) (*signingKey, error) {
 
 // sign produces a detached Ed25519 signature. Ed25519 hashes internally, so
 // crypto.Hash(0) instructs the signer to consume the message directly.
-func (k *signingKey) sign(message []byte) (string, error) {
+func (k *signingKey) sign(message []byte) (encoded string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			encoded = ""
+			err = fmt.Errorf("%w: signer callback: %v", teleop.ErrCallbackPanic, recovered)
+		}
+	}()
+	if k == nil || k.signer == nil {
+		return "", fmt.Errorf("%w: signer is unavailable", ErrSignature)
+	}
 	signature, err := k.signer.Sign(rand.Reader, message, crypto.Hash(0))
 	if err != nil {
 		return "", fmt.Errorf("sign audit record: %w", err)
@@ -104,6 +120,9 @@ func (k *signingKey) sign(message []byte) (string, error) {
 			ErrSignature,
 			len(signature),
 		)
+	}
+	if !ed25519.Verify(k.public, message, signature) {
+		return "", fmt.Errorf("%w: signer returned an invalid Ed25519 signature", ErrSignature)
 	}
 	return hex.EncodeToString(signature), nil
 }

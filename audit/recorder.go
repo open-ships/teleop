@@ -2,6 +2,7 @@ package audit
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ed25519"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/open-ships/teleop"
+	"github.com/open-ships/teleop/internal/eventorder"
 )
 
 const (
@@ -40,6 +42,9 @@ const (
 	// DefaultMaxPendingBytes bounds event data withheld from a Verify callback
 	// while it waits for the next required signed tree head.
 	DefaultMaxPendingBytes = 64 * 1024 * 1024
+	// maxIdleWitnessRetries bounds locally appended retry heads for unchanged
+	// event coverage. New activity resets the budget for its newer coverage.
+	maxIdleWitnessRetries = 1
 )
 
 var (
@@ -67,6 +72,13 @@ var (
 	// ErrPendingLimit reports that events awaiting a required signed tree head
 	// exceed VerifyOptions.MaxPendingBytes.
 	ErrPendingLimit = errors.New("teleop/audit: pending signature buffer limit exceeded")
+	// ErrInvalidEvent reports an event that cannot be represented faithfully or
+	// whose identity, sequence, or causality would make the completed stream
+	// unverifiable.
+	ErrInvalidEvent = errors.New("teleop/audit: invalid event")
+	// ErrWitnessRequired reports that a recorder configured to require external
+	// witnessing could not prove that its completed footer was acknowledged.
+	ErrWitnessRequired = errors.New("teleop/audit: required external witness unavailable")
 )
 
 const (
@@ -95,6 +107,10 @@ type Options struct {
 	AnchorTimeout time.Duration
 	// AnchorQueue is the number of pending publications retained.
 	AnchorQueue int
+	// RequireWitness makes Close fail unless every attempted publication
+	// succeeded and the final footer was acknowledged by Anchor. It does not make
+	// network I/O block controller input while the session is active.
+	RequireWitness bool
 	// CheckpointInterval and CheckpointEvery bound the gap between tree heads.
 	CheckpointInterval time.Duration
 	CheckpointEvery    uint64
@@ -170,6 +186,14 @@ func WithAnchor(anchor Anchor) Option {
 	}
 }
 
+// WithRequiredWitness controls whether Close requires successful external
+// acknowledgement of the final footer. This is a completion policy, not a
+// trusted-time claim: the Anchor adapter still determines what acknowledgement
+// means and must live in a separate custody domain to provide useful evidence.
+func WithRequiredWitness(required bool) Option {
+	return func(options *Options) { options.RequireWitness = required }
+}
+
 // WithAnchorTimeout bounds a single anchor publication.
 func WithAnchorTimeout(timeout time.Duration) Option {
 	return func(options *Options) {
@@ -181,8 +205,11 @@ func WithAnchorTimeout(timeout time.Duration) Option {
 
 // WithCheckpoints sets how often a tree head is emitted, by elapsed time and
 // by record count. WithSigner makes each head signed. Either bound may be zero
-// to disable it. Frequent checkpoints narrow the window in which a truncation
-// can go unwitnessed.
+// to disable it. Frequent checkpoints narrow nominal witness lag while the
+// adapter is healthy; they cannot impose a bound during a witness outage. When
+// interval is positive, its timer also appends at most one retry head for the
+// same event coverage after an exact recoverable Anchor failure or queue drop.
+// Historical failure and drop accounting remains sticky after recovery.
 func WithCheckpoints(interval time.Duration, every uint64) Option {
 	return func(options *Options) {
 		options.CheckpointInterval = interval
@@ -334,6 +361,27 @@ type VerifyOptions struct {
 	MaxPendingBytes uint64
 }
 
+// EvidenceStatus reports how far evidence has progressed through the recorder.
+// AcceptedEvents have been appended successfully; Recorder.Record can still
+// return an error if a following checkpoint fails. A controller may also have
+// additional events waiting in its own queue, which the recorder cannot see.
+// LocallyDurableEvents counts events followed by a successful Sync on the
+// configured writer. WitnessedEvents and WitnessedTreeSize come from the most
+// recent successful Anchor acknowledgement. Closed becomes true only after
+// footer finalization and required-witness evaluation have completed.
+type EvidenceStatus struct {
+	AcceptedEvents       uint64
+	LocallyDurableEvents uint64
+	WitnessedEvents      uint64
+	WitnessedTreeSize    uint64
+	Durability           string
+	WitnessConfigured    bool
+	WitnessRequired      bool
+	LastWitness          *WitnessReceipt
+	Closed               bool
+	Err                  error
+}
+
 // Recorder is a concurrency-safe, sticky-failure audit sink.
 type Recorder struct {
 	mu       sync.Mutex
@@ -345,17 +393,36 @@ type Recorder struct {
 	started  bool
 	closed   bool
 	failure  error
+	closeErr error
 
-	key     *signingKey
-	keyErr  error
-	tree    Tree
-	anchors *anchorRunner
-	session teleop.SessionID
+	closeOnce sync.Once
+	closeDone chan struct{}
+
+	key           *signingKey
+	keyErr        error
+	provenanceErr error
+	tree          Tree
+	anchors       *anchorRunner
+	session       teleop.SessionID
 
 	lastCheckpoint      time.Time
 	sinceCheckpoint     uint64
 	checkpointsRecorded uint64
+	published           eventorder.HighWater
+	durableCount        uint64
+
+	lastAnchorAttempt    *Checkpoint
+	witnessRetryCount    uint8
+	witnessRetryCoverage uint64
+
+	checkpointTimerMu  sync.Mutex
+	checkpointStop     chan struct{}
+	checkpointDone     chan struct{}
+	checkpointStarted  bool
+	checkpointStopping bool
 }
+
+var _ teleop.CanonicalEventSink = (*Recorder)(nil)
 
 // NewRecorder returns an audit recorder that writes to writer. The default
 // SHA-256 chain detects accidental corruption but is not authentic; use
@@ -378,9 +445,15 @@ func NewRecorder(writer io.Writer, options ...Option) *Recorder {
 		copy(key, configured.HMACKey)
 		configured.HMACKey = key
 	}
+	var provenanceErr error
 	if configured.Provenance != nil {
-		provenance := configured.Provenance.Clone()
-		configured.Provenance = &provenance
+		provenance, err := freezeProvenance(*configured.Provenance)
+		if err != nil {
+			provenanceErr = err
+			configured.Provenance = nil
+		} else {
+			configured.Provenance = &provenance
+		}
 	}
 	if configured.Signer != nil || configured.Anchor != nil {
 		// A signature or external anchor over an empty chain/tree cannot commit
@@ -392,9 +465,12 @@ func NewRecorder(writer io.Writer, options ...Option) *Recorder {
 		configured.Now = time.Now
 	}
 	recorder := &Recorder{
-		writer:  bufio.NewWriter(writer),
-		raw:     writer,
-		options: configured,
+		writer:        bufio.NewWriter(writer),
+		raw:           writer,
+		options:       configured,
+		closeDone:     make(chan struct{}),
+		published:     eventorder.New(teleop.MaxEventStreamsPerSession),
+		provenanceErr: provenanceErr,
 	}
 	if configured.Signer != nil {
 		key, err := newSigningKey(configured.Signer)
@@ -432,6 +508,163 @@ func (r *Recorder) AnchorStats() AnchorStats {
 	return r.anchors.stats()
 }
 
+// EvidenceStatus returns a concurrency-safe snapshot of local durability and
+// external witness coverage. Returned witness data is isolated from subsequent
+// recorder updates.
+func (r *Recorder) EvidenceStatus() EvidenceStatus {
+	r.mu.Lock()
+	completed := false
+	select {
+	case <-r.closeDone:
+		completed = true
+	default:
+	}
+	status := EvidenceStatus{
+		AcceptedEvents:       r.count,
+		LocallyDurableEvents: r.durableCount,
+		Durability:           r.durability(),
+		WitnessConfigured:    r.anchors != nil,
+		WitnessRequired:      r.options.RequireWitness,
+		Closed:               completed,
+		Err: errors.Join(
+			r.keyErr,
+			r.provenanceErr,
+			r.failure,
+			r.closeErr,
+		),
+	}
+	anchors := r.anchors
+	r.mu.Unlock()
+
+	if anchors == nil {
+		return status
+	}
+	stats := anchors.stats()
+	status.LastWitness = cloneWitnessReceipt(stats.LastReceipt)
+	if status.LastWitness != nil {
+		status.WitnessedEvents = status.LastWitness.Checkpoint.EventCount
+		// A tree head describes the records before the head while its signature
+		// also commits to the head's own chain hash.
+		status.WitnessedTreeSize = status.LastWitness.Checkpoint.Size + 1
+	}
+	if stats.Failed > 0 || stats.Dropped > 0 {
+		status.Err = errors.Join(
+			status.Err,
+			fmt.Errorf(
+				"%w: %d witness publication(s) failed and %d were dropped",
+				ErrWitnessRequired,
+				stats.Failed,
+				stats.Dropped,
+			),
+			stats.Err,
+		)
+	}
+	return status
+}
+
+// WaitForWitness waits until an Anchor acknowledges a tree head covering at
+// least eventCount events. A successful Anchor return is an acknowledgement by
+// that adapter; callers must still decide whether its custody and persistence
+// properties are trustworthy.
+func (r *Recorder) WaitForWitness(
+	ctx context.Context,
+	eventCount uint64,
+) (WitnessReceipt, error) {
+	if ctx == nil {
+		return WitnessReceipt{}, errors.New("teleop/audit: nil witness context")
+	}
+	r.mu.Lock()
+	anchors := r.anchors
+	r.mu.Unlock()
+	if anchors == nil {
+		return WitnessReceipt{}, ErrWitnessRequired
+	}
+	return anchors.wait(ctx, eventCount)
+}
+
+func (r *Recorder) startCheckpointTimer() {
+	if r.options.CheckpointInterval <= 0 {
+		return
+	}
+	r.checkpointTimerMu.Lock()
+	defer r.checkpointTimerMu.Unlock()
+	if r.checkpointStarted || r.checkpointStopping {
+		return
+	}
+	r.checkpointStarted = true
+	r.checkpointStop = make(chan struct{})
+	r.checkpointDone = make(chan struct{})
+	go r.runCheckpointTimer(
+		r.options.CheckpointInterval,
+		r.checkpointStop,
+		r.checkpointDone,
+	)
+}
+
+func (r *Recorder) runCheckpointTimer(
+	interval time.Duration,
+	stop <-chan struct{},
+	done chan<- struct{},
+) {
+	defer close(done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.mu.Lock()
+			if !r.closed && r.failure == nil && r.started {
+				reason := ""
+				switch {
+				case r.sinceCheckpoint > 0:
+					reason = "interval"
+				case r.shouldRetryWitnessLocked():
+					r.witnessRetryCount++
+					reason = "witness retry"
+				}
+				if reason != "" {
+					if err := r.checkpointLocked(reason); err != nil {
+						r.failLocked(err)
+					}
+				}
+			}
+			r.mu.Unlock()
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (r *Recorder) shouldRetryWitnessLocked() bool {
+	if r.anchors == nil || r.lastAnchorAttempt == nil ||
+		r.witnessRetryCount >= maxIdleWitnessRetries ||
+		r.lastAnchorAttempt.EventCount != r.count {
+		return false
+	}
+	return r.anchors.retryState(*r.lastAnchorAttempt) == anchorRetryEligible
+}
+
+func (r *Recorder) stopCheckpointTimer() {
+	r.checkpointTimerMu.Lock()
+	if r.checkpointStopping {
+		done := r.checkpointDone
+		r.checkpointTimerMu.Unlock()
+		if done != nil {
+			<-done
+		}
+		return
+	}
+	r.checkpointStopping = true
+	if !r.checkpointStarted {
+		r.checkpointTimerMu.Unlock()
+		return
+	}
+	close(r.checkpointStop)
+	done := r.checkpointDone
+	r.checkpointTimerMu.Unlock()
+	<-done
+}
+
 // Checkpoint forces a tree head immediately; WithSigner makes it signed.
 // Callers should invoke it at moments worth being able to prove later, such as
 // arming, an emergency stop, or a handover between operators. It returns
@@ -458,23 +691,106 @@ func (r *Recorder) Checkpoint(reason string) error {
 	return nil
 }
 
-// Record implements teleop.EventSink. An event that JSON cannot represent is
-// retained as an encoding-error payload rather than terminating controller
-// input. A zero session or a change of session permanently fails the recorder.
+// CheckpointAndWait writes a checkpoint across the recorder's configured local
+// flush/Sync barrier and waits until Anchor acknowledges that exact head or a
+// later head from this recorder whose Merkle prefix includes it. Unlike
+// WaitForWitness, this barrier cannot be satisfied by an older checkpoint that
+// happens to carry the same event count.
+//
+// ctx bounds only the external acknowledgement wait. Once the local checkpoint
+// has been written and queued, cancellation cannot retract it.
+func (r *Recorder) CheckpointAndWait(
+	ctx context.Context,
+	reason string,
+) (WitnessReceipt, error) {
+	if ctx == nil {
+		return WitnessReceipt{}, fmt.Errorf("%w: nil checkpoint context", teleop.ErrInvalidState)
+	}
+	if err := ctx.Err(); err != nil {
+		return WitnessReceipt{}, err
+	}
+
+	var (
+		anchors  *anchorRunner
+		baseline AnchorStats
+		target   Checkpoint
+	)
+	err := func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.closed {
+			return ErrClosed
+		}
+		if r.failure != nil {
+			return errors.Join(ErrFailed, r.failure)
+		}
+		if !r.started {
+			return ErrSessionRequired
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.startLocked(); err != nil {
+			return r.failLocked(err)
+		}
+		anchors = r.anchors
+		if anchors != nil {
+			baseline = anchors.stats()
+		}
+		var checkpointErr error
+		target, checkpointErr = r.writeCheckpointLocked(reason)
+		if checkpointErr != nil {
+			return r.failLocked(checkpointErr)
+		}
+		return nil
+	}()
+	if err != nil {
+		return WitnessReceipt{}, err
+	}
+	if anchors == nil {
+		return WitnessReceipt{}, ErrWitnessRequired
+	}
+	return waitForCheckpointWitness(ctx, anchors, target, baseline)
+}
+
+// Record implements teleop.EventSink. It freezes event before admission and
+// permanently fails the recorder if the event cannot be represented faithfully
+// or would make the stream unverifiable.
 func (r *Recorder) Record(ctx context.Context, event teleop.Event) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: nil record context", teleop.ErrInvalidState)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	header := event.Header()
-	payload, err := json.Marshal(event)
-	var encodingError string
+	canonical, err := teleop.FreezeEvent(event)
 	if err != nil {
-		encodingError = err.Error()
-		payload, _ = json.Marshal(struct {
-			Header teleop.Header `json:"header"`
-		}{
-			Header: header,
-		})
+		return r.rejectEvent(errors.Join(ErrInvalidEvent, err))
+	}
+	return r.RecordCanonical(ctx, canonical)
+}
+
+// RecordCanonical implements teleop.CanonicalEventSink. The controller can
+// freeze an event before its asynchronous sink queue, ensuring the bytes signed
+// here are exactly the bytes admitted there. Direct Record callers receive the
+// same validation through teleop.FreezeEvent.
+func (r *Recorder) RecordCanonical(
+	ctx context.Context,
+	event teleop.CanonicalEvent,
+) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: nil record context", teleop.ErrInvalidState)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	snapshot := eventSnapshot{
+		header:  event.Header(),
+		kind:    event.Kind(),
+		payload: append(json.RawMessage(nil), event.JSON()...),
+	}
+	if err := validateEventSnapshot(snapshot); err != nil {
+		return r.rejectEvent(err)
 	}
 
 	r.mu.Lock()
@@ -485,39 +801,146 @@ func (r *Recorder) Record(ctx context.Context, event teleop.Event) error {
 	if r.failure != nil {
 		return errors.Join(ErrFailed, r.failure)
 	}
-	if header.ID.Session == (teleop.SessionID{}) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := r.validateEventOrderLocked(snapshot.header); err != nil {
+		return r.failLocked(err)
+	}
+	if snapshot.header.ID.Session == (teleop.SessionID{}) {
 		return r.failLocked(ErrSessionRequired)
 	}
 	// Bind the session before the manifest is written so a signed manifest
 	// cannot be transplanted onto a different session's records.
 	if !r.started {
-		r.session = header.ID.Session
-	} else if header.ID.Session != r.session {
+		r.session = snapshot.header.ID.Session
+	} else if snapshot.header.ID.Session != r.session {
 		return r.failLocked(errors.New("teleop/audit: event session changed"))
 	}
 	if err := r.startLocked(); err != nil {
 		return r.failLocked(err)
 	}
-	now := r.options.Now().UTC()
+	now, err := r.now()
+	if err != nil {
+		return r.failLocked(err)
+	}
 	record := diskRecord{
-		Version:       FormatVersion,
-		RecordType:    "event",
-		RecordedAt:    now,
-		Kind:          event.Kind(),
-		Payload:       payload,
-		EncodingError: encodingError,
+		Version:    FormatVersion,
+		RecordType: "event",
+		RecordedAt: now,
+		Kind:       snapshot.kind,
+		Payload:    snapshot.payload,
 	}
 	if err := r.writeLocked(&record); err != nil {
 		return r.failLocked(err)
 	}
+	if !r.published.Advance(
+		snapshot.header.ID.Stream,
+		snapshot.header.ID.Sequence,
+	) {
+		return r.failLocked(fmt.Errorf(
+			"%w: event order changed during admission",
+			ErrInvalidEvent,
+		))
+	}
 	r.count++
+	if r.options.FlushEveryEvent && r.syncCapable() {
+		r.durableCount = r.count
+	}
 	r.sinceCheckpoint++
 	if r.checkpointDueLocked(now) {
 		if err := r.checkpointLocked("interval"); err != nil {
 			return r.failLocked(err)
 		}
 	}
+	r.startCheckpointTimer()
 	return nil
+}
+
+type eventSnapshot struct {
+	header  teleop.Header
+	kind    teleop.EventKind
+	payload json.RawMessage
+}
+
+func validateEventSnapshot(snapshot eventSnapshot) error {
+	if snapshot.kind == "" {
+		return fmt.Errorf("%w: event kind is empty", ErrInvalidEvent)
+	}
+	if len(snapshot.payload) == 0 || !json.Valid(snapshot.payload) {
+		return fmt.Errorf("%w: event payload is not valid JSON", ErrInvalidEvent)
+	}
+	if err := rejectDuplicateJSONFields(snapshot.payload); err != nil {
+		return fmt.Errorf("%w: event payload: %v", ErrInvalidEvent, err)
+	}
+	var envelope struct {
+		Header *teleop.Header `json:"header"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(snapshot.payload))
+	if err := decoder.Decode(&envelope); err != nil {
+		return fmt.Errorf("%w: decode event header: %v", ErrInvalidEvent, err)
+	}
+	if envelope.Header == nil {
+		return fmt.Errorf("%w: event payload has no header", ErrInvalidEvent)
+	}
+	expected, err := json.Marshal(snapshot.header)
+	if err != nil {
+		return fmt.Errorf("%w: encode Event.Header: %v", ErrInvalidEvent, err)
+	}
+	actual, err := json.Marshal(envelope.Header)
+	if err != nil {
+		return fmt.Errorf("%w: encode payload header: %v", ErrInvalidEvent, err)
+	}
+	if !bytes.Equal(expected, actual) {
+		return fmt.Errorf("%w: payload header differs from Event.Header", ErrInvalidEvent)
+	}
+	return nil
+}
+
+func (r *Recorder) validateEventOrderLocked(header teleop.Header) error {
+	if header.ID.Session == (teleop.SessionID{}) {
+		return ErrSessionRequired
+	}
+	if header.ID.Stream == "" || header.ID.Sequence == 0 {
+		return fmt.Errorf("%w: invalid event ID", ErrInvalidEvent)
+	}
+	want := r.published.Expected(header.ID.Stream)
+	if want == 0 {
+		return fmt.Errorf(
+			"%w: event stream limit %d reached or stream %q exhausted",
+			ErrInvalidEvent,
+			teleop.MaxEventStreamsPerSession,
+			header.ID.Stream,
+		)
+	}
+	if header.ID.Sequence != want {
+		return fmt.Errorf(
+			"%w: stream %q sequence %d follows %d",
+			ErrInvalidEvent,
+			header.ID.Stream,
+			header.ID.Sequence,
+			r.published.Through(header.ID.Stream),
+		)
+	}
+	for _, cause := range header.Causes {
+		if cause.Session != header.ID.Session ||
+			!r.published.Contains(cause.Stream, cause.Sequence) {
+			return fmt.Errorf("%w: cause %v does not precede event", ErrInvalidEvent, cause)
+		}
+	}
+	return nil
+}
+
+func (r *Recorder) rejectEvent(err error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrClosed
+	}
+	if r.failure != nil {
+		return errors.Join(ErrFailed, r.failure)
+	}
+	return r.failLocked(err)
 }
 
 func (r *Recorder) checkpointDueLocked(now time.Time) bool {
@@ -532,27 +955,32 @@ func (r *Recorder) checkpointDueLocked(now time.Time) bool {
 
 // checkpointLocked writes a tree head covering every record before it.
 func (r *Recorder) checkpointLocked(reason string) error {
+	_, err := r.writeCheckpointLocked(reason)
+	return err
+}
+
+func (r *Recorder) writeCheckpointLocked(reason string) (Checkpoint, error) {
+	now, err := r.now()
+	if err != nil {
+		return Checkpoint{}, err
+	}
 	checkpoint := diskRecord{
 		Version:    FormatVersion,
 		RecordType: "checkpoint",
-		RecordedAt: r.options.Now().UTC(),
+		RecordedAt: now,
 		EventCount: r.count,
 		Reason:     reason,
 	}
 	if err := r.writeLocked(&checkpoint); err != nil {
-		return err
+		return Checkpoint{}, err
 	}
 	r.checkpointsRecorded++
 	r.sinceCheckpoint = 0
 	r.lastCheckpoint = checkpoint.RecordedAt
-	r.publishAnchorLocked(checkpoint)
-	return nil
+	return r.publishAnchorLocked(checkpoint), nil
 }
 
-func (r *Recorder) publishAnchorLocked(record diskRecord) {
-	if r.anchors == nil {
-		return
-	}
+func (r *Recorder) publishAnchorLocked(record diskRecord) Checkpoint {
 	checkpoint := Checkpoint{
 		Version:    record.Version,
 		RecordType: record.RecordType,
@@ -569,7 +997,70 @@ func (r *Recorder) publishAnchorLocked(record diskRecord) {
 		checkpoint.KeyID = r.key.id
 		checkpoint.PublicKey = hex.EncodeToString(r.key.public)
 	}
-	r.anchors.publish(checkpoint)
+	if r.anchors != nil {
+		if checkpoint.RecordType == "checkpoint" {
+			if checkpoint.EventCount != r.witnessRetryCoverage {
+				r.witnessRetryCoverage = checkpoint.EventCount
+				r.witnessRetryCount = 0
+			}
+			attempt := checkpoint
+			r.lastAnchorAttempt = &attempt
+		}
+		r.anchors.publish(checkpoint)
+	}
+	return checkpoint
+}
+
+func waitForCheckpointWitness(
+	ctx context.Context,
+	anchors *anchorRunner,
+	target Checkpoint,
+	baseline AnchorStats,
+) (WitnessReceipt, error) {
+	for {
+		stats, changed, stopped := anchors.observation()
+		if stats.Failed > baseline.Failed {
+			return WitnessReceipt{}, errors.Join(ErrWitnessRequired, stats.Err)
+		}
+		if stats.Dropped > baseline.Dropped {
+			return WitnessReceipt{}, fmt.Errorf(
+				"%w: %d checkpoint publication(s) were dropped while waiting",
+				ErrWitnessRequired,
+				stats.Dropped-baseline.Dropped,
+			)
+		}
+		if stats.LastReceipt != nil && checkpointWitnessCovers(
+			stats.LastReceipt.Checkpoint,
+			target,
+		) {
+			return *cloneWitnessReceipt(stats.LastReceipt), nil
+		}
+		if stopped {
+			return WitnessReceipt{}, fmt.Errorf(
+				"%w: recorder closed before checkpoint %s was acknowledged",
+				ErrWitnessRequired,
+				target.ChainHead,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return WitnessReceipt{}, ctx.Err()
+		case <-changed:
+		case <-anchors.done:
+		}
+	}
+}
+
+func checkpointWitnessCovers(receipt, target Checkpoint) bool {
+	if receipt.Session != target.Session || receipt.EventCount < target.EventCount {
+		return false
+	}
+	if target.ChainHead != "" && receipt.ChainHead == target.ChainHead {
+		return true
+	}
+	// target itself becomes leaf target.Size. A later recorder head with a
+	// larger preceding-tree size therefore commits to target in its Merkle root.
+	return receipt.Size > target.Size
 }
 
 // treeHead builds the statement signed for a manifest, checkpoint, or footer.
@@ -590,41 +1081,95 @@ func (r *Recorder) treeHead(record diskRecord) TreeHead {
 // Close writes a footer and makes any failure sticky. A failed Close is safe to
 // retry: it returns the same error without appending a duplicate footer.
 func (r *Recorder) Close() error {
+	r.closeOnce.Do(r.closeInternal)
+	<-r.closeDone
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
-		if r.failure != nil {
-			return errors.Join(ErrFailed, r.failure)
-		}
-		return nil
-	}
+	return r.closeErr
+}
+
+func (r *Recorder) closeInternal() {
+	defer close(r.closeDone)
+	r.stopCheckpointTimer()
+
+	r.mu.Lock()
 	r.closed = true
-	defer r.clearKeyMaterialLocked()
-	// Stop anchoring on every exit path, including failures, so a failed
-	// Close cannot leak the publisher goroutine.
-	defer func() {
-		if r.anchors != nil {
-			r.anchors.stop()
+	var footer *diskRecord
+	if r.failure == nil {
+		if err := r.startLocked(); err != nil {
+			r.failLocked(err)
+		} else {
+			now, nowErr := r.now()
+			if nowErr != nil {
+				r.failLocked(nowErr)
+			} else {
+				candidate := diskRecord{
+					Version:    FormatVersion,
+					RecordType: "footer",
+					RecordedAt: now,
+					EventCount: r.count,
+				}
+				if err := r.writeLocked(&candidate); err != nil {
+					r.failLocked(err)
+				} else {
+					footer = &candidate
+					r.publishAnchorLocked(candidate)
+					if err := r.flushAndSync(); err != nil {
+						r.failLocked(err)
+					} else if r.syncCapable() {
+						r.durableCount = r.count
+					}
+				}
+			}
 		}
-	}()
+	}
+	anchors := r.anchors
+	r.mu.Unlock()
+
+	// Drain acknowledgements without holding the recorder mutex. Anchor adapters
+	// may inspect recorder status as part of their own observability.
+	if anchors != nil {
+		anchors.stop()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var result error
 	if r.failure != nil {
-		return errors.Join(ErrFailed, r.failure)
+		result = errors.Join(ErrFailed, r.failure)
 	}
-	if err := r.startLocked(); err != nil {
-		return r.failLocked(err)
+	if r.options.RequireWitness {
+		result = errors.Join(result, r.requiredWitnessErrorLocked(footer))
 	}
-	footer := diskRecord{
-		Version:    FormatVersion,
-		RecordType: "footer",
-		RecordedAt: r.options.Now().UTC(),
-		EventCount: r.count,
+	r.clearKeyMaterialLocked()
+	r.closeErr = result
+}
+
+func (r *Recorder) requiredWitnessErrorLocked(footer *diskRecord) error {
+	if r.anchors == nil {
+		return fmt.Errorf("%w: no Anchor is configured", ErrWitnessRequired)
 	}
-	if err := r.writeLocked(&footer); err != nil {
-		return r.failLocked(err)
+	stats := r.anchors.stats()
+	if stats.Failed > 0 || stats.Dropped > 0 {
+		return errors.Join(
+			fmt.Errorf(
+				"%w: %d publication(s) failed and %d were dropped",
+				ErrWitnessRequired,
+				stats.Failed,
+				stats.Dropped,
+			),
+			stats.Err,
+		)
 	}
-	r.publishAnchorLocked(footer)
-	if err := r.flushAndSync(); err != nil {
-		return r.failLocked(err)
+	if footer == nil || stats.LastReceipt == nil {
+		return fmt.Errorf("%w: completed footer was not acknowledged", ErrWitnessRequired)
+	}
+	acknowledged := stats.LastReceipt.Checkpoint
+	if acknowledged.RecordType != "footer" ||
+		acknowledged.Session != r.session ||
+		acknowledged.EventCount != r.count ||
+		acknowledged.ChainHead != footer.Hash {
+		return fmt.Errorf("%w: final acknowledgement does not cover the footer", ErrWitnessRequired)
 	}
 	return nil
 }
@@ -636,11 +1181,18 @@ func (r *Recorder) startLocked() error {
 	if r.keyErr != nil {
 		return r.keyErr
 	}
+	if r.provenanceErr != nil {
+		return r.provenanceErr
+	}
+	now, err := r.now()
+	if err != nil {
+		return err
+	}
 	r.started = true
 	manifest := diskRecord{
 		Version:       FormatVersion,
 		RecordType:    "manifest",
-		RecordedAt:    r.options.Now().UTC(),
+		RecordedAt:    now,
 		Chain:         r.chain(),
 		ControlSchema: ControlSchemaVersion,
 		Durability:    r.durability(),
@@ -677,13 +1229,33 @@ func (r *Recorder) durability() string {
 	if !r.options.FlushEveryEvent {
 		return "buffered"
 	}
-	if _, ok := r.raw.(interface{ Sync() error }); ok {
+	if r.syncCapable() {
 		return "fsync-every-record"
 	}
 	return "flush-every-record"
 }
 
-func (r *Recorder) writeLocked(record *diskRecord) error {
+func (r *Recorder) syncCapable() bool {
+	_, ok := r.raw.(interface{ Sync() error })
+	return ok
+}
+
+func (r *Recorder) now() (now time.Time, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			now = time.Time{}
+			err = fmt.Errorf("%w: audit clock: %v", teleop.ErrCallbackPanic, recovered)
+		}
+	}()
+	return r.options.Now().UTC(), nil
+}
+
+func (r *Recorder) writeLocked(record *diskRecord) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%w: audit writer or signer: %v", teleop.ErrCallbackPanic, recovered)
+		}
+	}()
 	record.PreviousHash = ""
 	record.Hash = ""
 	record.Signature = ""
@@ -764,7 +1336,12 @@ func (r *Recorder) clearKeyMaterialLocked() {
 	}
 }
 
-func (r *Recorder) flushAndSync() error {
+func (r *Recorder) flushAndSync() (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%w: audit writer: %v", teleop.ErrCallbackPanic, recovered)
+		}
+	}()
 	if err := r.writer.Flush(); err != nil {
 		return fmt.Errorf("flush audit log: %w", err)
 	}
@@ -873,8 +1450,7 @@ func Verify(
 		lineNumber     int
 		footer         bool
 		legacy         bool
-		seen           = make(map[teleop.EventID]struct{})
-		sequences      = make(map[string]uint64)
+		published      = eventorder.New(teleop.MaxEventStreamsPerSession)
 		session        *teleop.SessionID
 		tree           Tree
 		trusted        ed25519.PublicKey
@@ -1241,17 +1817,27 @@ func Verify(
 		if header.ID.Stream == "" || header.ID.Sequence == 0 {
 			return verification, fmt.Errorf("audit line %d: invalid event ID", lineNumber)
 		}
-		if header.ID.Sequence != sequences[header.ID.Stream]+1 {
+		wantSequence := published.Expected(header.ID.Stream)
+		if wantSequence == 0 {
+			return verification, fmt.Errorf(
+				"audit line %d: event stream limit %d reached or stream %q exhausted",
+				lineNumber,
+				teleop.MaxEventStreamsPerSession,
+				header.ID.Stream,
+			)
+		}
+		if header.ID.Sequence != wantSequence {
 			return verification, fmt.Errorf(
 				"audit line %d: stream %q sequence %d follows %d",
 				lineNumber,
 				header.ID.Stream,
 				header.ID.Sequence,
-				sequences[header.ID.Stream],
+				published.Through(header.ID.Stream),
 			)
 		}
 		for _, cause := range header.Causes {
-			if _, ok := seen[cause]; !ok {
+			if cause.Session != header.ID.Session ||
+				!published.Contains(cause.Stream, cause.Sequence) {
 				return verification, fmt.Errorf(
 					"audit line %d: cause %v does not precede event",
 					lineNumber,
@@ -1259,8 +1845,12 @@ func Verify(
 				)
 			}
 		}
-		sequences[header.ID.Stream] = header.ID.Sequence
-		seen[header.ID] = struct{}{}
+		if !published.Advance(header.ID.Stream, header.ID.Sequence) {
+			return verification, fmt.Errorf(
+				"audit line %d: event order changed during verification",
+				lineNumber,
+			)
+		}
 		verification.EventCount++
 		encodingError := ""
 		if disk.Version >= 2 {

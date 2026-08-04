@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/open-ships/teleop/internal/eventorder"
 )
 
 // DeliveryPolicy controls what happens when a subscription cannot keep up.
@@ -63,6 +66,52 @@ type StateMeta struct {
 	Connected bool
 	Stale     bool
 	Synthetic bool
+	// Invalid reports that the latest physical observation contained a
+	// non-finite or out-of-range analog value. The canonical state is neutral
+	// when this is true; callers must not treat that neutralization as a valid
+	// operator command.
+	Invalid bool
+
+	// LastStateChangeMonotonic is the session-relative time at which the
+	// canonical state last changed. It is intentionally distinct from transport
+	// health: a steady operator command may leave this value unchanged while a
+	// polling backend continues checking its documented connection seam.
+	LastStateChangeMonotonic time.Duration
+	// LastTransportCheckMonotonic is the most recent transport evidence accepted
+	// by the controller: either a delivered observation or a completed
+	// source-level connection check. TransportCheckSequence distinguishes a valid
+	// zero reading at session start from a source that has never checked in.
+	LastTransportCheckMonotonic time.Duration
+	TransportCheckSequence      uint64
+	// TransportSilenceVerifiable is true only when the source supplies independent
+	// periodic checks at its documented OS/framework seam even when state is
+	// unchanged. It does not imply a fresh physical-device or radio response.
+	// When false, elapsed silence is explicitly unverifiable.
+	TransportSilenceVerifiable bool
+}
+
+// TransportHealth is an InputSource Adapter's latest independently sampled
+// connection evidence at that adapter's documented OS/framework seam.
+// Sequence must increase after every completed check; CheckedAt records when it
+// completed. A zero sequence means no check has completed. Connected=false with
+// a nonzero sequence means the source could not affirm connection at that seam
+// (and is a confirmed disconnect when SilenceVerifiable is true), not proof
+// about a physical radio path beyond what the operating-system API tested.
+type TransportHealth struct {
+	Sequence          uint64
+	CheckedAt         time.Time
+	Connected         bool
+	SilenceVerifiable bool
+}
+
+// TransportHealthSource is the optional liveness seam implemented by an
+// InputSource Adapter that can check transport health independently of state
+// changes. TransportHealth must be safe for concurrent use with Read and must
+// not block. The source must document exactly which OS/framework condition it
+// freshly checks. Change-driven adapters may omit it, making silence explicitly
+// unverifiable without requiring duplicate observations in the audit stream.
+type TransportHealthSource interface {
+	TransportHealth() TransportHealth
 }
 
 // GameController is an open controller session. Implementations are created by
@@ -111,6 +160,16 @@ type Controller struct {
 	external        chan commandRequest
 	fatal           chan error
 
+	// commandMu closes admission atomically with terminal queue draining. A
+	// successful send while commandAccepting is true is therefore either handled
+	// by the run loop or observed by drainCommands; it cannot land after the
+	// terminal drain. commandSpace wakes synchronous callers when a queue slot is
+	// released without making asynchronous RecordCommand block.
+	commandMu        sync.Mutex
+	commandAccepting bool
+	commandSpace     chan struct{}
+	commandClosed    chan struct{}
+
 	// clocks detects wall-clock steps. Only the run loop may call observe;
 	// since is read-only and safe from any goroutine.
 	clocks *clockMonitor
@@ -120,9 +179,13 @@ type Controller struct {
 	meta    StateMeta
 
 	eventMu   sync.Mutex
-	sequences map[string]uint64
-	knownMu   sync.RWMutex
-	known     map[EventID]struct{}
+	allocated eventorder.HighWater
+
+	// published tracks one contiguous high-water mark per stream. Keeping this
+	// distinct from allocated matters: NewHeader allocates identities, while a
+	// command cause becomes valid only after the corresponding event is admitted.
+	publishedMu sync.RWMutex
+	published   eventorder.HighWater
 
 	subsMu       sync.Mutex
 	subscribers  map[*eventSubscription]struct{}
@@ -138,9 +201,13 @@ type Controller struct {
 
 	sinks []*sinkRunner
 
-	processorDisabled []bool
-	lastLiveness      time.Time
-	startedAt         time.Time
+	processorDisabled            []bool
+	lastLiveness                 time.Time
+	startedAt                    time.Time
+	healthSource                 TransportHealthSource
+	lastTransportHealthSequence  uint64
+	lastTransportHealthMonotonic time.Duration
+	transportSilenceVerifiable   bool
 }
 
 type sourceResult struct {
@@ -193,30 +260,36 @@ func NewController(source InputSource, options ...OpenOption) (*Controller, erro
 	sourceCtx, cancelSource := context.WithCancel(configured.context)
 	pipelineCtx, cancelPipe := context.WithCancel(context.Background())
 	controller := &Controller{
-		source:       source,
-		descriptor:   descriptor,
-		options:      configured,
-		clock:        configured.clock,
-		sourceCtx:    sourceCtx,
-		cancelSource: cancelSource,
-		pipelineCtx:  pipelineCtx,
-		cancelPipe:   cancelPipe,
-		done:         make(chan struct{}),
-		ingest:       make(chan sourceResult, configured.ingestBuffer),
-		external:     make(chan commandRequest, configured.ingestBuffer),
-		fatal:        make(chan error, len(configured.sinks)+2),
+		source:           source,
+		descriptor:       descriptor,
+		options:          configured,
+		clock:            configured.clock,
+		sourceCtx:        sourceCtx,
+		cancelSource:     cancelSource,
+		pipelineCtx:      pipelineCtx,
+		cancelPipe:       cancelPipe,
+		done:             make(chan struct{}),
+		ingest:           make(chan sourceResult, configured.ingestBuffer),
+		external:         make(chan commandRequest, configured.ingestBuffer),
+		fatal:            make(chan error, len(configured.sinks)+2),
+		commandAccepting: true,
+		commandSpace:     make(chan struct{}),
+		commandClosed:    make(chan struct{}),
 		clocks: newClockMonitor(
 			configured.clock.Now(),
 			configured.clockStepThreshold,
 		),
 		subscribers:  make(map[*eventSubscription]struct{}),
-		sequences:    make(map[string]uint64),
-		known:        make(map[EventID]struct{}),
+		allocated:    eventorder.New(MaxEventStreamsPerSession),
+		published:    eventorder.New(MaxEventStreamsPerSession),
 		sourceClosed: make(chan struct{}),
 		processorDisabled: make(
 			[]bool,
 			len(configured.processors),
 		),
+	}
+	if healthSource, ok := source.(TransportHealthSource); ok {
+		controller.healthSource = healthSource
 	}
 	if _, err := rand.Read(controller.session[:]); err != nil {
 		cancelSource()
@@ -324,14 +397,16 @@ func (c *Controller) run() {
 
 	now := c.clock.Now()
 	c.startedAt = now
-	c.stateMu.Lock()
-	c.meta.Connected = true
-	c.meta.PublishedAt = now
-	c.stateMu.Unlock()
-	if err := c.publish(ConnectionEvent{
+	connection := ConnectionEvent{
 		Meta:       c.nextHeaderAt("input", now, now, 0, nil, false),
 		State:      Connected,
 		Descriptor: c.Descriptor(),
+	}
+	if err := c.publishWithCommit(connection, func() {
+		c.stateMu.Lock()
+		c.meta.Connected = true
+		c.meta.PublishedAt = connection.Meta.PublishedAt
+		c.stateMu.Unlock()
 	}); err != nil {
 		c.terminate(err)
 		return
@@ -366,6 +441,7 @@ func (c *Controller) run() {
 				return
 			}
 		case request := <-c.external:
+			c.signalCommandSpace()
 			if err := c.handleCommand(request); err != nil {
 				c.terminate(err)
 				return
@@ -419,8 +495,8 @@ func (c *Controller) handleObservation(observation Observation, receivedAt time.
 	if observation.ObservedAt.IsZero() {
 		observation.ObservedAt = receivedAt
 	}
-	state, changed := sanitizeState(observation.State)
-	if changed {
+	state, invalid := sanitizeState(observation.State)
+	if invalid {
 		invalid := ErrorEvent{
 			Meta: c.nextHeaderAt(
 				"input",
@@ -430,7 +506,7 @@ func (c *Controller) handleObservation(observation Observation, receivedAt time.
 				nil,
 				true,
 			),
-			Message: ErrInvalidState.Error() + ": non-finite or out-of-range values were neutralized",
+			Message: ErrInvalidState.Error() + ": invalid analog observation was neutralized in full",
 			Err:     ErrInvalidState,
 		}
 		if err := c.publish(invalid); err != nil {
@@ -455,9 +531,10 @@ func (c *Controller) handleObservation(observation Observation, receivedAt time.
 		}
 	}
 
-	c.stateMu.Lock()
+	c.stateMu.RLock()
 	previous := c.state.Clone()
-	c.stateMu.Unlock()
+	previousMeta := c.meta
+	c.stateMu.RUnlock()
 
 	observationEvent := ObservationEvent{
 		Meta: c.nextHeaderAt(
@@ -466,32 +543,40 @@ func (c *Controller) handleObservation(observation Observation, receivedAt time.
 			receivedAt,
 			observation.DeviceTimestamp,
 			nil,
-			false,
+			invalid,
 		),
 		Native:   observation.Native.clone(),
 		Previous: previous,
 		Current:  state,
 	}
 
-	// Commit the state and its metadata together, before publishing. Updating
-	// state first and metadata after the publish loop leaves a window in which
-	// a snapshot returns new state alongside stale freshness metadata, which a
-	// consumer enforcing a command timeout reads as "no input has ever
-	// arrived". That fails safe, but it trips a gate for no reason, and a gate
-	// that trips spuriously is one operators learn to work around.
-	c.stateMu.Lock()
-	c.state = state.Clone()
-	c.meta = StateMeta{
-		ObservedAt:        observation.ObservedAt,
-		ReceivedAt:        receivedAt,
-		PublishedAt:       observationEvent.Meta.PublishedAt,
-		ReceivedMonotonic: observationEvent.Meta.ReceivedMonotonic,
-		Sequence:          observationEvent.Meta.ID.Sequence,
-		Connected:         true,
+	// Commit state and metadata atomically only after every authoritative sink
+	// has accepted the corresponding observation. This prevents Snapshot from
+	// exposing a control state that the evidence pipeline already rejected.
+	lastStateChange := previousMeta.LastStateChangeMonotonic
+	if previousMeta.Sequence == 0 || !reflect.DeepEqual(previous, state) {
+		lastStateChange = observationEvent.Meta.ReceivedMonotonic
 	}
-	c.stateMu.Unlock()
-
-	if err := c.publish(observationEvent); err != nil {
+	nextMeta := StateMeta{
+		ObservedAt:                  observation.ObservedAt,
+		ReceivedAt:                  receivedAt,
+		PublishedAt:                 observationEvent.Meta.PublishedAt,
+		ReceivedMonotonic:           observationEvent.Meta.ReceivedMonotonic,
+		Sequence:                    observationEvent.Meta.ID.Sequence,
+		Connected:                   true,
+		Synthetic:                   invalid,
+		Invalid:                     invalid,
+		LastStateChangeMonotonic:    lastStateChange,
+		LastTransportCheckMonotonic: observationEvent.Meta.ReceivedMonotonic,
+		TransportCheckSequence:      previousMeta.TransportCheckSequence + 1,
+		TransportSilenceVerifiable:  c.transportSilenceVerifiable,
+	}
+	if err := c.publishWithCommit(observationEvent, func() {
+		c.stateMu.Lock()
+		c.state = state.Clone()
+		c.meta = nextMeta
+		c.stateMu.Unlock()
+	}); err != nil {
 		return err
 	}
 	cause := []EventID{observationEvent.Meta.ID}
@@ -517,6 +602,9 @@ func (c *Controller) onTick(now time.Time) error {
 	if err := c.checkClock(now); err != nil {
 		return err
 	}
+	if err := c.refreshTransportHealth(now); err != nil {
+		return err
+	}
 	c.stateMu.RLock()
 	meta := c.meta
 	c.stateMu.RUnlock()
@@ -536,12 +624,24 @@ func (c *Controller) onTick(now time.Time) error {
 		if stale {
 			status = LivenessStale
 		}
+		var transportAge time.Duration
+		if meta.TransportCheckSequence > 0 {
+			transportAge = max(
+				c.clocks.since(now)-meta.LastTransportCheckMonotonic,
+				0,
+			)
+		}
 		if err := c.publish(LivenessEvent{
-			Meta:         c.nextHeaderAt("input", now, now, 0, nil, true),
-			State:        status,
-			LastObserved: meta.ObservedAt,
-			LastReceived: meta.ReceivedAt,
-			Age:          age,
+			Meta:                        c.nextHeaderAt("input", now, now, 0, nil, true),
+			State:                       status,
+			LastObserved:                meta.ObservedAt,
+			LastReceived:                meta.ReceivedAt,
+			Age:                         age,
+			LastStateChangeMonotonic:    meta.LastStateChangeMonotonic,
+			TransportCheckSequence:      meta.TransportCheckSequence,
+			LastTransportCheckMonotonic: meta.LastTransportCheckMonotonic,
+			TransportAge:                transportAge,
+			TransportSilenceVerifiable:  meta.TransportSilenceVerifiable,
 		}); err != nil {
 			return err
 		}
@@ -559,13 +659,88 @@ func (c *Controller) onTick(now time.Time) error {
 	return nil
 }
 
-func (c *Controller) neutralize(now time.Time, reason string) error {
+func (c *Controller) refreshTransportHealth(now time.Time) error {
+	if c.healthSource == nil {
+		return nil
+	}
+	health, err := readTransportHealth(c.healthSource)
+	if err != nil {
+		return err
+	}
+	c.transportSilenceVerifiable = health.SilenceVerifiable
+	if c.lastTransportHealthSequence > 0 &&
+		health.Sequence < c.lastTransportHealthSequence {
+		return fmt.Errorf(
+			"%w: transport health sequence regressed from %d to %d",
+			ErrInvalidState,
+			c.lastTransportHealthSequence,
+			health.Sequence,
+		)
+	}
+	if health.Sequence == 0 || health.Sequence == c.lastTransportHealthSequence {
+		c.stateMu.Lock()
+		c.meta.TransportSilenceVerifiable = health.SilenceVerifiable
+		if health.Sequence > 0 && !health.Connected {
+			c.meta.Connected = false
+		}
+		c.stateMu.Unlock()
+		if health.Sequence > 0 && !health.Connected {
+			return ErrDisconnected
+		}
+		return nil
+	}
+	checkedAt := health.CheckedAt
+	if checkedAt.IsZero() {
+		return fmt.Errorf(
+			"%w: transport health sequence %d has no check time",
+			ErrInvalidState,
+			health.Sequence,
+		)
+	}
+	checkedMonotonic := c.clocks.since(checkedAt)
+	nowMonotonic := c.clocks.since(now)
+	checkedMonotonic = min(max(checkedMonotonic, 0), nowMonotonic)
+	if c.lastTransportHealthSequence > 0 &&
+		checkedMonotonic < c.lastTransportHealthMonotonic {
+		return fmt.Errorf(
+			"%w: transport health time regressed from %s to %s",
+			ErrInvalidState,
+			c.lastTransportHealthMonotonic,
+			checkedMonotonic,
+		)
+	}
+	c.lastTransportHealthSequence = health.Sequence
+	c.lastTransportHealthMonotonic = checkedMonotonic
 	c.stateMu.Lock()
-	previous := c.state.Clone()
-	c.state = State{}
-	c.meta.Stale = true
-	c.meta.Synthetic = true
+	c.meta.LastTransportCheckMonotonic = max(
+		c.meta.LastTransportCheckMonotonic,
+		checkedMonotonic,
+	)
+	c.meta.TransportCheckSequence++
+	c.meta.TransportSilenceVerifiable = health.SilenceVerifiable
+	if !health.Connected {
+		c.meta.Connected = false
+	}
 	c.stateMu.Unlock()
+	if !health.Connected {
+		return ErrDisconnected
+	}
+	return nil
+}
+
+func readTransportHealth(source TransportHealthSource) (health TransportHealth, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%w: transport health: %v", ErrCallbackPanic, recovered)
+		}
+	}()
+	return source.TransportHealth(), nil
+}
+
+func (c *Controller) neutralize(now time.Time, reason string) error {
+	c.stateMu.RLock()
+	previous := c.state.Clone()
+	c.stateMu.RUnlock()
 
 	observation := ObservationEvent{
 		Meta: c.nextHeaderAt("input", now, now, 0, nil, true),
@@ -575,7 +750,15 @@ func (c *Controller) neutralize(now time.Time, reason string) error {
 		Previous: previous,
 		Current:  State{},
 	}
-	if err := c.publish(observation); err != nil {
+	if err := c.publishWithCommit(observation, func() {
+		c.stateMu.Lock()
+		c.state = State{}
+		c.meta.Stale = true
+		c.meta.Synthetic = true
+		c.meta.PublishedAt = observation.Meta.PublishedAt
+		c.meta.Sequence = observation.Meta.ID.Sequence
+		c.stateMu.Unlock()
+	}); err != nil {
 		return err
 	}
 	cause := []EventID{observation.Meta.ID}
@@ -586,10 +769,6 @@ func (c *Controller) neutralize(now time.Time, reason string) error {
 			return err
 		}
 	}
-	c.stateMu.Lock()
-	c.meta.PublishedAt = observation.Meta.PublishedAt
-	c.meta.Sequence = observation.Meta.ID.Sequence
-	c.stateMu.Unlock()
 	return nil
 }
 
@@ -629,6 +808,7 @@ func (c *Controller) terminate(err error) {
 	if err == nil {
 		err = ErrDisconnected
 	}
+	c.closeCommandAdmission()
 	// Publish commands the application already handed over. RecordCommand
 	// reports success once a command is queued, so discarding the queue here
 	// would silently drop a command from the record after telling the caller
@@ -668,6 +848,26 @@ func (c *Controller) terminate(err error) {
 	c.addTerminalError(c.waitSourceClose(deadline))
 }
 
+func (c *Controller) closeCommandAdmission() {
+	c.commandMu.Lock()
+	defer c.commandMu.Unlock()
+	if !c.commandAccepting {
+		return
+	}
+	c.commandAccepting = false
+	close(c.commandClosed)
+}
+
+func (c *Controller) signalCommandSpace() {
+	c.commandMu.Lock()
+	defer c.commandMu.Unlock()
+	if !c.commandAccepting {
+		return
+	}
+	close(c.commandSpace)
+	c.commandSpace = make(chan struct{})
+}
+
 // drainCommands publishes every command already accepted into the queue. It
 // uses terminal dispatch because the pipeline is shutting down and a failed
 // sink must not suppress delivery of the remainder.
@@ -675,7 +875,7 @@ func (c *Controller) drainCommands() {
 	for {
 		select {
 		case request := <-c.external:
-			c.publishTerminal(CommandEvent{
+			event := CommandEvent{
 				Meta: c.nextHeaderAt(
 					"command",
 					request.issuedAt,
@@ -688,7 +888,17 @@ func (c *Controller) drainCommands() {
 				Payload:    request.payload,
 				Authorized: request.command.Authorized,
 				Reason:     request.command.Reason,
-			})
+			}
+			c.publishTerminal(event)
+			if request.response != nil {
+				request.response <- commandResult{
+					id: event.Meta.ID,
+					err: errors.Join(
+						ErrCommandPublicationUncertain,
+						ErrClosed,
+					),
+				}
+			}
 		default:
 			return
 		}
@@ -707,8 +917,13 @@ func normalizeSourceError(err error, closing bool) error {
 
 func (c *Controller) tickInterval() time.Duration {
 	interval := time.Duration(0)
+	if c.healthSource != nil {
+		interval = advanceInterval
+	}
 	if c.options.livenessInterval > 0 {
-		interval = c.options.livenessInterval
+		if interval == 0 || c.options.livenessInterval < interval {
+			interval = c.options.livenessInterval
+		}
 	}
 	if c.options.staleAfter > 0 &&
 		(interval == 0 || c.options.staleAfter < interval) {
@@ -733,8 +948,10 @@ func (c *Controller) nextHeaderAt(
 	synthetic bool,
 ) Header {
 	c.eventMu.Lock()
-	c.sequences[stream]++
-	sequence := c.sequences[stream]
+	sequence := c.allocated.Expected(stream)
+	if sequence != 0 && !c.allocated.Advance(stream, sequence) {
+		sequence = 0
+	}
 	c.eventMu.Unlock()
 	if receivedAt.IsZero() {
 		receivedAt = c.clock.Now()
@@ -813,6 +1030,42 @@ func (c *Controller) publish(event Event) error {
 		return err
 	}
 	return c.processStages([]Event{event}, 0)
+}
+
+// publishWithCommit admits event to the evidence pipeline, applies commit,
+// exposes the event, and then runs processors in that order. Callers use it
+// when externally readable state must never get ahead of authoritative event
+// admission.
+func (c *Controller) publishWithCommit(event Event, commit func()) error {
+	if event == nil {
+		return nil
+	}
+	if err := c.dispatchWithMode(
+		event,
+		true,
+		c.options.synchronousAudit,
+		commit,
+	); err != nil {
+		return err
+	}
+	return c.processStages([]Event{event}, 0)
+}
+
+// publishSynchronous waits for the sink callback barrier for event before
+// exposing it to subscribers or processors. Per-sink FIFO ordering means that
+// every event admitted before event has also crossed that sink's callback
+// boundary when this returns successfully.
+func (c *Controller) publishSynchronous(event Event) error {
+	if event == nil {
+		return nil
+	}
+	if err := c.dispatchSynchronous(event, true); err != nil {
+		return err
+	}
+	if err := c.processStages([]Event{event}, 0); err != nil {
+		return errors.Join(ErrCommandPublicationUncertain, err)
+	}
+	return nil
 }
 
 func (c *Controller) publishTerminal(event Event) {
@@ -989,14 +1242,54 @@ func callGuarded(
 }
 
 func (c *Controller) dispatch(event Event, reportLoss bool) error {
-	dispatchErr := c.enqueueSinks(event)
-	if dispatchErr == nil {
-		// Record identity before subscribers can observe the event. This makes a
-		// command causally valid exactly when its caller can have received the
-		// event ID, without retaining mutable event payloads in the controller.
-		c.knownMu.Lock()
-		c.known[event.Header().ID] = struct{}{}
-		c.knownMu.Unlock()
+	return c.dispatchWithMode(
+		event,
+		reportLoss,
+		c.options.synchronousAudit,
+		nil,
+	)
+}
+
+func (c *Controller) dispatchSynchronous(event Event, reportLoss bool) error {
+	return c.dispatchWithMode(event, reportLoss, true, nil)
+}
+
+func (c *Controller) dispatchWithMode(
+	event Event,
+	reportLoss bool,
+	synchronous bool,
+	commit func(),
+) error {
+	id := event.Header().ID
+	identityErr := c.validateNextPublished(id)
+	if identityErr != nil && reportLoss {
+		return identityErr
+	}
+
+	var dispatchErr error
+	if synchronous {
+		dispatchErr = c.recordSinks(event)
+	} else {
+		dispatchErr = c.enqueueSinks(event)
+	}
+	if dispatchErr != nil && reportLoss {
+		// An authoritative sink that cannot accept the event invalidates the
+		// live path. Do not expose an activity to subscribers when the evidence
+		// pipeline has already reported that it cannot retain it.
+		return dispatchErr
+	}
+	if commit != nil {
+		commit()
+	}
+
+	// Advance the contiguous prefix before subscribers can observe the event.
+	// This makes a command causally valid exactly when its caller can have
+	// received the event ID, while retaining only one counter per stream.
+	if identityErr == nil {
+		identityErr = c.markPublished(id)
+		if identityErr != nil && reportLoss {
+			return identityErr
+		}
 	}
 
 	c.subsMu.Lock()
@@ -1058,13 +1351,66 @@ func (c *Controller) dispatch(event Event, reportLoss bool) error {
 }
 
 func (c *Controller) enqueueSinks(event Event) error {
+	_, err := c.admitSinkRecords(event, false)
+	return err
+}
+
+// recordSinks admits event to every sink and waits for every callback. Sink
+// callbacks remain bounded by the controller callback timeout.
+func (c *Controller) recordSinks(event Event) error {
+	completions, err := c.admitSinkRecords(event, true)
 	var result error
-	for _, sink := range c.sinks {
-		if err := sink.enqueue(cloneEvent(event)); err != nil {
-			result = errors.Join(result, err)
-		}
+	result = errors.Join(result, err)
+	for _, completion := range completions {
+		result = errors.Join(result, <-completion)
 	}
 	return result
+}
+
+func (c *Controller) admitSinkRecords(
+	event Event,
+	synchronous bool,
+) ([]<-chan error, error) {
+	var (
+		canonical    CanonicalEvent
+		hasCanonical bool
+	)
+	for _, sink := range c.sinks {
+		if sink.canonical != nil {
+			frozen, err := FreezeEvent(event)
+			if err != nil {
+				return nil, err
+			}
+			canonical = frozen
+			hasCanonical = true
+			break
+		}
+	}
+
+	completions := make([]<-chan error, 0, len(c.sinks))
+	var result error
+	for _, sink := range c.sinks {
+		record := sinkRecord{}
+		if sink.canonical != nil {
+			if !hasCanonical {
+				return completions, fmt.Errorf("%w: canonical sink without frozen event", ErrInvalidState)
+			}
+			record.canonical = canonical
+		} else {
+			record.event = cloneEvent(event)
+		}
+		if synchronous {
+			record.complete = make(chan error, 1)
+		}
+		if err := sink.enqueue(record); err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		if record.complete != nil {
+			completions = append(completions, record.complete)
+		}
+	}
+	return completions, result
 }
 
 func (c *Controller) recordSubscriptionGap(
@@ -1073,12 +1419,77 @@ func (c *Controller) recordSubscriptionGap(
 	reason string,
 ) error {
 	now := c.clock.Now()
-	return c.enqueueSinks(GapEvent{
-		Meta:    c.nextHeaderAt("input", now, now, 0, []EventID{cause.Header().ID}, true),
+	event := GapEvent{
+		// Delivery diagnostics use their own stream. A processor may reserve
+		// several input identities before the controller dispatches them; inserting
+		// a subscription gap into that reserved input range would break its
+		// contiguous publication order.
+		Meta:    c.nextHeaderAt("delivery", now, now, 0, []EventID{cause.Header().ID}, true),
 		Source:  "subscription",
 		Dropped: dropped,
 		Reason:  reason,
-	})
+	}
+	if err := c.validateNextPublished(event.Meta.ID); err != nil {
+		return err
+	}
+	var err error
+	if c.options.synchronousAudit {
+		err = c.recordSinks(event)
+	} else {
+		err = c.enqueueSinks(event)
+	}
+	if err != nil {
+		return err
+	}
+	return c.markPublished(event.Meta.ID)
+}
+
+func (c *Controller) validateNextPublished(id EventID) error {
+	if id.Session != c.session {
+		return fmt.Errorf(
+			"%w: event session %s does not match controller session %s",
+			ErrInvalidState,
+			id.Session,
+			c.session,
+		)
+	}
+	c.publishedMu.RLock()
+	want := c.published.Expected(id.Stream)
+	c.publishedMu.RUnlock()
+	if id.Stream == "" || id.Sequence == 0 {
+		return fmt.Errorf("%w: invalid event ID", ErrInvalidState)
+	}
+	if want == 0 {
+		return fmt.Errorf(
+			"%w: event stream limit %d reached or stream %q exhausted",
+			ErrInvalidState,
+			MaxEventStreamsPerSession,
+			id.Stream,
+		)
+	}
+	if id.Sequence != want {
+		return fmt.Errorf(
+			"%w: stream %q sequence %d follows %d",
+			ErrInvalidState,
+			id.Stream,
+			id.Sequence,
+			want-1,
+		)
+	}
+	return nil
+}
+
+func (c *Controller) markPublished(id EventID) error {
+	c.publishedMu.Lock()
+	defer c.publishedMu.Unlock()
+	if id.Session != c.session || !c.published.Advance(id.Stream, id.Sequence) {
+		return fmt.Errorf(
+			"%w: event %s does not extend the published stream prefix",
+			ErrInvalidState,
+			id,
+		)
+	}
+	return nil
 }
 
 func (c *Controller) requestFatal(err error) {
@@ -1211,7 +1622,8 @@ func (c *Controller) Close() error {
 type sinkRunner struct {
 	controller *Controller
 	sink       EventSink
-	queue      chan Event
+	canonical  CanonicalEventSink
+	queue      chan sinkRecord
 	done       chan struct{}
 	stopOnce   sync.Once
 
@@ -1219,29 +1631,49 @@ type sinkRunner struct {
 	err error
 }
 
+type sinkRecord struct {
+	event     Event
+	canonical CanonicalEvent
+	complete  chan error
+}
+
 func newSinkRunner(controller *Controller, sink EventSink, buffer int) *sinkRunner {
-	return &sinkRunner{
+	runner := &sinkRunner{
 		controller: controller,
 		sink:       sink,
-		queue:      make(chan Event, buffer),
+		queue:      make(chan sinkRecord, buffer),
 		done:       make(chan struct{}),
 	}
+	runner.canonical, _ = sink.(CanonicalEventSink)
+	return runner
 }
 
 func (runner *sinkRunner) run() {
 	defer close(runner.done)
-	for event := range runner.queue {
-		if err := runner.record(event); err != nil {
+	var failure error
+	for record := range runner.queue {
+		if failure == nil {
+			failure = runner.record(record)
+		}
+		if record.complete != nil {
+			record.complete <- failure
+			close(record.complete)
+		}
+		if failure != nil {
 			runner.mu.Lock()
-			runner.err = err
+			first := runner.err == nil
+			if first {
+				runner.err = failure
+			}
 			runner.mu.Unlock()
-			runner.controller.requestFatal(fmt.Errorf("record controller event: %w", err))
-			return
+			if first {
+				runner.controller.requestFatal(fmt.Errorf("record controller event: %w", failure))
+			}
 		}
 	}
 }
 
-func (runner *sinkRunner) record(event Event) error {
+func (runner *sinkRunner) record(record sinkRecord) error {
 	ctx, cancel := context.WithTimeout(
 		runner.controller.pipelineCtx,
 		runner.controller.options.callbackTimeout,
@@ -1256,7 +1688,11 @@ func (runner *sinkRunner) record(event Event) error {
 			}
 			result <- err
 		}()
-		err = runner.sink.Record(ctx, event)
+		if runner.canonical != nil {
+			err = runner.canonical.RecordCanonical(ctx, record.canonical)
+			return
+		}
+		err = runner.sink.Record(ctx, record.event)
 	}()
 	select {
 	case err := <-result:
@@ -1269,7 +1705,7 @@ func (runner *sinkRunner) record(event Event) error {
 	}
 }
 
-func (runner *sinkRunner) enqueue(event Event) error {
+func (runner *sinkRunner) enqueue(record sinkRecord) error {
 	runner.mu.Lock()
 	err := runner.err
 	runner.mu.Unlock()
@@ -1277,7 +1713,7 @@ func (runner *sinkRunner) enqueue(event Event) error {
 		return err
 	}
 	select {
-	case runner.queue <- event:
+	case runner.queue <- record:
 		return nil
 	default:
 		return ErrPipelineOverflow
@@ -1426,29 +1862,29 @@ func (s *eventSubscription) Close() error {
 
 func sanitizeState(state State) (State, bool) {
 	state = state.Clone()
-	changed := false
-	sanitize := func(value, minimum, maximum float32) float32 {
+	invalid := false
+	validate := func(value, minimum, maximum float32) {
 		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-			changed = true
-			return 0
+			invalid = true
+			return
 		}
-		clamped := Clamp(value, minimum, maximum)
-		if clamped != value {
-			changed = true
+		if value < minimum || value > maximum {
+			invalid = true
 		}
-		return clamped
 	}
-	state.LeftStick.X = sanitize(state.LeftStick.X, -1, 1)
-	state.LeftStick.Y = sanitize(state.LeftStick.Y, -1, 1)
-	state.RightStick.X = sanitize(state.RightStick.X, -1, 1)
-	state.RightStick.Y = sanitize(state.RightStick.Y, -1, 1)
-	state.LeftTrigger = sanitize(state.LeftTrigger, 0, 1)
-	state.RightTrigger = sanitize(state.RightTrigger, 0, 1)
+	validate(state.LeftStick.X, -1, 1)
+	validate(state.LeftStick.Y, -1, 1)
+	validate(state.RightStick.X, -1, 1)
+	validate(state.RightStick.Y, -1, 1)
+	validate(state.LeftTrigger, 0, 1)
+	validate(state.RightTrigger, 0, 1)
 	for id, pressed := range state.Buttons.Extensions {
 		if !pressed {
 			delete(state.Buttons.Extensions, id)
-			changed = true
 		}
 	}
-	return state, changed
+	if invalid {
+		return State{}, true
+	}
+	return state, false
 }

@@ -230,8 +230,9 @@ func inspectLinuxDevice(path string) (teleop.Descriptor, bool, error) {
 		VendorID:  inputID.Vendor,
 		ProductID: inputID.Product,
 		Properties: map[string]string{
-			"path":      path,
-			"real_path": realPath,
+			"path":                   path,
+			"real_path":              realPath,
+			"transport_health_scope": "fresh EVIOCGID evdev attachment check; not physical link response",
 		},
 		Capability: capability,
 	}, true, nil
@@ -279,27 +280,43 @@ func openPlatform(ctx context.Context, id teleop.DeviceID) (teleop.InputSource, 
 		initial:      true,
 		rumbleEffect: -1,
 	}
+	source.probeAttachment = func() error {
+		return linuxProbeAttachment(file)
+	}
 	if err := source.resync(); err != nil {
 		file.Close()
 		return nil, err
+	}
+	// Establish the capability before ingest begins. A busy controller may keep
+	// poll continuously readable and therefore never reach the timeout branch
+	// that performs periodic silence probes.
+	if err := source.checkEvdevAttachment(); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("initial evdev attachment probe: %w", err)
 	}
 	return source, nil
 }
 
 type linuxSource struct {
-	file         *os.File
-	descriptor   teleop.Descriptor
-	ranges       map[uint16]linuxAbsInfo
-	state        teleop.State
-	raw          bytes.Buffer
-	dropped      bool
-	initial      bool
-	closeOnce    sync.Once
-	closeMu      sync.RWMutex
-	closed       bool
-	closeErr     error
-	rumbleMu     sync.Mutex
-	rumbleEffect int16
+	file       *os.File
+	descriptor teleop.Descriptor
+	ranges     map[uint16]linuxAbsInfo
+	state      teleop.State
+	raw        bytes.Buffer
+	dropped    bool
+	initial    bool
+	closeOnce  sync.Once
+	closeMu    sync.RWMutex
+	closed     bool
+	closeErr   error
+	healthMu   sync.RWMutex
+	health     teleop.TransportHealth
+	// probeAttachment performs a fresh ioctl against the retained evdev file.
+	// It checks only that the kernel still recognizes that evdev attachment;
+	// it is not a challenge/response with a USB or wireless controller.
+	probeAttachment func() error
+	rumbleMu        sync.Mutex
+	rumbleEffect    int16
 
 	// pending holds bytes read from the device that do not yet form a complete
 	// event. The kernel can split an event across reads, so a decoder that
@@ -311,6 +328,69 @@ type linuxSource struct {
 
 func (s *linuxSource) Descriptor() teleop.Descriptor {
 	return s.descriptor.Clone()
+}
+
+func (s *linuxSource) TransportHealth() teleop.TransportHealth {
+	s.healthMu.RLock()
+	defer s.healthMu.RUnlock()
+	return s.health
+}
+
+func (s *linuxSource) updateTransportHealth(
+	checkedAt time.Time,
+	connected bool,
+	verifiable bool,
+) {
+	s.healthMu.Lock()
+	s.health.Sequence++
+	s.health.CheckedAt = checkedAt
+	s.health.Connected = connected
+	s.health.SilenceVerifiable = verifiable
+	s.healthMu.Unlock()
+}
+
+func linuxProbeAttachment(file *os.File) error {
+	if file == nil {
+		return os.ErrInvalid
+	}
+	var inputID linuxInputID
+	return linuxIOCTL(
+		file.Fd(),
+		linuxIOR('E', 0x02, unsafe.Sizeof(inputID)),
+		unsafe.Pointer(&inputID),
+	)
+}
+
+func (s *linuxSource) checkEvdevAttachment() error {
+	if s.probeAttachment == nil {
+		// A test or alternative construction without a real evdev probe must not
+		// turn timer expiry into a verifiable health claim.
+		s.healthMu.Lock()
+		s.health.SilenceVerifiable = false
+		s.healthMu.Unlock()
+		return nil
+	}
+	err := s.probeAttachment()
+	checkedAt := time.Now()
+	s.closeMu.RLock()
+	closed := s.closed
+	if err == nil {
+		s.updateTransportHealth(checkedAt, !closed, true)
+		s.closeMu.RUnlock()
+		if closed {
+			return teleop.ErrClosed
+		}
+		return nil
+	}
+	knownOutcome := closed ||
+		errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, syscall.EBADF) ||
+		errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.ENXIO) ||
+		errors.Is(err, syscall.EIO)
+	s.updateTransportHealth(checkedAt, false, knownOutcome)
+	s.closeMu.RUnlock()
+	return s.normalizeReadError(err)
 }
 
 func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
@@ -654,6 +734,7 @@ func (s *linuxSource) Close() error {
 		s.closeMu.Lock()
 		s.closed = true
 		s.closeMu.Unlock()
+		s.updateTransportHealth(time.Now(), false, s.probeAttachment != nil)
 		s.rumbleMu.Lock()
 		rumbleErr := s.stopRumbleLocked(true)
 		s.rumbleMu.Unlock()
@@ -691,7 +772,10 @@ func (s *linuxSource) waitReadable(ctx context.Context) error {
 		if deadline, ok := ctx.Deadline(); ok {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				return ctx.Err()
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return context.DeadlineExceeded
 			}
 			timeout = min(timeout, remaining)
 		}
@@ -708,16 +792,30 @@ func (s *linuxSource) waitReadable(ctx context.Context) error {
 			return s.normalizeReadError(err)
 		}
 		if ready == 0 {
+			if err := s.checkEvdevAttachment(); err != nil {
+				return err
+			}
 			continue
 		}
 		revents := pollFDs[0].Revents
 		if revents&unix.POLLNVAL != 0 {
+			s.updateTransportHealth(time.Now(), false, s.probeAttachment != nil)
 			if s.isClosed() {
 				return teleop.ErrClosed
 			}
 			return fmt.Errorf("%w: evdev descriptor is invalid", teleop.ErrDisconnected)
 		}
+		if revents&unix.POLLIN != 0 {
+			// A busy device may never reach the quiet-poll branch above. Keep the
+			// independent attachment evidence fresh before consuming that input too.
+			if err := s.checkEvdevAttachment(); err != nil {
+				return err
+			}
+		}
 		if revents&(unix.POLLIN|unix.POLLERR|unix.POLLHUP) != 0 {
+			if revents&(unix.POLLERR|unix.POLLHUP) != 0 {
+				s.updateTransportHealth(time.Now(), false, s.probeAttachment != nil)
+			}
 			return nil
 		}
 	}

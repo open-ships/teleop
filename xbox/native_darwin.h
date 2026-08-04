@@ -54,6 +54,7 @@ int teleop_gc_info_by_id(
 );
 void *teleop_gc_open(uint64_t identifier);
 int teleop_gc_next(void *opaque, teleop_gc_state *state, int timeout_ms);
+int teleop_gc_retained_controller_present(void *opaque);
 int teleop_gc_set_rumble(
     void *opaque,
     float low_frequency,

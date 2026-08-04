@@ -14,8 +14,9 @@
 // requires a public key obtained through a separate trusted channel and is the
 // preferred entry point for completed signed logs. [ReadAuthenticated] is the
 // corresponding entry point for completed HMAC-authenticated logs. [ReadAll]
-// verifies structural integrity and completeness but does not establish
-// authorship.
+// verifies structural integrity and requires a closing footer, but does not
+// establish authorship or prove that the producer observed every real-world
+// activity.
 //
 // When [VerifyOptions.PublicKey] or [VerifyOptions.RequireSignature] is set,
 // events are withheld from the streaming [Verify] callback until a verified

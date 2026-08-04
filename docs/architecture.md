@@ -9,23 +9,28 @@ OS controller API
 xbox device source
     ↕
 teleop.Controller
-    ├── authoritative EventSink (audit)
+    ├── immutable CanonicalEventSink → audit.Recorder → external witness
     ├── lossless subscription
-    └── latest-value subscription
-          ↓
-      gesture.Recognizer
-          ↓
-       action.Mapper
+    ├── latest-value subscription
+    └── safety.Authority → leased Actuator Command → acknowledgement
+              ↑
+        assured.Session owns composition and shutdown
 ```
 
 ## Package boundaries
 
 - `teleop` owns controller-neutral controls, states, rumble output, events,
-  subscriptions, provider interfaces, normalization, and lifecycle semantics.
+  immutable sink admission, subscriptions, provider interfaces, normalization,
+  transport-health metadata, and lifecycle semantics.
 - `xbox` supplies Xbox labels and selects the platform backend.
 - `gesture` derives temporal patterns without hiding canonical input.
 - `action` maps physical or gesture events to application-defined identifiers.
-- `audit` stores the event, command, and causality chain.
+- `safety` owns strict interlocks, the operator lifecycle state machine, Safety
+  Authority, expiring actuator leases, acknowledgement, and safe fallback.
+- `audit` stores and verifies the event, command, and causality chain; signs
+  tree heads and publishes witness checkpoints.
+- `assured` composes one controller, strict Guard, Safety Authority, durable
+  recorder, signer, witness, actuator, readiness policy, and ordered shutdown.
 - `testkit` supplies deterministic fake and replay sources.
 
 Attach recognizers and mappers with `teleop.WithProcessor`. Processors run in
@@ -38,13 +43,32 @@ connections are managed by the host operating system.
 ## Event guarantee
 
 Every observation delivered by an `InputSource` is accepted into each bounded
-authoritative-sink queue before it is published to subscriptions. Sink I/O is
-isolated from device ingest, so a durable recorder cannot add filesystem or
-`fsync` latency to the control path. If a sink fails, times out, or exhausts
-its queue, the controller terminates, publishes canonical neutral/release
-events to subscribers, and exposes the error through `Done`, `Err`, and
-`Close`. Acceptance does not mean the record is already durable when a
-subscriber receives the event.
+authoritative-sink queue before it is published to subscriptions or committed
+to `Snapshot`. For a `CanonicalEventSink`, the controller serializes and
+validates immutable bytes before queue handoff; later mutation of a third-party
+event cannot change the evidence. Sink I/O remains isolated from ordinary
+device ingest by default. `WithSynchronousAudit` instead waits for every sink
+callback before committing Snapshot state, exposing the event, or running
+processors. If admission or callback completion fails, the live event is not
+exposed and the controller terminates into its neutral terminal sequence.
+
+Queue acceptance is not durability. `Controller.RecordCommandSync` is the
+stronger barrier: it waits for every attached sink callback and, because each
+sink is FIFO, every earlier admitted event. `audit.Recorder` flushes and, when
+the writer supports `Sync`, synchronizes its store during that callback by
+default. Cancellation after controller-queue admission is explicitly
+indeterminate through
+`ErrCommandPublicationUncertain`; cancellation cannot retract already admitted
+work. `assured.Session` forces synchronous audit for every event, verifies the
+recorder's durable high-water mark, and only then exposes state or permits
+requested actuation.
+
+If a sink fails, times out, or exhausts its queue, the controller terminates,
+publishes canonical neutral/release events to subscribers, and exposes the
+error through `Done`, `Err`, and `Close`. Terminal subscriber delivery remains
+best effort even when the failed evidence sink cannot retain those final
+events; the Assured Session reports finalization failure instead of claiming a
+clean session.
 
 A lossless subscription never silently drops an event: only that subscription
 terminates with `teleop.ErrSubscriptionOverflow` if its configured queue is
@@ -57,13 +81,51 @@ Controller provide event-oriented streams. Windows XInput exposes sampled
 state, so its descriptors advertise `teleop.AuditSampledState`.
 
 These backends are change-driven: a control held steadily may produce no new
-observation. `SnapshotWithMeta` therefore exposes observation age without
-claiming that age proves transport failure. Confirmed disconnect always
-neutralizes state; age-based neutralization is an explicit application option.
+observation. `SnapshotWithMeta` separates state-change time, observation age,
+and independently sampled Transport Health. A `TransportHealthSource` advances
+a sequence after each fresh check at its documented OS/framework seam; silence
+is explicitly unverifiable when that capability is absent. Linux uses
+`EVIOCGID` to check that the kernel still recognizes the retained evdev
+attachment. macOS checks exact retained-controller membership in
+`GCController.controllers`. These checks expose OS/framework-reported
+connection and disconnect detection; they are not physical-device or radio
+challenge/response. Confirmed backend disconnect always neutralizes state;
+age-based neutralization is an explicit application option.
 Headers include a session-relative monotonic reading, and the controller emits
 `ClockEvent` if wall time steps materially relative to that reading. Application
-commands are injected through `GameController.RecordCommand` and receive a
-controller-owned event ID, preserving their causal place in the same stream.
+commands receive controller-owned IDs, preserving their causal place in the
+same stream.
+
+## Assured actuation guarantee
+
+`safety.Authority` serializes lifecycle and Apply operations so an Emergency
+Stop cannot race a stale Evaluate-to-actuator window. Each attempt records a
+decision and intent before sending a controller-session-bound, increasing
+sequence with a finite Command Lease. The receiver must enforce expiry and
+ordering. Send failure, rejection, timeout, missing/inconsistent application
+acknowledgement, evidence failure, or authority change selects a newer
+Engineered Safe State command.
+
+`assured.Session` is the production-oriented composition. It requires an exact
+backend stream, independently verifiable silence at the backend's documented
+OS/framework connection seam, strict maritime configuration, sync-capable
+exclusive evidence storage, Ed25519 signing, external witnessing, required
+application and caller-declared operator/authorization provenance, the
+effective teleop policy, applied acknowledgements, and a receiver-enforced
+actuator lease. Every admitted event crosses the local sync
+barrier before live exposure, startup requires the exact newly created
+checkpoint to be witnessed, and orderly close requires a witnessed signed
+footer. The raw controller, Guard, Recorder, and actuator are not exposed by
+the Session.
+
+The guarantee stops at the adapter seams. Hardware emergency stop, physical
+feedback, signer/witness custody, storage retention, clock trust, actuator
+lease enforcement, authenticated operator authorization, vessel-command
+mapping and limits, adapter identity/configuration retention, and
+vessel-specific safe-state analysis are deployment responsibilities. Authority
+preserves exact command bytes and input causality but does not interpret command
+semantics. A custom store's `Sync` result and an Anchor's successful return are
+adapter claims, not independently verifiable properties of this process.
 
 ## Extending teleop
 
@@ -83,6 +145,12 @@ Provider implementations should:
 6. Make `Close` idempotent and unblock `Read`.
 7. If rumble is advertised, accept concurrent `SetRumble` calls and stop both
    motors before `Close` releases the device.
+8. Implement `TransportHealthSource` only when the adapter can independently
+   and freshly check a documented OS/framework connection condition while
+   state is unchanged. Advance its sequence for each completed check, timestamp
+   it, report confirmed disconnection at that seam, and disclose detection
+   latency and what lies beyond the seam. Do not manufacture health from an
+   application timer or call an OS attachment check a physical-link response.
 
 Providers that can observe hotplug directly or by inexpensive polling may also
 implement `teleop.WatchingProvider`. Watching is explicit and owns no global

@@ -3,6 +3,7 @@ package teleop_test
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"sync"
 	"testing"
@@ -99,6 +100,78 @@ func TestDisconnectNeutralizesStateAndClosesControlEdges(t *testing.T) {
 			releasedTrigger,
 			disconnected,
 		)
+	}
+}
+
+func TestInvalidAnalogObservationNeutralizesWholeStateAndMarksFault(t *testing.T) {
+	tests := []struct {
+		name  string
+		state teleop.State
+	}{
+		{
+			name: "finite stick above range",
+			state: teleop.State{
+				LeftStick:    teleop.Stick{X: 1.01},
+				RightTrigger: 0.75,
+			},
+		},
+		{
+			name: "finite trigger below range",
+			state: teleop.State{
+				LeftStick:   teleop.Stick{Y: 0.75},
+				LeftTrigger: -0.01,
+			},
+		},
+		{
+			name: "nan",
+			state: teleop.State{
+				RightStick: teleop.Stick{X: float32(math.NaN())},
+			},
+		},
+		{
+			name: "infinity",
+			state: teleop.State{
+				RightTrigger: float32(math.Inf(1)),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.state.SetButton(teleop.ButtonFaceSouth, true)
+			source := testkit.NewFakeSource(teleop.Descriptor{ID: "invalid"}, 4)
+			controller, err := teleop.NewController(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = controller.Close() })
+			subscription, err := controller.Subscribe(teleop.SubscriptionOptions{Buffer: 16})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := source.Push(t.Context(), test.state); err != nil {
+				t.Fatal(err)
+			}
+			waitForSnapshot(t, controller, func(state teleop.State, meta teleop.StateMeta) bool {
+				return meta.Invalid && meta.Synthetic && reflect.DeepEqual(state, teleop.State{})
+			})
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			var foundError, foundObservation bool
+			for !foundError || !foundObservation {
+				event, err := subscription.Next(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch value := event.(type) {
+				case teleop.ErrorEvent:
+					foundError = foundError || errors.Is(value.Err, teleop.ErrInvalidState)
+				case teleop.ObservationEvent:
+					foundObservation = foundObservation ||
+						value.Meta.Synthetic && reflect.DeepEqual(value.Current, teleop.State{})
+				}
+			}
+		})
 	}
 }
 
@@ -659,6 +732,107 @@ func TestSlowSinkDoesNotDelayCanonicalSnapshot(t *testing.T) {
 	t.Fatalf("snapshot remained at %f while a slow sink drained", controller.Snapshot().LeftTrigger)
 }
 
+type blockingObservationSink struct {
+	entered chan teleop.ObservationEvent
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingObservationSink() *blockingObservationSink {
+	return &blockingObservationSink{
+		entered: make(chan teleop.ObservationEvent, 1),
+		release: make(chan struct{}),
+	}
+}
+
+func (sink *blockingObservationSink) Record(ctx context.Context, event teleop.Event) error {
+	observation, ok := event.(teleop.ObservationEvent)
+	if !ok || observation.Meta.Synthetic {
+		return nil
+	}
+	var result error
+	sink.once.Do(func() {
+		sink.entered <- observation
+		select {
+		case <-sink.release:
+		case <-ctx.Done():
+			result = ctx.Err()
+		}
+	})
+	return result
+}
+
+func TestSynchronousAuditBlocksStateAndSubscriberExposure(t *testing.T) {
+	source := testkit.NewFakeSource(teleop.Descriptor{ID: "sync-audit"}, 4)
+	sink := newBlockingObservationSink()
+	controller, err := teleop.NewController(
+		source,
+		teleop.WithAuditSink(sink),
+		teleop.WithSynchronousAudit(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-sink.release:
+		default:
+			close(sink.release)
+		}
+		_ = controller.Close()
+	})
+	waitForSnapshot(t, controller, func(_ teleop.State, meta teleop.StateMeta) bool {
+		return meta.Connected
+	})
+	subscription, err := controller.Subscribe(teleop.SubscriptionOptions{Buffer: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	for _, want := range []teleop.EventKind{teleop.EventConnection, teleop.EventCapabilities} {
+		event, nextErr := subscription.Next(ctx)
+		if nextErr != nil {
+			t.Fatal(nextErr)
+		}
+		if event.Kind() != want {
+			t.Fatalf("initial event kind = %s, want %s", event.Kind(), want)
+		}
+	}
+
+	if err := source.Push(ctx, teleop.State{RightTrigger: 0.8}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sink.entered:
+	case <-ctx.Done():
+		t.Fatalf("observation did not reach synchronous sink: %v", ctx.Err())
+	}
+	state, meta := controller.SnapshotWithMeta()
+	if state.RightTrigger != 0 || meta.Sequence != 0 {
+		t.Fatalf("snapshot advanced before sink completion: state=%#v meta=%#v", state, meta)
+	}
+	probeCtx, cancelProbe := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancelProbe()
+	if event, nextErr := subscription.Next(probeCtx); nextErr == nil {
+		t.Fatalf("subscriber observed event before sink completion: %#v", event)
+	} else if !errors.Is(nextErr, context.DeadlineExceeded) {
+		t.Fatalf("subscriber probe error = %v, want deadline", nextErr)
+	}
+
+	close(sink.release)
+	waitForSnapshot(t, controller, func(state teleop.State, meta teleop.StateMeta) bool {
+		return state.RightTrigger == 0.8 && meta.Sequence > 0
+	})
+	event, err := subscription.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Kind() != teleop.EventObservation {
+		t.Fatalf("released event kind = %s, want %s", event.Kind(), teleop.EventObservation)
+	}
+}
+
 type channelSink struct {
 	events chan teleop.Event
 }
@@ -734,6 +908,151 @@ func TestLivenessMarksAndNeutralizesStaleInput(t *testing.T) {
 	if !meta.Stale {
 		t.Fatal("synthetic neutralization refreshed physical input freshness")
 	}
+}
+
+func TestTransportHealthDistinguishesSteadyStateFromUnverifiedSilence(t *testing.T) {
+	source := testkit.NewFakeSource(teleop.Descriptor{ID: "transport-health"}, 4)
+	source.SetTransportHealth(teleop.TransportHealth{
+		Sequence:          1,
+		CheckedAt:         time.Now(),
+		Connected:         true,
+		SilenceVerifiable: true,
+	})
+	controller, err := teleop.NewController(
+		source,
+		teleop.WithLiveness(5*time.Millisecond, time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = controller.Close() })
+	subscription, err := controller.Subscribe(teleop.SubscriptionOptions{Buffer: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Push(t.Context(), teleop.State{LeftTrigger: 0.4}); err != nil {
+		t.Fatal(err)
+	}
+	waitForSnapshot(t, controller, func(state teleop.State, meta teleop.StateMeta) bool {
+		return state.LeftTrigger == 0.4 &&
+			meta.TransportSilenceVerifiable && meta.TransportCheckSequence > 1
+	})
+	_, before := controller.SnapshotWithMeta()
+
+	// The physical controls remain unchanged while an independent backend check
+	// proves the transport is still responsive.
+	source.SetTransportHealth(teleop.TransportHealth{
+		Sequence:          2,
+		CheckedAt:         time.Now(),
+		Connected:         true,
+		SilenceVerifiable: true,
+	})
+	waitForSnapshot(t, controller, func(state teleop.State, meta teleop.StateMeta) bool {
+		return state.LeftTrigger == 0.4 &&
+			meta.TransportCheckSequence > before.TransportCheckSequence &&
+			meta.LastStateChangeMonotonic == before.LastStateChangeMonotonic &&
+			meta.LastTransportCheckMonotonic >= before.LastTransportCheckMonotonic
+	})
+	_, after := controller.SnapshotWithMeta()
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	for {
+		event, nextErr := subscription.Next(ctx)
+		if nextErr != nil {
+			t.Fatal(nextErr)
+		}
+		liveness, ok := event.(teleop.LivenessEvent)
+		if !ok || liveness.TransportCheckSequence < after.TransportCheckSequence {
+			continue
+		}
+		if !liveness.TransportSilenceVerifiable ||
+			liveness.LastStateChangeMonotonic != after.LastStateChangeMonotonic ||
+			liveness.LastTransportCheckMonotonic != after.LastTransportCheckMonotonic ||
+			liveness.TransportAge < 0 {
+			t.Fatalf("liveness transport evidence = %+v, snapshot = %+v", liveness, after)
+		}
+		break
+	}
+
+	// A confirmed disconnect fails closed even if a buggy adapter forgot to
+	// advance its sequence for the final check.
+	source.SetTransportHealth(teleop.TransportHealth{
+		Sequence:          2,
+		CheckedAt:         time.Now(),
+		Connected:         false,
+		SilenceVerifiable: true,
+	})
+	select {
+	case <-controller.Done():
+	case <-time.After(time.Second):
+		t.Fatal("controller did not terminate on confirmed transport disconnect")
+	}
+	if !errors.Is(controller.Err(), teleop.ErrDisconnected) {
+		t.Fatalf("terminal error = %v, want ErrDisconnected", controller.Err())
+	}
+}
+
+type panicTransportHealthSource struct {
+	*testkit.FakeSource
+}
+
+func (*panicTransportHealthSource) TransportHealth() teleop.TransportHealth {
+	panic("transport health bug")
+}
+
+func TestTransportHealthPanicAndSequenceRegressionFailClosed(t *testing.T) {
+	t.Run("panic", func(t *testing.T) {
+		source := &panicTransportHealthSource{FakeSource: testkit.NewFakeSource(
+			teleop.Descriptor{ID: "transport-panic"},
+			1,
+		)}
+		controller, err := teleop.NewController(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = controller.Close() })
+		select {
+		case <-controller.Done():
+		case <-time.After(time.Second):
+			t.Fatal("controller did not terminate after TransportHealth panic")
+		}
+		if !errors.Is(controller.Err(), teleop.ErrCallbackPanic) {
+			t.Fatalf("terminal error = %v, want ErrCallbackPanic", controller.Err())
+		}
+	})
+
+	t.Run("sequence regression", func(t *testing.T) {
+		source := testkit.NewFakeSource(teleop.Descriptor{ID: "transport-regression"}, 1)
+		source.SetTransportHealth(teleop.TransportHealth{
+			Sequence:          7,
+			CheckedAt:         time.Now(),
+			Connected:         true,
+			SilenceVerifiable: true,
+		})
+		controller, err := teleop.NewController(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = controller.Close() })
+		waitForSnapshot(t, controller, func(_ teleop.State, meta teleop.StateMeta) bool {
+			return meta.TransportCheckSequence > 0
+		})
+		source.SetTransportHealth(teleop.TransportHealth{
+			Sequence:          6,
+			CheckedAt:         time.Now(),
+			Connected:         true,
+			SilenceVerifiable: true,
+		})
+		select {
+		case <-controller.Done():
+		case <-time.After(time.Second):
+			t.Fatal("controller did not terminate after transport sequence regression")
+		}
+		if !errors.Is(controller.Err(), teleop.ErrInvalidState) {
+			t.Fatalf("terminal error = %v, want ErrInvalidState", controller.Err())
+		}
+	})
 }
 
 func TestObservationAgeDoesNotNeutralizeWithoutExplicitOptIn(t *testing.T) {

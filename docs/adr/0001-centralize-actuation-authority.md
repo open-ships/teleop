@@ -1,0 +1,5 @@
+# Centralize hazardous actuation in an assured session
+
+Teleop will provide an **Assured Session** that owns a single **Safety Authority**, its **Evidence Session**, readiness checks, and shutdown ordering. Hazardous actuation crosses one serialized seam that persists intent before transmission, applies an expiring **Command Lease**, records acknowledgement or uncertainty, and selects a vessel-specific **Engineered Safe State** whenever authority cannot be proven; direct `Guard.Evaluate` and actuator calls remain low-level tools and are not the assured interface.
+
+This deliberately accepts synchronous evidence latency throughout an **Assured Session**: every admitted event crosses the local sink callback and durability barrier before live exposure, and actuation fails closed if that requirement cannot be met. Ordinary non-assured controllers retain buffered audit ingestion. Independent hardware emergency stop, actuator watchdog, feedback, and vessel safety analysis remain required because software process isolation cannot provide those physical guarantees.
