@@ -64,6 +64,12 @@ go get github.com/open-ships/teleop
 Pair or connect controllers through the host operating system first. The
 package does not implement Bluetooth or Xbox Wireless pairing.
 
+Releases follow semantic versioning. [`VERSION`](VERSION) declares the release
+baseline. After successful CI on the current `main` commit, the SHA-pinned
+shared Open Ships release policy publishes an annotated tag, deterministic
+source archive, checksums, SBOM, toolchain evidence, and separate
+build-provenance and SBOM attestations.
+
 ## Quick start
 
 Discover a controller, subscribe to its event stream, and consume normalized
