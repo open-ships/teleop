@@ -10,22 +10,18 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26.x"
-      - run: go test ./...
-      - run: go test ./...
-        env:
-          CGO_ENABLED: "0"
-      - if: runner.os == 'Linux'
-        run: go test -race ./...
-      - if: runner.os == 'Linux'
-        run: go test -coverprofile=coverage.out ./...
-      - if: runner.os == 'Linux'
-        run: test -z "$(gofmt -l .)"
-      - run: go vet ./...
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    uses: open-ships/ci/.github/workflows/check-go.yaml@95d4b3ed5452a99525c240688de146553e57cee0 # shared CI v1.2.0 candidate
+    with:
+      runner: ${{ matrix.os }}
+      command: |
+        go test ./...
+        CGO_ENABLED=0 go test ./...
+        if [ "$RUNNER_OS" = Linux ]; then
+          go test -race ./...
+          go test -coverprofile=coverage.out ./...
+          test -z "$(gofmt -l .)"
+        fi
+        go vet ./...
