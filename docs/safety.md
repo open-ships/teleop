@@ -1,9 +1,14 @@
 # Safety interlocks and assured actuation
 
 `teleop` transports a remote operator's intent. It cannot determine whether a
-particular vessel action is safe. For hazardous actuation, the recommended
+particular physical action is safe. For hazardous actuation, the recommended
 interface is an `assured.Session`: it owns one **Safety Authority**, its strict
-maritime interlocks, the actuator command path, and the **Evidence Session**.
+strict interlocks, the actuator command path, and the **Evidence Session**.
+
+These modules are optional. Controller input and auditing work independently
+for games, simulations, and other applications without specifying an actuator
+or safe state. The strict command seams are domain-neutral; the consuming
+system supplies meaning and validation. See [integration choices](integration.md).
 
 `safety.Guard` remains the low-level interlock primitive. Calling
 `Guard.Evaluate` and then calling an actuator separately leaves a race and an
@@ -15,7 +20,7 @@ back.
 > [!IMPORTANT]
 > These packages are not a certified safety controller. They do not replace an
 > independent hardware emergency stop, safety-rated interlocks, actuator-side
-> expiry, or a vessel-specific hazard analysis. A consumer game controller,
+> expiry, or a system-specific hazard analysis. A consumer game controller,
 > general-purpose operating system, and this process remain common-cause
 > failure domains.
 
@@ -52,7 +57,7 @@ macOS checks exact retained-controller membership in
 `GCController.controllers`. Neither is a physical-controller or radio
 challenge, and both inherit OS disconnect-detection latency.
 
-The strict maritime profile uses `TransportTimeout` as the silence deadline.
+The strict profile uses `TransportTimeout` as the silence deadline.
 It does not trip solely because an unchanged state has an old observation age,
 or because observation-age metadata is marked stale, while independent
 Transport Health remains fresh. If stale handling synthesizes a neutral
@@ -66,27 +71,27 @@ does not manufacture Transport Health. The legacy `safety.New` profile still
 uses `WithCommandTimeout` against observation age; a steady change-driven
 source can therefore time out under that profile.
 
-## Strict maritime profile
+## Domain-neutral strict profile
 
-Start from `safety.DefaultMaritimeConfig`, then replace its values with limits
-derived from the vessel hazard analysis:
+Start from `safety.DefaultStrictConfig`, then select values appropriate to the
+controlled system (from its hazard analysis for physical actuation):
 
 ```go
-maritime := safety.DefaultMaritimeConfig(xbox.RightBumper)
-maritime.CommandTimeout = 250 * time.Millisecond
-maritime.TransportTimeout = 150 * time.Millisecond
-maritime.LoopWatchdog = 100 * time.Millisecond
-maritime.DeadManReactuation = 30 * time.Second
-maritime.ArmStickTolerance = 0.05
-maritime.ArmTriggerTolerance = 0.02
+profile := safety.DefaultStrictConfig(xbox.RightBumper)
+profile.CommandTimeout = 250 * time.Millisecond
+profile.TransportTimeout = 150 * time.Millisecond
+profile.LoopWatchdog = 100 * time.Millisecond
+profile.DeadManReactuation = 30 * time.Second
+profile.ArmStickTolerance = 0.05
+profile.ArmTriggerTolerance = 0.02
 
-guard, err := safety.NewMaritime(maritime)
+guard, err := safety.NewStrict(profile)
 if err != nil {
     return err
 }
 ```
 
-`NewMaritime` rejects incomplete or weakening configuration rather than
+`NewStrict` rejects incomplete or weakening configuration rather than
 silently substituting permissive behavior. Configuration validation requires:
 
 - positive command, transport, loop-watchdog, and dead-man re-actuation
@@ -100,11 +105,16 @@ verifiable Transport Health at the source's documented seam and a timely
 control-loop heartbeat. Faults always latch; the strict profile cannot disable
 latching.
 
-`NewMaritime` requires a positive `CommandTimeout`, but strict authorization
+`NewStrict` requires a positive `CommandTimeout`, but strict authorization
 keeps `Decision.InputAge` diagnostic and uses independent Transport Health,
 rather than observation churn, to decide whether silence is safe. The legacy
 profile enforces `CommandTimeout` directly. Library defaults are starting
 points, not certified limits.
+
+`MaritimeConfig`, `DefaultMaritimeConfig`, and `NewMaritime` retain the original
+preset as compatibility spellings with identical strict behavior. In
+`assured.Config`, prefer `Safety: profile`; legacy `Maritime: profile` remains
+accepted, but setting both nonzero fields is an error.
 
 A Guard binds to one controller session only. It cannot carry armed state,
 dead-man history, or timing proof across a reconnect or operator handover.
@@ -166,8 +176,10 @@ The following fragment assumes:
   command limits;
 - `operatorID` and `voyageAuthorization` have been authenticated and enforced
   outside teleop; and
-- `requestedThrottle` has passed the vessel's mapping, range, rate/slew, and
-  mode policy.
+- `vesselPolicy` implements `safety.CommandPolicy` for the vessel's mapping,
+  units, limits, transitions, setpoint-rate limits and operator grants;
+- `policyConfiguration` retains its actual effective configuration and `ctx`
+  carries the current authenticated grant whenever live intent is submitted.
 
 ```go
 store, err := assured.CreateFileStore(evidencePath)
@@ -175,13 +187,13 @@ if err != nil {
     return err
 }
 
-maritime := safety.DefaultMaritimeConfig(xbox.RightBumper)
-maritime.CommandTimeout = 250 * time.Millisecond
-maritime.TransportTimeout = 150 * time.Millisecond
-maritime.LoopWatchdog = 100 * time.Millisecond
-maritime.DeadManReactuation = 30 * time.Second
+profile := safety.DefaultStrictConfig(xbox.RightBumper)
+profile.CommandTimeout = 250 * time.Millisecond
+profile.TransportTimeout = 150 * time.Millisecond
+profile.LoopWatchdog = 100 * time.Millisecond
+profile.DeadManReactuation = 30 * time.Second
 
-safeState := safety.VesselCommand{
+safeState := safety.Command{
     Name: "vessel.safe",
     Payload: map[string]any{
         "propulsion": 0,
@@ -200,16 +212,18 @@ session, err := assured.OpenProvider(ctx, provider, deviceID, assured.Config{
         Operator:           operatorID,
         Authorization:      voyageAuthorization,
         Config: map[string]any{
-            "maritime":              maritime,
+            "safety":                profile,
             "command_ttl":           commandTTL.String(),
             "engineered_safe_state": safeState,
+            "command_policy":        policyConfiguration,
         },
     },
-    Maritime: maritime,
+    Safety: profile,
     Authority: safety.AuthorityConfig{
         EngineeredSafeState:          safeState,
         CommandTTL:                   commandTTL,
         RequireAppliedAcknowledgment: true,
+        Policy:                       vesselPolicy,
     },
     Actuator:           actuator,
     CheckpointInterval: 2 * time.Second,
@@ -258,7 +272,7 @@ for {
     }
 
     result, err := session.Apply(ctx, safety.ApplyRequest{
-        Intent: safety.VesselCommand{
+        Intent: safety.Command{
             Name:    "propulsion.set",
             Payload: map[string]any{"throttle": requestedThrottle},
         },
@@ -324,14 +338,14 @@ earlier blocked Arm or Reset from overwriting a later safety request.
 
 `safety.Authority` is the minimum hazardous-output boundary, but assembling it
 correctly is a deployment responsibility. Production code must create a strict
-Guard with `NewMaritime`, pass it to `NewAuthorityWithGuard`, attach
+Guard with `NewStrict`, pass it to `NewAuthorityWithGuard`, attach
 `Authority.Processor()` before controller ingest starts, call `Authority.Bind`,
 and route every lifecycle operation and actuator request through Authority.
 Its `Evidence` adapter must not return success before the record crosses the
 required local durability barrier.
 
 `safety.NewAuthority` constructs the configurable legacy Guard and is not a
-replacement for `NewMaritime` in the strict path. Prefer `assured.OpenProvider`
+replacement for `NewStrict` in the strict path. Prefer `assured.OpenProvider`
 or `assured.OpenSource`; they validate and own the composition. If Assured
 Session readiness rejects a sampled audit backend, unverifiable transport,
 missing witness, or non-durable evidence store, do not silently downgrade a
@@ -423,9 +437,9 @@ assumptions:
   input is not automatically safe: stopping thrust may remove steerage, and
   centering steering may be wrong during docking or dynamic positioning.
 - Treat every `ApplyRequest.Intent` as application-defined output. Authority
-  preserves its exact bytes and input cause but does not validate actuator
-  mapping, sign, units, range/envelope, rate/slew, or current vessel mode.
-  Enforce those rules in a reviewed command-policy layer before `Apply` and
+  preserves its exact bytes and input cause and, in Assured Sessions, requires
+  a live `Authority.Policy` decision before intent. Configure that reviewed
+  policy to validate mapping, units, limits, mode and authenticated grants, and
   enforce safety-critical hard limits independently at the receiver. Retain the
   effective policy or a content-addressed copy in `Provenance.Config`.
 - `Provenance.Operator` and `Provenance.Authorization` are required recorded

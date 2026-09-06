@@ -315,8 +315,11 @@ type linuxSource struct {
 	// It checks only that the kernel still recognizes that evdev attachment;
 	// it is not a challenge/response with a USB or wireless controller.
 	probeAttachment func() error
-	rumbleMu        sync.Mutex
-	rumbleEffect    int16
+	// queryState is the per-source kernel seam used to test incomplete state
+	// reads. A nil value uses the retained evdev descriptor.
+	queryState   func(uintptr, unsafe.Pointer) error
+	rumbleMu     sync.Mutex
+	rumbleEffect int16
 
 	// pending holds bytes read from the device that do not yet form a complete
 	// event. The kernel can split an event across reads, so a decoder that
@@ -354,11 +357,31 @@ func linuxProbeAttachment(file *os.File) error {
 		return os.ErrInvalid
 	}
 	var inputID linuxInputID
-	return linuxIOCTL(
-		file.Fd(),
+	return linuxFileIOCTL(
+		file,
 		linuxIOR('E', 0x02, unsafe.Sizeof(inputID)),
 		unsafe.Pointer(&inputID),
 	)
+}
+
+// Pin the descriptor for the entire syscall. File.Fd races Close and can let
+// descriptor reuse target an unrelated device between lookup and ioctl/poll.
+// RawConn.Control keeps the file alive and preserves runtime poller ownership.
+func linuxFileControl(file *os.File, call func(uintptr) error) error {
+	if file == nil {
+		return os.ErrInvalid
+	}
+	raw, err := file.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var callErr error
+	controlErr := raw.Control(func(fd uintptr) { callErr = call(fd) })
+	return errors.Join(controlErr, callErr)
+}
+
+func linuxFileIOCTL(file *os.File, request uintptr, value unsafe.Pointer) error {
+	return linuxFileControl(file, func(fd uintptr) error { return linuxIOCTL(fd, request, value) })
 }
 
 func (s *linuxSource) checkEvdevAttachment() error {
@@ -407,6 +430,7 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 			ObservedAt: time.Now(),
 			Native: teleop.NativeInput{
 				Format: "linux-evdev-initial-state",
+				Fields: s.axisMetadata(),
 			},
 		}, nil
 	}
@@ -439,6 +463,7 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 					Native: teleop.NativeInput{
 						Format: "linux-evdev",
 						Data:   raw,
+						Fields: s.axisMetadata(),
 					},
 					Gap: &teleop.SourceGap{
 						Dropped: 1, // SYN_DROPPED proves at least one event was lost.
@@ -449,7 +474,9 @@ func (s *linuxSource) Read(ctx context.Context) (teleop.Observation, error) {
 			continue
 		}
 
-		s.apply(event)
+		if err := s.apply(event); err != nil {
+			return teleop.Observation{}, err
+		}
 		if event.Type == evSyn && event.Code == synReport {
 			raw := slices.Clone(s.raw.Bytes())
 			s.raw.Reset()
@@ -508,8 +535,8 @@ func (s *linuxSource) nextEvent(ctx context.Context) (linuxInputEvent, error) {
 			s.scratch = make([]byte, size*linuxReadBatchEvents)
 		}
 		// Bound the read when the descriptor supports deadlines. This is best
-		// effort: an evdev device does not, because the capability ioctls need
-		// a raw descriptor and take it out of the runtime poller. Clearing a
+		// effort: not every device supports runtime deadlines. Our capability
+		// ioctls retain runtime poller ownership through RawConn.Control. Clearing a
 		// stale deadline matters as much as setting one, since a deadline left
 		// over from an earlier canceled call would fire against a live read.
 		if deadline, ok := ctx.Deadline(); ok {
@@ -559,16 +586,22 @@ func (s *linuxSource) appendRaw(event linuxInputEvent) {
 	}
 }
 
-func (s *linuxSource) apply(event linuxInputEvent) {
+func (s *linuxSource) apply(event linuxInputEvent) error {
 	switch event.Type {
 	case evKey:
 		if control, ok := linuxKeyControl(event.Code); ok {
+			if event.Value < 0 || event.Value > 2 {
+				return fmt.Errorf("%w: evdev key %#x value %d", teleop.ErrInvalidState, event.Code, event.Value)
+			}
 			s.state.SetButton(control, event.Value != 0)
 		}
 	case evAbs:
 		info, known := s.ranges[event.Code]
 		if !known {
-			return
+			return nil
+		}
+		if err := validateLinuxAxis(event.Code, event.Value, info); err != nil {
+			return err
 		}
 		switch event.Code {
 		case absX:
@@ -591,6 +624,33 @@ func (s *linuxSource) apply(event linuxInputEvent) {
 			s.state.DPad.Down = event.Value > 0
 		}
 	}
+	return nil
+}
+
+// Kernel min/max values are calibration metadata, not enforced limits. Never
+// silently turn an implausible reading into full-scale intent. Deployments
+// with endpoint overshoot must validate and correct their driver calibration.
+func validateLinuxAxis(code uint16, value int32, info linuxAbsInfo) error {
+	if info.Maximum <= info.Minimum || value < info.Minimum || value > info.Maximum {
+		return fmt.Errorf("%w: evdev axis %#x value %d outside valid range [%d,%d]",
+			teleop.ErrInvalidState, code, value, info.Minimum, info.Maximum)
+	}
+	if (code == absHat0X || code == absHat0Y) &&
+		(info.Minimum != -1 || info.Maximum != 1 || value < -1 || value > 1) {
+		return fmt.Errorf("%w: evdev hat %#x must use [-1,1]", teleop.ErrInvalidState, code)
+	}
+	return nil
+}
+
+func (s *linuxSource) axisMetadata() map[string]int64 {
+	fields := make(map[string]int64, len(s.ranges)*3)
+	for code, info := range s.ranges {
+		prefix := fmt.Sprintf("axis.%d.", code)
+		fields[prefix+"minimum"] = int64(info.Minimum)
+		fields[prefix+"maximum"] = int64(info.Maximum)
+		fields[prefix+"value"] = int64(info.Value)
+	}
+	return fields
 }
 
 func (s *linuxSource) SetRumble(ctx context.Context, rumble teleop.Rumble) error {
@@ -616,8 +676,8 @@ func (s *linuxSource) SetRumble(ctx context.Context, rumble teleop.Rumble) error
 	}
 
 	effect := newLinuxRumbleEffect(s.rumbleEffect, rumble)
-	if err := linuxIOCTL(
-		s.file.Fd(),
+	if err := linuxFileIOCTL(
+		s.file,
 		linuxIOW('E', 0x80, unsafe.Sizeof(effect)),
 		unsafe.Pointer(&effect),
 	); err != nil {
@@ -676,7 +736,7 @@ func (s *linuxSource) stopRumbleLocked(remove bool) error {
 	}
 	if remove {
 		request := linuxIOW('E', 0x81, unsafe.Sizeof(int32(0)))
-		if err := linuxIOCTLValue(s.file.Fd(), request, uintptr(s.rumbleEffect)); err != nil {
+		if err := linuxFileControl(s.file, func(fd uintptr) error { return linuxIOCTLValue(fd, request, uintptr(s.rumbleEffect)) }); err != nil {
 			result = errors.Join(result, err)
 		} else {
 			s.rumbleEffect = -1
@@ -703,29 +763,40 @@ func (s *linuxSource) normalizeRumbleError(err error) error {
 }
 
 func (s *linuxSource) resync() error {
+	query := s.queryState
+	if query == nil {
+		query = func(request uintptr, value unsafe.Pointer) error {
+			return linuxFileIOCTL(s.file, request, value)
+		}
+	}
 	keys := make([]byte, 96)
-	if err := linuxIOCTLBytes(s.file.Fd(), linuxIOR('E', 0x18, uintptr(len(keys))), keys); err != nil {
+	if err := query(linuxIOR('E', 0x18, uintptr(len(keys))), unsafe.Pointer(&keys[0])); err != nil {
 		return fmt.Errorf("query controller key state: %w", err)
 	}
+	// Commit only after every required axis and digital state has been read and
+	// validated. A partially refreshed snapshot is never a neutral baseline.
+	next := linuxSource{ranges: make(map[uint16]linuxAbsInfo, len(s.ranges))}
 	digital := make(map[teleop.ControlID]bool)
 	for code, control := range linuxKeyControls() {
 		digital[control] = digital[control] || linuxBit(keys, code)
 	}
 	for control, pressed := range digital {
-		s.state.SetButton(control, pressed)
+		next.state.SetButton(control, pressed)
 	}
 	for code := range s.ranges {
 		var info linuxAbsInfo
-		if err := linuxIOCTL(
-			s.file.Fd(),
+		if err := query(
 			linuxIOR('E', uintptr(0x40+code), unsafe.Sizeof(info)),
 			unsafe.Pointer(&info),
 		); err != nil {
-			continue
+			return fmt.Errorf("query required controller axis %#x: %w", code, err)
 		}
-		s.ranges[code] = info
-		s.apply(linuxInputEvent{Type: evAbs, Code: code, Value: info.Value})
+		next.ranges[code] = info
+		if err := next.apply(linuxInputEvent{Type: evAbs, Code: code, Value: info.Value}); err != nil {
+			return err
+		}
 	}
+	s.state, s.ranges = next.state, next.ranges
 	return nil
 }
 
@@ -780,11 +851,14 @@ func (s *linuxSource) waitReadable(ctx context.Context) error {
 			timeout = min(timeout, remaining)
 		}
 		timeoutMillis := int((timeout + time.Millisecond - 1) / time.Millisecond)
-		pollFDs := []unix.PollFd{{
-			Fd:     int32(s.file.Fd()),
-			Events: unix.POLLIN,
-		}}
-		ready, err := unix.Poll(pollFDs, timeoutMillis)
+		var pollFDs []unix.PollFd
+		var ready int
+		err := linuxFileControl(s.file, func(fd uintptr) error {
+			pollFDs = []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+			var pollErr error
+			ready, pollErr = unix.Poll(pollFDs, timeoutMillis)
+			return pollErr
+		})
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
@@ -840,11 +914,11 @@ func (s *linuxSource) normalizeReadError(err error) error {
 
 func linuxCapabilities(file *os.File) (map[teleop.ControlID]bool, map[uint16]linuxAbsInfo, error) {
 	keys := make([]byte, 96)
-	if err := linuxIOCTLBytes(file.Fd(), linuxIOR('E', 0x20+evKey, uintptr(len(keys))), keys); err != nil {
+	if err := linuxFileIOCTL(file, linuxIOR('E', 0x20+evKey, uintptr(len(keys))), unsafe.Pointer(&keys[0])); err != nil {
 		return nil, nil, err
 	}
 	absolute := make([]byte, 16)
-	if err := linuxIOCTLBytes(file.Fd(), linuxIOR('E', 0x20+evAbs, uintptr(len(absolute))), absolute); err != nil {
+	if err := linuxFileIOCTL(file, linuxIOR('E', 0x20+evAbs, uintptr(len(absolute))), unsafe.Pointer(&absolute[0])); err != nil {
 		return nil, nil, err
 	}
 	supported := make(map[teleop.ControlID]bool)
@@ -859,12 +933,23 @@ func linuxCapabilities(file *os.File) (map[teleop.ControlID]bool, map[uint16]lin
 			continue
 		}
 		var info linuxAbsInfo
-		if err := linuxIOCTL(
-			file.Fd(),
+		if err := linuxFileIOCTL(
+			file,
 			linuxIOR('E', uintptr(0x40+code), unsafe.Sizeof(info)),
 			unsafe.Pointer(&info),
-		); err == nil {
-			ranges[code] = info
+		); err != nil {
+			return nil, nil, fmt.Errorf("query advertised controller axis %#x: %w", code, err)
+		}
+		if err := validateLinuxAxis(code, info.Value, info); err != nil {
+			return nil, nil, err
+		}
+		ranges[code] = info
+	}
+	for _, pair := range [][2]uint16{{absX, absY}, {absRX, absRY}} {
+		_, x := ranges[pair[0]]
+		_, y := ranges[pair[1]]
+		if x != y {
+			return nil, nil, fmt.Errorf("%w: incomplete evdev stick axes %#x/%#x", teleop.ErrInvalidState, pair[0], pair[1])
 		}
 	}
 	if _, ok := ranges[absX]; ok {
@@ -892,10 +977,10 @@ func linuxCapabilities(file *os.File) (map[teleop.ControlID]bool, map[uint16]lin
 
 func linuxRumbleSupported(file *os.File) bool {
 	feedback := make([]byte, ffMax/8+1)
-	if err := linuxIOCTLBytes(
-		file.Fd(),
+	if err := linuxFileIOCTL(
+		file,
 		linuxIOR('E', 0x20+evFF, uintptr(len(feedback))),
-		feedback,
+		unsafe.Pointer(&feedback[0]),
 	); err != nil {
 		return false
 	}

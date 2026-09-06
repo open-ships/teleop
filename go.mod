@@ -2,6 +2,8 @@ module github.com/open-ships/teleop
 
 go 1.26.0
 
+toolchain go1.26.8
+
 require (
 	charm.land/bubbletea/v2 v2.0.8
 	charm.land/lipgloss/v2 v2.0.5

@@ -3,6 +3,11 @@
 Teleop separates controller-independent application code from controller- and
 operating-system-specific input and feedback output.
 
+Controller input and `audit` work without actuation. `safety` and `assured`
+are optional modules; `assured` retains a strict contract rather than selecting
+weaker behavior based on whether an adapter controls a boat, car, or game.
+See [integration choices and compatibility](integration.md).
+
 ```text
 OS controller API
     ↕
@@ -12,9 +17,9 @@ teleop.Controller
     ├── immutable CanonicalEventSink → audit.Recorder → external witness
     ├── lossless subscription
     ├── latest-value subscription
-    └── safety.Authority → leased Actuator Command → acknowledgement
+    └── optional safety.Authority → leased Actuator Command → acknowledgement
               ↑
-        assured.Session owns composition and shutdown
+        optional assured.Session owns strict composition and shutdown
 ```
 
 ## Package boundaries
@@ -108,10 +113,10 @@ Engineered Safe State command.
 
 `assured.Session` is the production-oriented composition. It requires an exact
 backend stream, independently verifiable silence at the backend's documented
-OS/framework connection seam, strict maritime configuration, sync-capable
+OS/framework connection seam, domain-neutral `safety.StrictConfig`, sync-capable
 exclusive evidence storage, Ed25519 signing, external witnessing, required
 application and caller-declared operator/authorization provenance, the
-effective teleop policy, applied acknowledgements, and a receiver-enforced
+effective teleop policy, a live-command `Authority.Policy`, applied acknowledgements, and a receiver-enforced
 actuator lease. Every admitted event crosses the local sync
 barrier before live exposure, startup requires the exact newly created
 checkpoint to be witnessed, and orderly close requires a witnessed signed
@@ -120,12 +125,20 @@ the Session.
 
 The guarantee stops at the adapter seams. Hardware emergency stop, physical
 feedback, signer/witness custody, storage retention, clock trust, actuator
-lease enforcement, authenticated operator authorization, vessel-command
+lease enforcement, authenticated operator authorization, system-command
 mapping and limits, adapter identity/configuration retention, and
-vessel-specific safe-state analysis are deployment responsibilities. Authority
-preserves exact command bytes and input causality but does not interpret command
-semantics. A custom store's `Sync` result and an Anchor's successful return are
+system-specific safe-state analysis are deployment responsibilities. Authority
+preserves exact command bytes and input causality and delegates semantic checks
+to the required policy adapter. Its reference implementation has strict scalar
+limits and independently signed grants, not built-in vehicle limits. A custom
+policy's permission, store's `Sync` result and Anchor's successful return are
 adapter claims, not independently verifiable properties of this process.
+
+Assured `Config.Processors` supports ordered gesture/action composition after
+the authority processor; exact instances and order are attested. Startup
+contexts do not own an established session: `Session.Close` owns evidenced
+shutdown. `simulation.Receiver` is an explicit deterministic reference model;
+manual-clock construction never weakens Assured's system-clock requirement.
 
 ## Extending teleop
 

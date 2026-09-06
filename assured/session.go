@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -33,12 +34,15 @@ var (
 const ProvenanceConfigKey = "teleop.assured.v1"
 
 type assuredProvenanceProfile struct {
-	Maritime  assuredMaritimeProfile  `json:"maritime"`
-	Authority assuredAuthorityProfile `json:"authority"`
-	Evidence  assuredEvidenceProfile  `json:"evidence"`
+	// The v1 wire spelling is retained for existing incident tooling. It records
+	// the effective strict profile for both Config.Safety and legacy Maritime.
+	Maritime   assuredSafetyProfile    `json:"maritime"`
+	Authority  assuredAuthorityProfile `json:"authority"`
+	Evidence   assuredEvidenceProfile  `json:"evidence"`
+	Processors []string                `json:"processors,omitempty"`
 }
 
-type assuredMaritimeProfile struct {
+type assuredSafetyProfile struct {
 	CommandTimeout      time.Duration    `json:"command_timeout_ns"`
 	TransportTimeout    time.Duration    `json:"transport_timeout_ns"`
 	DeadMan             teleop.ControlID `json:"dead_man"`
@@ -49,6 +53,7 @@ type assuredMaritimeProfile struct {
 }
 
 type assuredAuthorityProfile struct {
+	PolicyType                   string             `json:"policy_type"`
 	EngineeredSafeState          assuredSafeCommand `json:"engineered_safe_state"`
 	CommandTTL                   time.Duration      `json:"command_ttl_ns"`
 	RequireAppliedAcknowledgment bool               `json:"require_applied_acknowledgment"`
@@ -79,7 +84,7 @@ type assuredEvidenceProfile struct {
 //
 // An Assured Session deliberately has no permissive defaults. In particular,
 // it requires an Ed25519 signer, an external Anchor in a separate custody
-// domain, required application/operator provenance fields, a strict maritime Guard,
+// domain, required application/operator provenance fields, a strict Guard,
 // a receiver-enforced actuator lease, and sync-capable local evidence.
 type Config struct {
 	// EvidenceStore is the sync-capable local journal. Signer authenticates its
@@ -92,12 +97,22 @@ type Config struct {
 	// ProvenanceConfigKey and injects its normalized effective control profile.
 	Provenance audit.Provenance
 
-	// Maritime is the validated strict interlock profile. Authority supplies
-	// its engineered safe command and receiver lease; Actuator is the sole
-	// system-under-control output adapter.
-	Maritime  safety.MaritimeConfig
+	// Safety is the validated, domain-neutral strict interlock profile.
+	// Set either Safety or legacy Maritime, never both. Values are not merged.
+	Safety safety.StrictConfig
+	// Maritime is the original spelling of Safety. Its guarantees are identical.
+	//
+	// Deprecated: use Safety.
+	Maritime safety.MaritimeConfig
+	// Authority supplies the application-defined safe command and receiver
+	// lease; Actuator is the sole system-under-control output adapter.
 	Authority safety.AuthorityConfig
 	Actuator  safety.Actuator
+	// Processors run after Safety Authority and in the given order (for example,
+	// gestures then actions). Instances must be non-nil pointers. Their exact
+	// identities and order are sealed; application configuration must retain
+	// their effective bindings and thresholds in Provenance.Config.
+	Processors []teleop.Processor
 
 	// CheckpointInterval controls how often locally durable evidence is signed
 	// and offered to the external witness while the recorder is healthy.
@@ -140,9 +155,14 @@ type Session struct {
 	closeErr  error
 }
 
+// ID exposes the immutable session identity for independently issued operator
+// grants. It grants no access to the controller or output adapter.
+func (session *Session) ID() teleop.SessionID { return session.authority.Session() }
+
 // OpenSource opens source with the Recorder and Authority processor attached
 // before ingest starts. Exact-backend audit delivery and independently
-// verifiable transport health are mandatory.
+// verifiable transport health are mandatory. ctx bounds startup; the returned
+// Session owns its lifetime through Close, including evidenced safe shutdown.
 func OpenSource(
 	ctx context.Context,
 	source teleop.InputSource,
@@ -176,6 +196,7 @@ func OpenSource(
 // controller. The provider must return the concrete *teleop.Controller created
 // with the supplied options; wrappers cannot prove that Assured's recorder,
 // processor, clock, and synchronous barriers are the ones serving the Session.
+// ctx bounds startup; use Session.Close for the returned session's lifetime.
 func OpenProvider(
 	ctx context.Context,
 	provider teleop.Provider,
@@ -227,7 +248,7 @@ func open(
 		audit.WithCheckpoints(config.CheckpointInterval, checkpointEvery),
 	)
 	bridge := &evidenceBridge{recorder: recorder}
-	guard, err := safety.NewMaritime(config.Maritime)
+	guard, err := safety.NewStrict(config.Safety)
 	if err != nil {
 		return nil, errors.Join(err, closeUnopened(config.EvidenceStore, recorder))
 	}
@@ -241,11 +262,12 @@ func open(
 		return nil, errors.Join(err, closeUnopened(config.EvidenceStore, recorder))
 	}
 
-	livenessInterval := assuredLivenessInterval(config.Maritime)
+	livenessInterval := assuredLivenessInterval(config.Safety)
 	processor := authority.Processor()
+	processors := append([]teleop.Processor{processor}, config.Processors...)
 	attestation, err := teleop.NewPipelineAttestation(teleop.PipelineRequirements{
 		AuditSinks:       []teleop.EventSink{recorder},
-		Processors:       []teleop.Processor{processor},
+		Processors:       processors,
 		SynchronousAudit: true,
 		LivenessInterval: livenessInterval,
 		ShutdownTimeout:  config.ShutdownTimeout,
@@ -262,10 +284,16 @@ func open(
 		// transport timeout so it cannot be disabled or weakened by callers.
 		teleop.WithLiveness(livenessInterval, 0),
 		teleop.WithShutdownTimeout(config.ShutdownTimeout),
-		// The seal must remain last: it stamps only the exact effective pipeline
-		// above, and Controller.AttestPipeline detects later overrides.
-		attestation.Option(),
+		// Providers commonly bind their Open context to controller lifetime.
+		// Assured owns ordered shutdown itself; explicitly select the lifetime
+		// required by the seal instead of relying on provider defaults.
+		teleop.WithContext(context.Background()),
 	}
+	for _, additional := range config.Processors {
+		required = append(required, teleop.WithProcessor(additional))
+	}
+	// The seal must remain last; all configured processors participate.
+	required = append(required, attestation.Option())
 	opened, openErr := callControllerOpener(opener, required)
 	if openErr != nil {
 		return nil, errors.Join(openErr, closeUnopened(config.EvidenceStore, recorder))
@@ -318,7 +346,7 @@ func open(
 		shutdownTimeout: config.ShutdownTimeout,
 		closeDone:       make(chan struct{}),
 	}
-	if err := waitForTransport(ctx, controller, config.Maritime.TransportTimeout); err != nil {
+	if err := waitForTransport(ctx, controller, config.Safety.TransportTimeout); err != nil {
 		return nil, errors.Join(err, session.closeNow())
 	}
 	if err := bindAuthority(ctx, authority, controller); err != nil {
@@ -653,7 +681,14 @@ func (bridge *evidenceBridge) Commit(
 	causes := append([]teleop.EventID(nil), record.Causes...)
 	bridge.mu.RLock()
 	parent, parentKnown := bridge.identities[record.ParentID]
+	pendingParents := len(bridge.identities)
 	bridge.mu.RUnlock()
+	// Authority is serialized, so healthy traffic has only a handful of open
+	// chains. Repeated partially recorded failures must fail closed, not grow
+	// unbounded bookkeeping or evict identities and silently lose causality.
+	if pendingParents >= maxPendingEvidenceParents && !parentKnown && evidenceCanBeParent(record.Kind) {
+		return "", fmt.Errorf("%w: too many unfinished authority evidence chains", ErrEvidenceNotDurable)
+	}
 	if parentKnown && !containsEventID(causes, parent) {
 		causes = append(causes, parent)
 	}
@@ -671,6 +706,8 @@ func (bridge *evidenceBridge) Commit(
 	bridge.advanceIdentity(record.Kind, record.ParentID, evidenceID, id)
 	return evidenceID, nil
 }
+
+const maxPendingEvidenceParents = 64
 
 func (bridge *evidenceBridge) advanceIdentity(
 	kind safety.EvidenceKind,
@@ -786,6 +823,9 @@ func (bridge *evidenceBridge) recordTerminalCommand(
 }
 
 func evidenceAuthorized(record safety.EvidenceRecord) bool {
+	if record.Policy != nil {
+		return record.Policy.Permit && record.Decision != nil && record.Decision.Permit
+	}
 	if record.Actuator != nil {
 		return !record.Actuator.Fallback
 	}
@@ -832,6 +872,16 @@ func containsEventID(ids []teleop.EventID, target teleop.EventID) bool {
 // only frozen safe-state bytes and JSON-native provenance, so the Recorder and
 // Authority cannot observe different results from a stateful Marshaler.
 func prepareConfig(config Config) (Config, error) {
+	// Resolve the compatibility spelling once, before validation or callbacks.
+	// Reject dual configuration even when equal: no precedence or field merging
+	// may silently change the interlocks that are validated and recorded.
+	if config.Maritime != (safety.StrictConfig{}) {
+		if config.Safety != (safety.StrictConfig{}) {
+			return Config{}, fmt.Errorf("%w: set either Safety or Maritime, not both", ErrInvalidConfig)
+		}
+		config.Safety = config.Maritime
+		config.Maritime = safety.MaritimeConfig{}
+	}
 	if err := validateConfig(config); err != nil {
 		return Config{}, err
 	}
@@ -861,21 +911,28 @@ func prepareConfig(config Config) (Config, error) {
 		checkpointEvery = audit.DefaultCheckpointEvery
 	}
 	config.CheckpointEvery = checkpointEvery
+	config.Processors = slices.Clone(config.Processors)
+	processorTypes := make([]string, len(config.Processors))
+	for i, processor := range config.Processors {
+		processorTypes[i] = reflect.TypeOf(processor).String()
+	}
 
 	// Keep a separate slice in provenance even though both copies contain the
 	// same normalized bytes. Neither subsystem can mutate the other's payload.
 	provenanceSafePayload := append(json.RawMessage(nil), safePayload...)
 	provenance.Config[ProvenanceConfigKey] = assuredProvenanceProfile{
-		Maritime: assuredMaritimeProfile{
-			CommandTimeout:      config.Maritime.CommandTimeout,
-			TransportTimeout:    config.Maritime.TransportTimeout,
-			DeadMan:             config.Maritime.DeadMan,
-			DeadManReactuation:  config.Maritime.DeadManReactuation,
-			LoopWatchdog:        config.Maritime.LoopWatchdog,
-			ArmStickTolerance:   config.Maritime.ArmStickTolerance,
-			ArmTriggerTolerance: config.Maritime.ArmTriggerTolerance,
+		Processors: processorTypes,
+		Maritime: assuredSafetyProfile{
+			CommandTimeout:      config.Safety.CommandTimeout,
+			TransportTimeout:    config.Safety.TransportTimeout,
+			DeadMan:             config.Safety.DeadMan,
+			DeadManReactuation:  config.Safety.DeadManReactuation,
+			LoopWatchdog:        config.Safety.LoopWatchdog,
+			ArmStickTolerance:   config.Safety.ArmStickTolerance,
+			ArmTriggerTolerance: config.Safety.ArmTriggerTolerance,
 		},
 		Authority: assuredAuthorityProfile{
+			PolicyType: reflect.TypeOf(config.Authority.Policy).String(),
 			EngineeredSafeState: assuredSafeCommand{
 				Name:    config.Authority.EngineeredSafeState.Name,
 				Payload: provenanceSafePayload,
@@ -893,14 +950,14 @@ func prepareConfig(config Config) (Config, error) {
 			CheckpointEvery:     checkpointEvery,
 			WitnessTimeout:      config.WitnessTimeout,
 			ShutdownTimeout:     config.ShutdownTimeout,
-			LivenessInterval:    assuredLivenessInterval(config.Maritime),
+			LivenessInterval:    assuredLivenessInterval(config.Safety),
 		},
 	}
 	config.Provenance = provenance
 	return config, nil
 }
 
-func assuredLivenessInterval(config safety.MaritimeConfig) time.Duration {
+func assuredLivenessInterval(config safety.StrictConfig) time.Duration {
 	return max(config.TransportTimeout/2, time.Nanosecond)
 }
 
@@ -987,6 +1044,15 @@ func validateConfig(config Config) (result error) {
 	if config.Actuator == nil || nilInterface(config.Actuator) {
 		result = errors.Join(result, fmt.Errorf("%w: Actuator is required", ErrInvalidConfig))
 	}
+	if config.Authority.Policy == nil || nilInterface(config.Authority.Policy) {
+		result = errors.Join(result, fmt.Errorf("%w: Authority.Policy is required", ErrInvalidConfig))
+	}
+	for i, processor := range config.Processors {
+		value := reflect.ValueOf(processor)
+		if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() {
+			result = errors.Join(result, fmt.Errorf("%w: processor %d must be a non-nil pointer instance", ErrInvalidConfig, i))
+		}
+	}
 	if err := validateProvenance(config.Provenance); err != nil {
 		result = errors.Join(result, err)
 	}
@@ -1024,10 +1090,10 @@ func validateConfig(config Config) (result error) {
 		name  string
 		value time.Duration
 	}{
-		{name: "command timeout", value: config.Maritime.CommandTimeout},
-		{name: "transport timeout", value: config.Maritime.TransportTimeout},
-		{name: "loop watchdog", value: config.Maritime.LoopWatchdog},
-		{name: "dead-man re-actuation", value: config.Maritime.DeadManReactuation},
+		{name: "command timeout", value: config.Safety.CommandTimeout},
+		{name: "transport timeout", value: config.Safety.TransportTimeout},
+		{name: "loop watchdog", value: config.Safety.LoopWatchdog},
+		{name: "dead-man re-actuation", value: config.Safety.DeadManReactuation},
 		{name: "shutdown timeout", value: config.ShutdownTimeout},
 	} {
 		if deadline.value > 0 && config.Authority.CommandTTL > deadline.value {
@@ -1040,8 +1106,8 @@ func validateConfig(config Config) (result error) {
 			))
 		}
 	}
-	if _, err := safety.NewMaritime(config.Maritime); err != nil {
-		result = errors.Join(result, err)
+	if _, err := safety.NewStrict(config.Safety); err != nil {
+		result = errors.Join(result, ErrInvalidConfig, err)
 	}
 	return result
 }

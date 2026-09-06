@@ -838,7 +838,7 @@ func TestProvenanceRoundTrips(t *testing.T) {
 	if verification.Provenance.GoVersion == "" {
 		t.Fatal("captured provenance must include the Go version")
 	}
-	if verification.Provenance.Config["rate_limit_hz"] != float64(50) {
+	if verification.Provenance.Config["rate_limit_hz"] != json.Number("50") {
 		t.Fatalf("config = %v", verification.Provenance.Config)
 	}
 }
