@@ -59,7 +59,7 @@ func TestProvenanceConfigurationIsDeeplyFrozen(t *testing.T) {
 		t.Fatalf("late top-level mutation was recorded: %#v", config)
 	}
 	mapping := config["mapping"].(map[string]any)
-	if mapping["dead_zone"] != 0.12 {
+	if mapping["dead_zone"] != json.Number("0.12") {
 		t.Fatalf("nested map = %#v", mapping)
 	}
 	routes := config["routes"].([]any)
@@ -67,7 +67,7 @@ func TestProvenanceConfigurationIsDeeplyFrozen(t *testing.T) {
 		t.Fatalf("nested slice = %#v", routes)
 	}
 	recordedLimits := config["limits"].(map[string]any)
-	if recordedLimits["maximum"] != float64(7) {
+	if recordedLimits["maximum"] != json.Number("7") {
 		t.Fatalf("nested pointer = %#v", recordedLimits)
 	}
 }

@@ -361,6 +361,45 @@ subscription overflow, recorder error, or sampled backend as a safety event.
 Teleop reports these conditions; the application decides the appropriate safe
 state.
 
+## Incident verification
+
+Obtain the producer's Ed25519 public key from independent provisioning and
+checkpoint JSON Lines from the independently administered witness. Do not trust
+a key or custody file merely because it accompanies the producer's log.
+
+```sh
+go run ./cmd/teleop-verify -key trusted-public.hex -witnesses retained-heads.jsonl evidence.jsonl
+go run ./cmd/teleop-verify -key trusted-public.hex -witnesses retained-heads.jsonl -events evidence.jsonl
+```
+
+The CLI requires either retained witnesses or explicit `-local-only`. It checks
+every supplied checkpoint's signature and exact position/root/session/count in
+the actual log, detecting a different same-key signed fork or truncation before
+a retained head. JSON reports expose matched witness coverage, event kinds,
+known gaps and errors. A witness checkpoint authenticates its covered prefix,
+not a later suffix. A valid footer establishes orderly producer finalization,
+not physical safety or events omitted before admission.
+
+`-events` spools owner-only temporary output and releases the timeline only
+after the complete requested verification succeeds. `-partial` allows a missing
+footer for incident inspection, but unsigned tails and corruption remain errors
+with nonzero exit status. A partial inspection is not a completeness claim.
+`-max-bytes` bounds accepted evidence size (default 1 GiB). Keep the original
+incident file immutable and preserve acquisition hashes/custody separately.
+
+Library callers use `audit.VerifyOptions.Witnesses` and `RequireWitness`; the
+public key must still come from outside the log. Streaming consumers can receive
+signed-prefix events before a later witness mismatch; use a spool or transactional
+consumer if no result may be released until all requested witnesses match.
+
+`assured.NewMirroredStore` retains complete bytes in all configured stores,
+requires every store's Sync to succeed and permanently fails closed after a
+write/sync fault. Close still attempts every store. These callbacks have no
+hard cancellation guarantee. Separate adapters are not automatically separate
+failure/custody domains: validate independent storage, permissions, retention,
+power-loss behavior, capacity alarms and restore drills. Witnessing hashes
+alone cannot recover a destroyed full log.
+
 ### What none of this provides
 
 An audit log is evidence and post-incident learning. It is not a safety

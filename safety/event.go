@@ -53,7 +53,7 @@ const (
 	// ReasonSourceError reports an input or controller pipeline error.
 	ReasonSourceError Reason = "source_error"
 	// ReasonTransportUnverifiable reports a source that cannot independently
-	// establish liveness while controller state is unchanged. Strict maritime guards
+	// establish liveness while controller state is unchanged. Strict guards
 	// refuse to infer health from silence.
 	ReasonTransportUnverifiable Reason = "transport_unverifiable"
 	// ReasonTransportTimeout reports that the newest independently verified

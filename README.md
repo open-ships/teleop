@@ -2,8 +2,8 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/open-ships/teleop.svg)](https://pkg.go.dev/github.com/open-ships/teleop)
 
-Normalized, loss-aware game-controller input for Go teleoperation and autonomy
-applications.
+Normalized, loss-aware game-controller input for Go games, simulation,
+teleoperation, and autonomy applications.
 
 `teleop` separates controller hardware and operating-system APIs from
 application control logic. It exposes transport-independent state snapshots,
@@ -12,19 +12,26 @@ output authority with expiring command leases, and signed, externally witnessed
 audit recording. The included `xbox` provider works on Linux, macOS, and
 Windows.
 
+Start with controller input and add auditing as needed. `safety` and `assured`
+are optional modules, not prerequisites for opening a controller or recording
+its activity. Commands, policies, and output adapters belong to the consuming
+application. See [choosing integration modules](docs/integration.md) for games,
+RC cars, boats, simulators, and migration from the maritime names.
+
 > [!IMPORTANT]
 > `teleop` is not a certified safety controller. Its strict path combines
 > fresh OS/framework connection evidence, a dead-man switch, loop watchdog,
 > latching stop, durable evidence, an engineered safe state, and
 > receiver-enforced command leases. It does not replace a hardware emergency
-> stop, safety-rated interlocks, physical feedback, vessel-specific command
+> stop, safety-rated interlocks, physical feedback, system-specific command
 > validation, or an actuator that reaches a safe state when lease renewal stops.
 > A backend also cannot report input that the device, radio, driver, or OS never
 > delivered.
 
 The API has completed its pre-v1 review. The `v1.0.0` tag begins the Go module
 compatibility commitment. Validate backend mappings on the exact controller,
-OS/driver, radio, and actuator combination before deployment.
+OS/driver, and radio combination; physical actuation additionally requires
+validation of the receiving system.
 
 ## Features
 
@@ -38,7 +45,7 @@ OS/driver, radio, and actuator combination before deployment.
 - Tap, double-tap, hold, chord, stick-region, and trigger-threshold gestures
 - Application-defined action bindings with causal event IDs
 - Application command records linked to the input that caused them
-- Strict maritime interlocks with release-neutral-arm-fresh-press sequencing
+- Optional domain-neutral strict interlocks with release-neutral-arm-fresh-press sequencing
 - Independent backend connection checks distinct from unchanged operator state
 - Serialized Safety Authority with expiring leases and acknowledged fallback
 - Assured Session composition that hides raw hazardous-output seams
@@ -419,15 +426,18 @@ must be small.
 Within their stated key, adapter, and custody assumptions, these mechanisms
 detect alteration and make replacement or truncation of a witnessed prefix
 evident. They do not detect input the operating system never delivered or prove
-that an application produced a safe vessel command. That is what the next
-section addresses.
+that an application produced a safe physical command. The next section adds
+command-policy enforcement and recorded receiver claims, not physical proof.
 
 ## Assured safety authority
 
 For hazardous output, use `assured.Session`. It composes the strict
-`safety.NewMaritime` profile, audit recorder, external witness, and one
+`safety.NewStrict` profile, audit recorder, external witness, and one
 serialized `safety.Authority`; it does not expose the raw controller or
-actuator path.
+actuator path. Set `assured.Config.Safety` to a `safety.StrictConfig`.
+The original `Maritime` field and maritime constructors remain compatibility
+spellings; do not set both profile fields. These strict requirements are not
+imposed on ordinary controller input or auditing.
 
 The operator sequence is deliberately strict:
 
@@ -445,19 +455,22 @@ decision and intent, transmits a session-bound command with an expiry lease,
 and validates the matching actuator acknowledgement. Assured configuration
 requires the adapter to assert an application time inside that lease. When any
 configured teleop condition is unproven, the authority substitutes the
-vessel-specific Engineered Safe State.
+application-defined Engineered Safe State.
 
-Authority does not validate a command's actuator mapping, units, bounds,
-rate/slew, vessel-mode constraints, or operator permission. In this fragment,
-`validatedThrottle` must already have passed an authenticated, vessel-specific
-command policy:
+Assured configuration requires `Authority.Policy`. Authority checks that policy
+before durable intent, records its decision against the exact command, and
+limits the lease to grant expiry. The `policy` package supplies strict scalar
+envelopes and independently signed, session-bound operator grants; custom
+command types supply their own reviewed `safety.CommandPolicy`. Low-level
+authorities without a policy enforce input interlocks only. In this fragment,
+`ctx` carries the current grant and the configured policy understands the payload:
 
 ```go
 // This is one iteration of the already-running authoritative Apply loop.
 result, err := session.Apply(ctx, safety.ApplyRequest{
-    Intent: safety.VesselCommand{
+    Intent: safety.Command{
         Name:    "propulsion.set",
-        Payload: map[string]any{"throttle": validatedThrottle},
+        Payload: map[string]any{"throttle": requestedThrottle},
     },
     Causes: []teleop.EventID{inputEvent.Header().ID},
     Detail: "captain propulsion request",
@@ -482,9 +495,15 @@ also inhibit and latch.
 The receiver must reject expired or out-of-order leases, enforce independent
 hard command/mode limits, and enter its safe state without this process. An
 independent hardware emergency stop, safety-rated interlocks, authenticated
-physical feedback, authenticated operator authorization, and vessel-specific
+physical feedback, authenticated operator authorization, and system-specific
 hazard analysis remain mandatory deployment controls. See the complete [safety
 guide](docs/safety.md) and [safety case](docs/safety-case.md).
+
+See [command policy and receiver simulation](docs/command-policy.md) for the
+reference envelope and adapter acceptance checks. For incidents,
+`cmd/teleop-verify` checks signed logs against independently retained witness
+checkpoints; [the audit guide](docs/audit.md#incident-verification) explains its
+trust and completeness limits.
 
 ## Terminal monitor
 

@@ -24,18 +24,31 @@ var (
 	ErrActuatorTimeout   = errors.New("teleop/safety: actuator acknowledgement timed out")
 	ErrActuatorRejected  = errors.New("teleop/safety: actuator rejected command")
 	ErrAuthorityRevoked  = errors.New("teleop/safety: authority changed during command")
-	ErrInvalidAuthority  = errors.New("teleop/safety: invalid authority configuration")
-	ErrAuthorityClock    = errors.New("teleop/safety: authority clock unavailable")
+	// ErrIntentSuperseded accompanies ErrAuthorityRevoked when newer ordinary
+	// input invalidated an intent before any live send began. After a successful
+	// fallback the caller may recompute current intent without re-arming.
+	ErrIntentSuperseded = errors.New("teleop/safety: unsent intent superseded by input")
+	ErrInvalidAuthority = errors.New("teleop/safety: invalid authority configuration")
+	ErrAuthorityClock   = errors.New("teleop/safety: authority clock unavailable")
 )
 
-// VesselCommand is an application command before it is snapshotted for
+// Command is an application command before it is snapshotted for
 // evidence and transmission. Payload must be JSON representable. Authority
 // encodes it exactly once so the evidence ledger and actuator see identical
 // bytes even if the caller later mutates Payload.
-type VesselCommand struct {
+//
+// The application owns the name, schema, units, and meaning. Authority's lease
+// and fallback protocol is intended for renewable state/setpoint commands; it
+// cannot undo an irreversible one-shot action when a lease expires.
+type Command struct {
 	Name    string
 	Payload any
 }
+
+// VesselCommand is the original name for Command.
+//
+// Deprecated: use Command; its payload is not vessel-specific.
+type VesselCommand = Command
 
 // EncodedCommand is the immutable representation shared by evidence and the
 // actuator adapter.
@@ -137,6 +150,7 @@ type EvidenceRecord struct {
 
 	Lifecycle      *LifecycleEvidence      `json:"lifecycle,omitempty"`
 	Decision       *Decision               `json:"decision,omitempty"`
+	Policy         *PolicyDecision         `json:"policy,omitempty"`
 	Requested      *EncodedCommand         `json:"requested,omitempty"`
 	Applied        *EncodedCommand         `json:"applied,omitempty"`
 	Actuator       *ActuatorCommand        `json:"actuator,omitempty"`
@@ -148,6 +162,10 @@ type EvidenceRecord struct {
 // Clone returns an isolated record suitable for retaining asynchronously.
 func (record EvidenceRecord) Clone() EvidenceRecord {
 	record.Causes = slices.Clone(record.Causes)
+	if record.Policy != nil {
+		value := record.Policy.Clone()
+		record.Policy = &value
+	}
 	if record.Lifecycle != nil {
 		value := *record.Lifecycle
 		record.Lifecycle = &value
@@ -254,10 +272,16 @@ func (fn ReceiptFunc) Await(ctx context.Context) (ActuatorAcknowledgment, error)
 
 // AuthorityConfig defines the non-optional output policy. EngineeredSafeState
 // is application-defined because neutral controller input is not necessarily a
-// vessel's safe actuator state.
+// controlled system's safe state. It is one frozen fallback command; an adapter
+// may interpret it as a request to enter its own system-specific safe mode.
 type AuthorityConfig struct {
-	EngineeredSafeState VesselCommand
+	EngineeredSafeState Command
 	CommandTTL          time.Duration
+	// Policy is mandatory for Assured Sessions. Low-level authorities without
+	// it enforce input interlocks only, not command semantics or operator grants.
+	// Safe-state commands bypass live policy so authorization failure cannot
+	// prevent the independent emergency path.
+	Policy CommandPolicy
 	// RequireAppliedAcknowledgment rejects an otherwise accepted response that
 	// does not assert when the actuator applied the command. The timestamp is an
 	// adapter claim, not independent physical-state proof; production adapters
@@ -272,7 +296,7 @@ type AuthorityConfig struct {
 // the Guard itself, and substitutes EngineeredSafeState whenever output is not
 // authorized.
 type ApplyRequest struct {
-	Intent VesselCommand
+	Intent Command
 	Causes []teleop.EventID
 	Detail string
 }
@@ -283,6 +307,7 @@ type ApplyRequest struct {
 // Engineered Safe State selected by an inhibiting Guard decision.
 type ApplyResult struct {
 	Decision             Decision
+	Policy               *PolicyDecision
 	Requested            EncodedCommand
 	Applied              EncodedCommand
 	Fallback             bool
@@ -306,6 +331,11 @@ type Authority struct {
 	ttl                          time.Duration
 	now                          func() time.Time
 	requireAppliedAcknowledgment bool
+	policy                       CommandPolicy
+	policyCall                   chan struct{}
+	previousApplied              *EncodedCommand // serial protects the acknowledged baseline.
+	previouslyAppliedAt          time.Time
+	previousLiveExpiry           time.Time
 
 	processor *authorityProcessor
 	serial    chan struct{}
@@ -317,16 +347,17 @@ type Authority struct {
 	liveAwaitCall chan struct{}
 	safeAwaitCall chan struct{}
 
-	stateMu      sync.Mutex
-	source       AuthoritySource
-	session      teleop.SessionID
-	bound        bool
-	closed       bool
-	active       uint64
-	activeID     uint64
-	activeLive   bool
-	activeInput  Decision
-	activeCancel context.CancelFunc
+	stateMu       sync.Mutex
+	source        AuthoritySource
+	session       teleop.SessionID
+	bound         bool
+	closed        bool
+	active        uint64
+	activeID      uint64
+	activeLive    bool
+	activeSending bool
+	activeInput   Decision
+	activeCancel  context.CancelFunc
 
 	recordSequence  uint64 // serial protects the evidence order.
 	commandSequence uint64 // serial protects actuator order.
@@ -345,7 +376,7 @@ func NewAuthority(
 }
 
 // NewAuthorityWithGuard returns an Authority around an already validated
-// Guard. Production sessions use this constructor with NewMaritime so strict
+// Guard. Assured sessions use this constructor with NewStrict so strict
 // profile validation remains the Guard module's single source of truth.
 func NewAuthorityWithGuard(
 	config AuthorityConfig,
@@ -365,7 +396,7 @@ func NewAuthorityWithGuard(
 	if config.CommandTTL <= 0 {
 		return nil, fmt.Errorf("%w: command TTL must be positive", ErrInvalidAuthority)
 	}
-	safe, err := encodeVesselCommand(config.EngineeredSafeState)
+	safe, err := encodeCommand(config.EngineeredSafeState)
 	if err != nil {
 		return nil, errors.Join(
 			ErrInvalidAuthority,
@@ -384,6 +415,8 @@ func NewAuthorityWithGuard(
 		ttl:                          config.CommandTTL,
 		now:                          now,
 		requireAppliedAcknowledgment: config.RequireAppliedAcknowledgment,
+		policy:                       config.Policy,
+		policyCall:                   newCallbackGate(),
 		serial:                       make(chan struct{}, 1),
 		clockCall:                    newCallbackGate(),
 		evidenceCall:                 newCallbackGate(),
@@ -564,7 +597,7 @@ func (authority *Authority) Apply(
 	if err := validContext(ctx); err != nil {
 		return ApplyResult{}, err
 	}
-	requested, err := encodeVesselCommand(request.Intent)
+	requested, err := encodeCommand(request.Intent)
 	if err != nil {
 		failureDetail := boundedFailureDetail(
 			fmt.Sprintf("invalid command intent %q", request.Intent.Name),
@@ -606,7 +639,33 @@ func (authority *Authority) Apply(
 	}()
 	request.Causes = authority.withDecisionInputCause(request.Causes, decision)
 
-	decisionID, decisionErr := authority.recordDecision(opCtx, decision, request.Causes, request.Detail)
+	var policyDecision *PolicyDecision
+	if decision.Permit && authority.policy != nil {
+		value, policyErr := authority.evaluatePolicy(opCtx, requested, decision)
+		policyDecision = &value
+		if policyErr != nil {
+			authority.markActiveFallback(activeID)
+			authority.inhibit("command policy refused intent")
+			// Retain the exact refused command and grant independently of a
+			// cancelled evaluation. Evidence failure never suppresses fallback.
+			evidenceCtx, cancelEvidence := authority.safetyContext(ctx)
+			_, evidenceErr := authority.recordPolicyDecision(evidenceCtx, decision, request.Causes, requested, value, policyErr.Error())
+			cancelEvidence()
+			fallback, fallbackErr := authority.executeFallbackLocked(ctx, Decision{State: StateSafe, Reasons: []Reason{ReasonOperator}}, request.Causes, "command policy refused intent")
+			fallback.Requested, fallback.Policy = requested, policyDecision
+			return fallback, errors.Join(ErrCommandPolicy, policyErr, evidenceErr, fallbackErr)
+		}
+		limitedCtx, cancelPolicy := context.WithDeadline(opCtx, value.ExpiresAt)
+		defer cancelPolicy()
+		opCtx = limitedCtx
+	}
+	var decisionID EvidenceID
+	var decisionErr error
+	if policyDecision != nil {
+		decisionID, decisionErr = authority.recordPolicyDecision(opCtx, decision, request.Causes, requested, *policyDecision, request.Detail)
+	} else {
+		decisionID, decisionErr = authority.recordDecision(opCtx, decision, request.Causes, request.Detail)
+	}
 	if decisionErr != nil {
 		authority.markActiveFallback(activeID)
 		authority.inhibit("decision evidence unavailable")
@@ -617,6 +676,7 @@ func (authority *Authority) Apply(
 			"decision evidence unavailable",
 		)
 		fallback.Requested = requested
+		fallback.Policy = policyDecision
 		return fallback, errors.Join(decisionErr, fallbackErr)
 	}
 
@@ -637,6 +697,7 @@ func (authority *Authority) Apply(
 		fallback,
 		reason,
 	)
+	result.Policy = policyDecision
 	if applyErr != nil {
 		if fallback {
 			authority.inhibit("engineered safe state failed")
@@ -656,7 +717,14 @@ func (authority *Authority) Apply(
 			fallbackDecision = current
 			fallbackCauses = authority.withDecisionInputCause(fallbackCauses, current)
 		}
-		authority.inhibit(failureReason)
+		// Supersession after a completed evidence barrier and before Send is not
+		// actuator uncertainty. Preserve standing arm only on that proven path;
+		// the Guard still owns latching interlock faults and operator revocation.
+		superseded := errors.Is(applyErr, ErrIntentSuperseded) &&
+			!errors.Is(applyErr, ErrEvidence) && !errors.Is(applyErr, ErrEvidenceIdentity)
+		if !superseded {
+			authority.inhibit(failureReason)
+		}
 		safeResult, safeErr := authority.executeFallbackLocked(
 			ctx,
 			fallbackDecision,
@@ -666,6 +734,15 @@ func (authority *Authority) Apply(
 		result.FallbackSequence = safeResult.CommandSequence
 		result.FallbackAcknowledged = safeResult.Acknowledgment != nil &&
 			safeResult.Acknowledgment.Accepted
+		if superseded {
+			if safeErr != nil || !result.FallbackAcknowledged {
+				authority.inhibit("superseded intent fallback failed")
+			} else {
+				authority.stateMu.Lock()
+				authority.guard.Heartbeat()
+				authority.stateMu.Unlock()
+			}
+		}
 		return result, errors.Join(applyErr, safeErr)
 	}
 
@@ -691,17 +768,10 @@ func (authority *Authority) Apply(
 	}
 	authority.stateMu.Unlock()
 
-	revokedCtx, cancelRevoked := authority.safetyContext(ctx)
-	defer cancelRevoked()
 	authority.markActiveFallback(activeID)
 	revokedCauses := authority.withDecisionInputCause(request.Causes, current)
-	revokedID, revokedErr := authority.recordDecision(
-		revokedCtx,
-		current,
-		revokedCauses,
-		"authority changed after actuator acknowledgement",
-	)
-	_ = revokedID
+	// executeFallbackLocked records the current decision and links its intent;
+	// a separate unparented duplicate decision would remain an unfinished chain.
 	safeResult, safeErr := authority.executeFallbackLocked(
 		ctx,
 		current,
@@ -711,7 +781,7 @@ func (authority *Authority) Apply(
 	result.FallbackSequence = safeResult.CommandSequence
 	result.FallbackAcknowledged = safeResult.Acknowledgment != nil &&
 		safeResult.Acknowledgment.Accepted
-	return result, errors.Join(ErrAuthorityRevoked, revokedErr, safeErr)
+	return result, errors.Join(ErrAuthorityRevoked, safeErr)
 }
 
 func (authority *Authority) permissiveLifecycle(
@@ -955,6 +1025,7 @@ func (authority *Authority) beginApply(
 	decision := authority.guard.Evaluate()
 	authority.active = id
 	authority.activeLive = decision.Permit
+	authority.activeSending = false
 	authority.activeInput = cloneAuthorityDecision(decision)
 	authority.activeCancel = cancel
 	return opCtx, cancel, decision, id, nil
@@ -965,6 +1036,7 @@ func (authority *Authority) endApply(id uint64) {
 	if authority.active == id {
 		authority.active = 0
 		authority.activeLive = false
+		authority.activeSending = false
 		authority.activeInput = Decision{}
 		authority.activeCancel = nil
 	}
@@ -986,7 +1058,15 @@ func (authority *Authority) cancelLiveApplyIfDecisionChanged() {
 	if !authority.activeLive || authority.activeCancel == nil {
 		return
 	}
-	if sameDecisionInput(authority.activeInput, authority.guard.Evaluate()) {
+	current := authority.guard.Evaluate()
+	if sameDecisionInput(authority.activeInput, current) {
+		return
+	}
+	if !authority.activeSending && ordinaryInputDecision(current) {
+		// Finish the bounded evidence callback, then reject the superseded intent
+		// at preflight. Canceling this callback would manufacture an evidence
+		// failure from an ordinary release or newer observation. Faults and stops
+		// still cancel immediately, and receiver lease expiry remains independent.
 		return
 	}
 	// Cancel only the requested-command phase. Apply switches to an independent
@@ -995,6 +1075,32 @@ func (authority *Authority) cancelLiveApplyIfDecisionChanged() {
 	authority.activeLive = false
 	authority.activeInput = Decision{}
 	authority.activeCancel()
+}
+
+func ordinaryInputDecision(decision Decision) bool {
+	return decision.Permit || (decision.State == StateArmed && onlyDeadManEngagement(decision.Reasons))
+}
+
+// checkBeforeSend preserves strict input causality. It marks the last preflight
+// under the same mutex used by input cancellation; after that point any failed
+// operation is conservatively treated as possibly transmitted.
+func (authority *Authority) checkBeforeSend(ctx context.Context, expected Decision, sending bool) (Decision, error) {
+	authority.stateMu.Lock()
+	defer authority.stateMu.Unlock()
+	current := authority.guard.Evaluate()
+	if err := ctx.Err(); err != nil {
+		return current, errors.Join(ErrAuthorityRevoked, err)
+	}
+	if !sameDecisionInput(expected, current) {
+		if authority.activeLive && !authority.activeSending && ordinaryInputDecision(current) {
+			return current, errors.Join(ErrAuthorityRevoked, ErrIntentSuperseded)
+		}
+		return current, ErrAuthorityRevoked
+	}
+	if sending {
+		authority.activeSending = true
+	}
+	return current, nil
 }
 
 func (authority *Authority) executeFallbackLocked(
@@ -1069,20 +1175,33 @@ func (authority *Authority) executeLocked(
 		cancelIntent()
 	}
 	result.IntentEvidenceID = intentID
+	abortUnsent := func(cause error) (ApplyResult, error) {
+		parent := intentID
+		if parent == "" {
+			parent = decisionID
+		}
+		abortCtx, cancelAbort := authority.safetyContext(ctx)
+		defer cancelAbort()
+		id, abortErr := authority.commit(abortCtx, EvidenceRecord{
+			Kind: EvidenceFailure, CommandSequence: sequence, ParentID: parent,
+			DecisionID: decisionID, Causes: causes, Requested: commandPointer(requested),
+			Detail: "intent not transmitted", Error: errorText(cause),
+		})
+		result.OutcomeEvidenceID = id
+		return result, errors.Join(cause, abortErr)
+	}
 	if intentErr != nil && !fallback {
-		return result, intentErr
+		return abortUnsent(intentErr)
 	}
 	if !fallback {
 		// Intent durability is a FIFO barrier behind every earlier canonical input
 		// event. Re-evaluate after that barrier, immediately before entering the
 		// actuator boundary, so a fault processed while evidence was committing
 		// cannot inherit the earlier permit decision.
-		authority.stateMu.Lock()
-		current := authority.guard.Evaluate()
-		authority.stateMu.Unlock()
-		if !sameDecisionInput(decision, current) {
+		current, err := authority.checkBeforeSend(ctx, decision, false)
+		if err != nil {
 			result.Decision = cloneAuthorityDecision(current)
-			return result, ErrAuthorityRevoked
+			return abortUnsent(err)
 		}
 	}
 
@@ -1097,7 +1216,7 @@ func (authority *Authority) executeLocked(
 	}
 	if clockErr != nil {
 		if !fallback {
-			return result, errors.Join(intentErr, clockErr)
+			return abortUnsent(errors.Join(intentErr, clockErr))
 		}
 		// A clock callback is outside the trusted safety core. Its failure cannot
 		// prevent a best-effort Engineered Safe State with a bounded lease.
@@ -1146,12 +1265,10 @@ func (authority *Authority) executeLocked(
 		// before Send. A revocation after this boundary is handled by cancellation,
 		// receiver sequence/expiry, and a newer fallback; software cannot make the
 		// transport call and an asynchronous stop physically atomic.
-		authority.stateMu.Lock()
-		current := authority.guard.Evaluate()
-		authority.stateMu.Unlock()
-		if !sameDecisionInput(decision, current) {
+		current, err := authority.checkBeforeSend(ctx, decision, true)
+		if err != nil {
 			result.Decision = cloneAuthorityDecision(current)
-			return result, ErrAuthorityRevoked
+			return abortUnsent(err)
 		}
 	}
 
@@ -1161,6 +1278,11 @@ func (authority *Authority) executeLocked(
 		sendCall = authority.safeSendCall
 		awaitCall = authority.safeAwaitCall
 	}
+	// Once a send can start, the old acknowledged state is no longer a proven
+	// baseline. Only a validated positive receipt can re-establish it.
+	authority.previousApplied = nil
+	authority.previouslyAppliedAt = time.Time{}
+	authority.previousLiveExpiry = time.Time{}
 	receipt, sendErr := callActuatorSend(authority.actuator, sendCall, ctx, envelope)
 	if sendErr != nil || receipt == nil {
 		if sendErr == nil {
@@ -1230,7 +1352,8 @@ func (authority *Authority) executeLocked(
 		cancelSent()
 	}
 	if sentErr != nil && !fallback {
-		return result, errors.Join(intentErr, sentErr)
+		recordErr := authority.recordActuatorError(ctx, envelope, intentID, decisionID, causes, sentErr)
+		return result, errors.Join(intentErr, sentErr, recordErr)
 	}
 	if !fallback {
 		await()
@@ -1248,6 +1371,13 @@ func (authority *Authority) executeLocked(
 		return result, errors.Join(intentErr, sentErr, classified, recordErr)
 	}
 	result.Acknowledgment = &ack
+	if ack.Accepted && !ack.AppliedAt.IsZero() {
+		authority.previousApplied = commandPointer(applied)
+		authority.previouslyAppliedAt = ack.AppliedAt
+		if !fallback {
+			authority.previousLiveExpiry = envelope.ExpiresAt
+		}
+	}
 
 	kind := EvidenceAcknowledged
 	var outcomeErr error
@@ -1419,7 +1549,7 @@ func (authority *Authority) safetyContext(
 	return context.WithTimeout(base, authority.ttl)
 }
 
-func encodeVesselCommand(command VesselCommand) (encoded EncodedCommand, err error) {
+func encodeCommand(command Command) (encoded EncodedCommand, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			encoded = EncodedCommand{}

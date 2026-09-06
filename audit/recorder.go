@@ -79,6 +79,7 @@ var (
 	// ErrWitnessRequired reports that a recorder configured to require external
 	// witnessing could not prove that its completed footer was acknowledged.
 	ErrWitnessRequired = errors.New("teleop/audit: required external witness unavailable")
+	ErrWitnessMismatch = errors.New("teleop/audit: evidence does not match retained witness")
 )
 
 const (
@@ -289,6 +290,13 @@ type Record struct {
 
 // Verification describes what was actually verified.
 type Verification struct {
+	// MatchedWitnesses counts independently supplied checkpoints matched to
+	// exact authenticated records in this file. It does not authenticate the
+	// witness's custody or receipt time; those come from the trusted collection.
+	MatchedWitnesses uint64
+	WitnessedEvents  uint64
+	// WitnessedTreeSize includes the matched head record itself.
+	WitnessedTreeSize uint64
 	// Version is the stream's wire-format version.
 	Version int
 	// Chain names the integrity mechanism declared by the manifest.
@@ -337,6 +345,12 @@ type Verification struct {
 
 // VerifyOptions configures streaming verification.
 type VerifyOptions struct {
+	// Witnesses must be collected independently of the evidence producer.
+	// Each must occur exactly in the verified file; a valid but truncated or
+	// forked signed history is rejected. PublicKey is mandatory when supplied.
+	Witnesses []Checkpoint
+	// RequireWitness refuses verification without any retained checkpoints.
+	RequireWitness bool
 	// RequireFooter rejects an interrupted or still-open stream.
 	RequireFooter bool
 	// AllowUnverified permits a stream that explicitly declares no hash chain.
@@ -1428,6 +1442,10 @@ func Verify(
 	options VerifyOptions,
 	consume func(Record) error,
 ) (Verification, error) {
+	witnesses, err := prepareWitnessVerification(options)
+	if err != nil {
+		return Verification{}, err
+	}
 	signatureRequired := options.RequireSignature || len(options.PublicKey) > 0
 	if len(options.PublicKey) > 0 && len(options.PublicKey) != ed25519.PublicKeySize {
 		return Verification{}, fmt.Errorf(
@@ -1711,6 +1729,15 @@ func Verify(
 				}
 			}
 		}
+		if witness, ok := witnesses[tree.Size()]; ok {
+			if !headVerified || !witnessMatchesRecord(witness, disk, headSession) {
+				return verification, fmt.Errorf("%w: checkpoint at record %d", ErrWitnessMismatch, tree.Size())
+			}
+			verification.MatchedWitnesses++
+			verification.WitnessedEvents = max(verification.WitnessedEvents, witness.EventCount)
+			verification.WitnessedTreeSize = max(verification.WitnessedTreeSize, tree.Size()+1)
+			delete(witnesses, tree.Size())
+		}
 		if disk.Version >= 3 && verification.Chain != chainNone {
 			raw, decodeErr := hex.DecodeString(disk.Hash)
 			if decodeErr != nil {
@@ -1904,6 +1931,9 @@ func Verify(
 			ErrSignatureRequired,
 			tree.Size()-signedThrough,
 		)
+	}
+	if len(witnesses) > 0 {
+		return verification, fmt.Errorf("%w: %d retained checkpoints are absent from the file", ErrWitnessMismatch, len(witnesses))
 	}
 	return verification, nil
 }

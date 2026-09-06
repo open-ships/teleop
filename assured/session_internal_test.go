@@ -1,6 +1,7 @@
 package assured
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -38,6 +39,23 @@ func TestEvidenceBridgeReleasesCompletedChainIdentities(t *testing.T) {
 	}
 	if retained := len(bridge.identities); retained != 0 {
 		t.Fatalf("completed evidence chains retained %d identities", retained)
+	}
+}
+
+func TestEvidenceBridgeBoundsUnfinishedChainsWithoutSilentEviction(t *testing.T) {
+	bridge := &evidenceBridge{identities: make(map[safety.EvidenceID]teleop.EventID)}
+	for i := range maxPendingEvidenceParents {
+		bridge.identities[safety.EvidenceID(fmt.Sprint(i))] = teleop.EventID{Sequence: uint64(i + 1)}
+	}
+	if _, err := bridge.Commit(t.Context(), safety.EvidenceRecord{Kind: safety.EvidenceDecision}); !errors.Is(err, ErrEvidenceNotDurable) {
+		t.Fatalf("unbounded new chain: %v", err)
+	}
+	if len(bridge.identities) != maxPendingEvidenceParents {
+		t.Fatal("unfinished evidence identities silently evicted")
+	}
+	bridge.advanceIdentity(safety.EvidenceFailure, "0", "terminal", teleop.EventID{Sequence: 100})
+	if len(bridge.identities) != maxPendingEvidenceParents-1 {
+		t.Fatal("terminal refusal did not release chain")
 	}
 }
 

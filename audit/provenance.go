@@ -149,6 +149,7 @@ func freezeProvenance(provenance Provenance) (frozen Provenance, err error) {
 type cloneVisit struct {
 	typeOf  reflect.Type
 	pointer uintptr
+	length  int // slices sharing an address can represent different JSON values
 }
 
 func cloneProvenanceValue(value reflect.Value, visited map[cloneVisit]reflect.Value) reflect.Value {
@@ -201,7 +202,7 @@ func cloneProvenanceValue(value reflect.Value, visited map[cloneVisit]reflect.Va
 		if value.IsNil() {
 			return reflect.Zero(value.Type())
 		}
-		visit := cloneVisit{typeOf: value.Type(), pointer: value.Pointer()}
+		visit := cloneVisit{typeOf: value.Type(), pointer: value.Pointer(), length: value.Len()}
 		if cloned, ok := visited[visit]; ok {
 			return cloned
 		}

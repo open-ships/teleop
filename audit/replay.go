@@ -25,6 +25,15 @@ func (event OpaqueEvent) Header() teleop.Header { return event.Meta.Clone() }
 // Kind implements teleop.Event.
 func (event OpaqueEvent) Kind() teleop.EventKind { return event.Type }
 
+// MarshalJSON preserves the original event envelope, including extension
+// fields and exact JSON numbers. FreezeEvent validates its header against Meta.
+func (event OpaqueEvent) MarshalJSON() ([]byte, error) {
+	if !json.Valid(event.Payload) {
+		return nil, fmt.Errorf("opaque %s event has invalid JSON", event.Type)
+	}
+	return append([]byte(nil), event.Payload...), nil
+}
+
 // CloneEvent implements teleop.EventCloner.
 func (event OpaqueEvent) CloneEvent() teleop.Event {
 	event.Meta = event.Meta.Clone()
@@ -46,6 +55,12 @@ func (event EncodingErrorEvent) Header() teleop.Header { return event.Meta.Clone
 
 // Kind implements teleop.Event.
 func (event EncodingErrorEvent) Kind() teleop.EventKind { return event.OriginalKind }
+
+// MarshalJSON refuses to turn missing legacy evidence into an apparently
+// complete event of the original kind.
+func (event EncodingErrorEvent) MarshalJSON() ([]byte, error) {
+	return nil, &ReplayFaultError{Reason: "event encoding failed: " + event.Message}
+}
 
 // CloneEvent implements teleop.EventCloner.
 func (event EncodingErrorEvent) CloneEvent() teleop.Event {
@@ -128,7 +143,12 @@ func Descriptor(records []Record) (teleop.Descriptor, bool, error) {
 		if err != nil {
 			return teleop.Descriptor{}, false, err
 		}
-		connection := event.(*teleop.ConnectionEvent)
+		connection, ok := event.(*teleop.ConnectionEvent)
+		if !ok {
+			return teleop.Descriptor{}, false, &ReplayFaultError{
+				Reason: "connection descriptor unavailable: " + record.EncodingError,
+			}
+		}
 		if connection.Descriptor.ID != "" {
 			return connection.Descriptor.Clone(), true, nil
 		}
@@ -154,6 +174,16 @@ func Observations(records []Record) ([]teleop.Observation, error) {
 		faults     []string
 	)
 	for _, record := range records {
+		if record.EncodingError != "" {
+			reason := fmt.Sprintf("%s event encoding failed: %s", record.Kind, record.EncodingError)
+			faults = append(faults, reason)
+			if pendingGap == nil {
+				pendingGap = &teleop.SourceGap{Reason: reason}
+			} else {
+				pendingGap.Reason += "; " + reason
+			}
+			continue
+		}
 		switch record.Kind {
 		case teleop.EventGap:
 			var event teleop.GapEvent

@@ -45,7 +45,11 @@ func decodeDiskRecord(encoded []byte) (diskRecord, error) {
 			}
 		}
 	}
-	if err := json.Unmarshal(encoded, &record); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	// Config is open-ended JSON. Preserve its exact numeric representation just
+	// as the recording path does; float64 can change authenticated integers.
+	decoder.UseNumber()
+	if err := decoder.Decode(&record); err != nil {
 		return record, err
 	}
 	if version == FormatVersion {
@@ -57,6 +61,7 @@ func decodeDiskRecord(encoded []byte) (diskRecord, error) {
 		record.provenanceRaw = append(json.RawMessage(nil), raw...)
 		if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			decoder := json.NewDecoder(bytes.NewReader(raw))
+			decoder.UseNumber()
 			decoder.DisallowUnknownFields()
 			var provenance Provenance
 			if err := decoder.Decode(&provenance); err != nil {

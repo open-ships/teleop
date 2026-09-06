@@ -307,6 +307,10 @@ func validConfig(
 		},
 		Maritime: maritime,
 		Authority: safety.AuthorityConfig{
+			// Deliberately permissive TEST double; never a production policy.
+			Policy: safety.CommandPolicyFunc(func(ctx context.Context, request safety.PolicyRequest) (safety.PolicyDecision, error) {
+				return safety.PolicyDecision{Permit: true, PolicyID: "test-only", Subject: "test", Authorization: "test", ExpiresAt: time.Now().Add(time.Hour)}, nil
+			}),
 			EngineeredSafeState: safety.VesselCommand{
 				Name: "vessel.safe",
 				Payload: map[string]any{
@@ -347,10 +351,21 @@ func (payload *statefulSafePayload) callCount() int {
 }
 
 func TestAssuredManifestRecordsEffectiveControlProfileAndFrozenSafeState(t *testing.T) {
+	for _, spelling := range []string{"Safety", "Maritime"} {
+		t.Run(spelling, func(t *testing.T) { testAssuredManifestProfile(t, spelling) })
+	}
+}
+
+func testAssuredManifestProfile(t *testing.T, spelling string) {
+	t.Helper()
 	store := &syncStore{}
 	anchor := &witnessAnchor{}
 	actuator := &acceptingActuator{}
 	config, public := validConfig(t, store, anchor, actuator)
+	expected := config.Maritime
+	if spelling == "Safety" {
+		config.Safety, config.Maritime = expected, safety.MaritimeConfig{}
+	}
 	stateful := &statefulSafePayload{}
 	config.Authority.EngineeredSafeState.Payload = stateful
 	config.CheckpointEvery = 0
@@ -415,14 +430,14 @@ func TestAssuredManifestRecordsEffectiveControlProfileAndFrozenSafeState(t *test
 	if err := json.Unmarshal(profileJSON, &profile); err != nil {
 		t.Fatalf("decode recorded assured profile: %v", err)
 	}
-	if profile.Maritime.CommandTimeout != config.Maritime.CommandTimeout ||
-		profile.Maritime.TransportTimeout != config.Maritime.TransportTimeout ||
-		profile.Maritime.DeadMan != config.Maritime.DeadMan ||
-		profile.Maritime.DeadManReactuation != config.Maritime.DeadManReactuation ||
-		profile.Maritime.LoopWatchdog != config.Maritime.LoopWatchdog ||
-		profile.Maritime.ArmStickTolerance != config.Maritime.ArmStickTolerance ||
-		profile.Maritime.ArmTriggerTolerance != config.Maritime.ArmTriggerTolerance {
-		t.Fatalf("recorded maritime profile = %+v, config = %+v", profile.Maritime, config.Maritime)
+	if profile.Maritime.CommandTimeout != expected.CommandTimeout ||
+		profile.Maritime.TransportTimeout != expected.TransportTimeout ||
+		profile.Maritime.DeadMan != expected.DeadMan ||
+		profile.Maritime.DeadManReactuation != expected.DeadManReactuation ||
+		profile.Maritime.LoopWatchdog != expected.LoopWatchdog ||
+		profile.Maritime.ArmStickTolerance != expected.ArmStickTolerance ||
+		profile.Maritime.ArmTriggerTolerance != expected.ArmTriggerTolerance {
+		t.Fatalf("recorded strict profile = %+v, config = %+v", profile.Maritime, expected)
 	}
 	wantSafePayload := `{"marshal_call":1,"propulsion":0,"steering":0}`
 	if profile.Authority.EngineeredSafeState.Name != config.Authority.EngineeredSafeState.Name ||
@@ -439,7 +454,7 @@ func TestAssuredManifestRecordsEffectiveControlProfileAndFrozenSafeState(t *test
 		profile.Evidence.CheckpointEvery != audit.DefaultCheckpointEvery ||
 		profile.Evidence.WitnessTimeout != config.WitnessTimeout ||
 		profile.Evidence.ShutdownTimeout != config.ShutdownTimeout ||
-		profile.Evidence.LivenessInterval != config.Maritime.TransportTimeout/2 {
+		profile.Evidence.LivenessInterval != expected.TransportTimeout/2 {
 		t.Fatalf("recorded evidence profile = %+v", profile.Evidence)
 	}
 
@@ -628,6 +643,11 @@ func TestAssuredSessionRejectsMissingGuarantees(t *testing.T) {
 		want   error
 	}{
 		{
+			name:   "command policy",
+			mutate: func(config *assured.Config) { config.Authority.Policy = nil },
+			want:   assured.ErrInvalidConfig,
+		},
+		{
 			name:   "evidence store",
 			mutate: func(config *assured.Config) { config.EvidenceStore = nil },
 			want:   assured.ErrInvalidConfig,
@@ -701,15 +721,27 @@ func TestAssuredSessionRejectsMissingGuarantees(t *testing.T) {
 }
 
 func TestAssuredSessionRejectsSampledAndUnverifiableSources(t *testing.T) {
+	for _, spelling := range []string{"Safety", "Maritime"} {
+		t.Run(spelling, func(t *testing.T) { testAssuredRejectsSources(t, spelling) })
+	}
+}
+
+func testAssuredRejectsSources(t *testing.T, spelling string) {
+	t.Helper()
 	t.Run("sampled audit grade", func(t *testing.T) {
 		store := &syncStore{}
 		config, _ := validConfig(t, store, &witnessAnchor{}, &acceptingActuator{})
+		if spelling == "Safety" {
+			config.Safety, config.Maritime = config.Maritime, safety.MaritimeConfig{}
+		}
 		source := exactSource(false)
+		defer source.Close()
 		descriptor := source.Descriptor()
 		sampled := testkit.NewFakeSource(teleop.Descriptor{
 			ID:         descriptor.ID,
 			Capability: teleop.Capabilities{AuditGrade: teleop.AuditSampledState},
 		}, 1)
+		defer sampled.Close()
 		sampled.SetTransportHealth(teleop.TransportHealth{SilenceVerifiable: true})
 		_, err := assured.OpenSource(t.Context(), sampled, config)
 		if !errors.Is(err, assured.ErrAuditGrade) {
@@ -722,6 +754,9 @@ func TestAssuredSessionRejectsSampledAndUnverifiableSources(t *testing.T) {
 		config, _ := validConfig(t, store, &witnessAnchor{}, &acceptingActuator{})
 		config.Maritime.TransportTimeout = 75 * time.Millisecond
 		config.Authority.CommandTTL = 50 * time.Millisecond
+		if spelling == "Safety" {
+			config.Safety, config.Maritime = config.Maritime, safety.MaritimeConfig{}
+		}
 		source := exactSource(false)
 		source.SetTransportHealth(teleop.TransportHealth{})
 		_, err := assured.OpenSource(t.Context(), source, config)
@@ -968,7 +1003,7 @@ func TestOpenProviderRejectsConcreteControllerWithUnattestedPipeline(t *testing.
 		{name: "authority processor", omit: 2},
 		{name: "liveness", omit: 3},
 		{name: "shutdown timeout", omit: 4},
-		{name: "attestation seal", omit: 5},
+		{name: "attestation seal", omit: 6},
 		{name: "post-seal override", omit: -1, override: true},
 		{name: "post-seal custom clock", omit: -1, overrideClock: true},
 	} {

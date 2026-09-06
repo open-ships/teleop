@@ -16,6 +16,11 @@ import (
 // incident requires knowing what the machine was told to do, which is a
 // function of the application's own mapping from input to actuation, not of
 // the controller state teleop observes.
+//
+// This is an audit record, not an execution request: recording never sends a
+// command or evaluates a policy. Authorized is the application's assertion,
+// not a permission established by teleop. The optional safety.Command is the
+// separate intent type accepted by Safety Authority.
 type Command struct {
 	// Name identifies the command in an application-defined vocabulary.
 	Name string

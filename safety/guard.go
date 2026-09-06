@@ -15,7 +15,7 @@
 // path that honors its decisions.
 //
 // Hazardous production integrations should use assured.Session, which owns a
-// strict maritime Guard together with durable evidence, Safety Authority,
+// strict Guard together with durable evidence, Safety Authority,
 // expiring actuator leases, acknowledgement validation, and ordered shutdown.
 // Low-level users that construct a Guard directly should still route every
 // actuator request through Authority; a separate Evaluate-then-send loop leaves
@@ -43,11 +43,15 @@ const (
 	// is indistinguishable from one that has been taped, wedged, or left in
 	// the hand of an incapacitated operator.
 	DefaultDeadManReactuation = 60 * time.Second
-	// DefaultMaritimeLoopWatchdog is the conservative application-loop watchdog
-	// used by DefaultMaritimeConfig. Deployments must still choose all deadlines
+	// DefaultStrictLoopWatchdog is the application-loop watchdog
+	// used by DefaultStrictConfig. Deployments must still choose all deadlines
 	// from their own hazard analysis and enforce a shorter independent actuator
 	// lease where necessary.
-	DefaultMaritimeLoopWatchdog = 100 * time.Millisecond
+	DefaultStrictLoopWatchdog = 100 * time.Millisecond
+	// DefaultMaritimeLoopWatchdog retains the original profile default.
+	//
+	// Deprecated: use DefaultStrictLoopWatchdog.
+	DefaultMaritimeLoopWatchdog = DefaultStrictLoopWatchdog
 	// DefaultArmStickTolerance permits small normalized stick drift during Arm
 	// without applying an operational dead zone to live commands.
 	DefaultArmStickTolerance float32 = 0.05
@@ -90,11 +94,11 @@ type options struct {
 	validationErr       error
 }
 
-// MaritimeConfig is the validated production-oriented Guard profile. It
+// StrictConfig is the domain-neutral, validated Guard profile. It
 // requires every software interlock the Guard can provide and always latches.
 // It complements, rather than replaces, an actuator-side timeout and a
 // hardware emergency stop.
-type MaritimeConfig struct {
+type StrictConfig struct {
 	CommandTimeout      time.Duration
 	TransportTimeout    time.Duration
 	DeadMan             teleop.ControlID
@@ -104,19 +108,32 @@ type MaritimeConfig struct {
 	ArmTriggerTolerance float32
 }
 
-// DefaultMaritimeConfig returns the strict profile with conservative library
-// defaults. A deployment must replace them when its hazard analysis requires
-// shorter deadlines.
-func DefaultMaritimeConfig(deadMan teleop.ControlID) MaritimeConfig {
-	return MaritimeConfig{
+// MaritimeConfig is the original name for StrictConfig.
+//
+// Deprecated: use StrictConfig. The profile does not establish maritime safety.
+type MaritimeConfig = StrictConfig
+
+// DefaultStrictConfig returns starting values for the strict profile, not
+// approved limits for any particular system. Applications must select deadlines
+// and tolerances appropriate to their controlled system.
+func DefaultStrictConfig(deadMan teleop.ControlID) StrictConfig {
+	return StrictConfig{
 		CommandTimeout:      DefaultCommandTimeout,
 		TransportTimeout:    DefaultCommandTimeout,
 		DeadMan:             deadMan,
 		DeadManReactuation:  DefaultDeadManReactuation,
-		LoopWatchdog:        DefaultMaritimeLoopWatchdog,
+		LoopWatchdog:        DefaultStrictLoopWatchdog,
 		ArmStickTolerance:   DefaultArmStickTolerance,
 		ArmTriggerTolerance: DefaultArmTriggerTolerance,
 	}
+}
+
+// DefaultMaritimeConfig retains the original maritime preset with exactly the
+// same interlocks and defaults as DefaultStrictConfig, not vessel-approved limits.
+//
+// Deprecated: use DefaultStrictConfig.
+func DefaultMaritimeConfig(deadMan teleop.ControlID) MaritimeConfig {
+	return DefaultStrictConfig(deadMan)
 }
 
 // Option configures a Guard.
@@ -129,7 +146,7 @@ type Option func(*options)
 // Choose it from the worst tolerable actuation overrun, not from the expected
 // input rate. A change-driven backend legitimately falls silent while a control
 // is held steady, so an ordinary Guard will conservatively time out. The strict
-// maritime profile additionally requires independent TransportHealthSource
+// profile additionally requires independent TransportHealthSource
 // evidence; teleop.WithLiveness reports age but does not manufacture evidence.
 func WithCommandTimeout(timeout time.Duration) Option {
 	return func(o *options) {
@@ -279,10 +296,17 @@ func New(opts ...Option) *Guard {
 	return newGuard(configured)
 }
 
-// NewMaritime returns a Guard using the validated strict maritime profile.
+// NewMaritime is the compatibility spelling of NewStrict.
+//
+// Deprecated: use NewStrict.
+func NewMaritime(config MaritimeConfig) (*Guard, error) {
+	return NewStrict(config)
+}
+
+// NewStrict returns a Guard using the validated strict interlock profile.
 // Unlike New, it reports invalid configuration as an error because production
 // values commonly come from deployment configuration rather than source code.
-func NewMaritime(config MaritimeConfig) (*Guard, error) {
+func NewStrict(config StrictConfig) (*Guard, error) {
 	var validationErr error
 	if config.CommandTimeout <= 0 {
 		validationErr = errors.Join(validationErr, fmt.Errorf(

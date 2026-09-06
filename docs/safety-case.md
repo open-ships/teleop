@@ -5,18 +5,27 @@ behavior. It is not a vessel certification, type approval, or substitute for a
 hazard analysis performed against the actual propulsion, steering, power,
 communications, and operating environment.
 
+Scope: these claims concern the optional strict actuation path, not the
+requirements for ordinary controller input or auditing. The package's generic
+interfaces and software contracts can be verified without physical receiver
+specifications. Maritime hazards below illustrate a physical deployment;
+each consuming system owns its own deployment evidence. See
+[integration choices](integration.md) and [ADR-0004](adr/0004-keep-assurance-optional-and-domain-neutral.md).
+
 ## Top-level claim
 
 When an application uses an **Assured Session**, no application-requested,
 non-fallback **Actuator Command** is intentionally transmitted unless the
-software can establish the configured interlocks, preserve the exact input
-cause, and durably admit the corresponding **Activity Evidence**. Loss of
+software can establish configured interlocks and command-policy permission,
+preserve the exact input cause, and durably admit the corresponding **Activity Evidence**. Loss of
 authority or uncertainty selects the configured **Engineered Safe State** and
 stops renewing the **Command Lease**.
 
-This claim covers transaction integrity, not command semantics. Safety
-Authority does not determine whether an application chose the correct actuator,
-sign, units, range, rate, slew, vessel mode, or authorized operator.
+The command policy is an explicit trusted adapter, not a claim that generic
+software knows a vessel's safe limits. The reference `policy` package checks
+scalar identity, units, bounds, command/mode transitions, setpoint deltas and
+signed grants. Physical slew, actual vessel state, mapping correctness and
+safe-state suitability still need independently reviewed deployment evidence.
 
 That claim depends on deployment evidence outside this repository:
 
@@ -26,7 +35,7 @@ That claim depends on deployment evidence outside this repository:
 - vessel-specific analysis proving that state is safe in each operating mode;
 - a vessel-command policy that validates input mappings, actuator identity and
   units, command envelopes, rate/slew limits, operating-mode constraints, and
-  authenticated operator authorization before `Apply`, with independent
+  authenticated operator authorization at the `Authority.Policy` boundary, with independent
   receiver-side limits where required by the hazard analysis;
 - authenticated actuator feedback capable of distinguishing receipt from
   physical effect;
@@ -50,6 +59,8 @@ That claim depends on deployment evidence outside this repository:
 | SR-08 | A completed evidence history is resistant to undetected editing, replacement, truncation, and destruction. | Hash chaining, signed Merkle heads, trusted-key verification, timed checkpoints, and witness high-water tracking. | Independent key custody and WORM/transparency witness. |
 | SR-09 | Audit degradation is visible and policy-controlled. | Sticky recorder failures, witness receipts/health, timed idle checkpoints, persisted transport liveness, gap events, and strict Assured Session startup/close validation. | Capacity alarms, redundant journal, on-call response. |
 | SR-10 | Restart, reconnect, and handover never inherit previous authority. | One-shot session binding and reset-to-idle lifecycle semantics. | Operator handover procedure and integration tests. |
+| SR-11 | Live commands require an unexpired policy grant bound to exact command evidence. | `safety/policy_test.go`, `policy/policy_test.go`; Assured rejects a missing policy. | Approved limits, independent authorization service, revocation and key custody. |
+| SR-12 | Receiver enforcement can be fault-tested independently from input processing. | `simulation/receiver_test.go` exercises boot epochs, ownership, replay, expiry, authenticated policy faults and fallback. | The model is not hardware; run the same scenarios against the installed receiver and independent watchdog. |
 
 ## Hazard log
 
@@ -65,7 +76,7 @@ That claim depends on deployment evidence outside this repository:
 | H-08 audit outage creates a second hazard | Disk full or witness outage blocks commands needed to remain safe. | External witnessing is not a prerequisite for attempting the Engineered Safe State; policy distinguishes local durability from external witnessing. | Local evidence, process, or actuator failure can still defeat the attempt; vessel-specific trade-off between continued control and evidence availability. |
 | H-09 acknowledged command is not physically applied | Transport acknowledgement is mistaken for actuator effect. | Assured configuration rejects an accepted reply without an application time inside the lease; malformed, stale, or future claims are uncertainty and trigger fallback. | `AppliedAt` is still an adapter assertion; requires authenticated independent physical feedback and trustworthy clock bounds. |
 | H-10 recent evidence is destroyed before external acknowledgement | The producer and its locally durable journal fail or are compromised after an event but before a witness receipt covers it. | Every Assured event is locally synchronized; signed checkpoints, receipt high-water tracking, health counters, configurable checkpoint frequency, exact startup witnessing, and an exact witnessed footer expose and reduce the window. | The suffix after the last receipt is not externally protected. Use independent low-latency witnesses, `CheckpointEvery: 1` where justified, redundant/WORM storage, and active lag alarms. |
-| H-11 unsafe command passes every teleop interlock | Application mapping selects the wrong actuator, sign, units, range, rate/slew, or vessel mode, or relies on an unauthenticated operator/grant label. | No semantic control is claimed. Authority binds the exact application-supplied command bytes and current input cause to its decision, evidence, lease, and acknowledgement; it does not interpret the command or authenticate provenance fields. | Independently review and test the vessel-command policy; authenticate and enforce operator roles; enforce hard envelopes and mode constraints at the receiver; validate with hardware-in-the-loop and sea trials. |
+| H-11 unsafe command passes every teleop interlock | Incorrect mapping, units, limits, mode or operator permission. | Mandatory Assured command-policy evaluation, exact decision/intent evidence, grant-bounded leases; strict reference scalar policy and signed grants. | Wrong configured limits, permissive custom policies, state/feedback error and compromised credentials remain possible; independently enforce receiver envelopes and validate with hardware-in-the-loop and sea trials. |
 
 ## Evidence semantics
 
@@ -110,8 +121,8 @@ when the witness, network, or producer is unavailable.
   seam, not a physical controller or radio response.
 - Do not use a zero controller state as a synonym for vessel safety. Configure
   an Engineered Safe State for each actuator/mode and test transitions into it.
-- Do not treat an Authority permit as approval of vessel-command semantics.
-  Before `Apply`, validate the input-to-command mapping, actuator/channel and
+- Do not treat a policy permit as proof of physical safety. Configure and
+  independently validate the input-to-command mapping, actuator/channel and
   units, permitted envelope, rate/slew, current vessel mode/state, and operator
   grant. Enforce safety-critical limits again outside this process where a
   single application fault cannot be accepted. Retain the effective policy or
