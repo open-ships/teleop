@@ -215,8 +215,8 @@ Each call to `Subscribe` creates an independent bounded queue:
 
 - `DeliveryLossless` terminates with `teleop.ErrSubscriptionOverflow` instead
   of silently dropping input. Use it for command and safety consumers.
-- `DeliveryLatest` discards the oldest queued event when full. Use it for
-  monitors and other snapshot-oriented consumers.
+- `DeliveryLatest` clears the queued backlog when full and retains the newest
+  event. Use it for monitors and other snapshot-oriented consumers.
 
 The default buffer is 1024 events. Choose a buffer based on the consumer's
 worst-case latency and always handle the subscription's terminal error.
@@ -243,6 +243,18 @@ controller, err := provider.Open(
 )
 ```
 
+`TapMaximum` is inclusive. A press longer than that limit but shorter than
+`HoldMinimum` produces neither a tap nor a hold and clears the pending
+double-tap sequence. A hold takes precedence when both limits are equal.
+Gesture configuration rejects non-finite thresholds and hysteresis.
+
+Controller-backed gesture durations use session-relative monotonic time, so
+wall-clock corrections do not turn a short press into a hold. Standalone
+recognition uses recorded monotonic metadata when present; use
+`Recognizer.AdvanceMonotonic(session, elapsed)` for idle advancement of that
+session. `AdvanceGestures(wallTime)` serves legacy events with wall time only.
+Keep one time basis per session; see [the audit guide](docs/audit.md) for replay.
+
 Record the application command at the same decision boundary that sends it to
 the machine. Link it to the input or derived event IDs that produced it so the
 audit trail records both operator intent and the command actually considered:
@@ -256,7 +268,9 @@ err := controller.RecordCommand(ctx, teleop.Command{
 })
 ```
 
-`RecordCommand` is non-blocking; `teleop.ErrPipelineOverflow` means the
+`RecordCommand` admits to its queue without waiting for space or sink callbacks.
+It serializes the payload synchronously, so custom JSON serialization must
+bound its own work. `teleop.ErrPipelineOverflow` means the
 command could not be admitted to the bounded audit pipeline and should be
 treated as a safety fault.
 
@@ -407,7 +421,10 @@ consistency, not device identity. Key provisioning, rotation, revocation, and
 destruction are deployment responsibilities.
 
 When feeding a finite `testkit.ReplaySource` through a controller, pass
-`teleop.WithDeferredStart()` so `Subscribe` is attached before replay begins.
+`teleop.WithDeferredStart()` so `Subscribe` is attached before replay begins,
+and `teleop.WithReplayBackpressure()` so ingestion waits for bounded queue space.
+The latter is for pausable replay input; live inputs retain fail-fast overflow
+detection, and Assured pipeline attestation rejects replay backpressure.
 
 Known backend loss is published as `GapEvent`. Recorder failures stop the
 controller pipeline, and lossless subscriber overflow is explicit. See

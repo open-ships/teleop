@@ -333,6 +333,12 @@ changes. Disarm, Emergency Stop, and Close revoke authority before waiting for
 evidence or serialization, cancel an in-flight requested command, and attempt a
 newer Engineered Safe State command. A safety-generation check also prevents an
 earlier blocked Arm or Reset from overwriting a later safety request.
+`Session.Disarm` and `Session.EmergencyStop` accept canceled or expired caller
+contexts: revocation still occurs and Authority supplies bounded contexts for
+evidence and the safe-state attempt. Pass a non-nil context. Ordinary operations
+such as Arm, Reset, and Apply still honor caller cancellation. Once Session
+shutdown begins, `Close` owns the ordered safe-state attempt and final audit;
+lifecycle calls return `assured.ErrSessionClosed`.
 
 ### Using Safety Authority without an Assured Session
 

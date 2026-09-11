@@ -5,7 +5,6 @@ package testkit
 import (
 	"context"
 	"io"
-	"slices"
 	"sync"
 	"time"
 
@@ -93,8 +92,10 @@ func (f *FakeSource) Push(ctx context.Context, state teleop.State) error {
 	})
 }
 
-// PushObservation queues an exact observation for the controller ingest loop.
+// PushObservation queues an isolated observation for the controller ingest
+// loop. The caller may reuse or mutate its data after this method returns.
 func (f *FakeSource) PushObservation(ctx context.Context, observation teleop.Observation) error {
+	observation = observation.Clone()
 	select {
 	case <-f.done:
 		return teleop.ErrClosed
@@ -152,6 +153,9 @@ func (f *FakeSource) Close() error {
 }
 
 // ReplaySource is a finite teleop.InputSource over recorded observations.
+// When using it with Controller, enable WithDeferredStart and
+// WithReplayBackpressure to attach subscribers first and pace bounded ingest.
+// Read does not sleep or advance a clock; WithClock controls re-derivation time.
 type ReplaySource struct {
 	descriptor   teleop.Descriptor
 	observations []teleop.Observation
@@ -162,9 +166,13 @@ type ReplaySource struct {
 
 // NewReplaySource copies descriptor and observations into a finite replay.
 func NewReplaySource(descriptor teleop.Descriptor, observations []teleop.Observation) *ReplaySource {
+	copied := make([]teleop.Observation, len(observations))
+	for index, observation := range observations {
+		copied[index] = observation.Clone()
+	}
 	return &ReplaySource{
 		descriptor:   descriptor.Clone(),
-		observations: slices.Clone(observations),
+		observations: copied,
 	}
 }
 
@@ -182,7 +190,7 @@ func (r *ReplaySource) Read(ctx context.Context) (teleop.Observation, error) {
 	if r.closed || r.index >= len(r.observations) {
 		return teleop.Observation{}, io.EOF
 	}
-	observation := r.observations[r.index]
+	observation := r.observations[r.index].Clone()
 	r.index++
 	return observation, nil
 }

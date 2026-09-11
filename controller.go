@@ -474,13 +474,21 @@ func (c *Controller) readLoop() {
 			receivedAt:  c.clock.Now(),
 			err:         err,
 		}
-		select {
-		case c.ingest <- result:
-		case <-c.sourceCtx.Done():
-			return
-		default:
-			c.requestFatal(ErrPipelineOverflow)
-			return
+		if c.options.replayBackpressure {
+			select {
+			case c.ingest <- result:
+			case <-c.sourceCtx.Done():
+				return
+			}
+		} else {
+			select {
+			case c.ingest <- result:
+			case <-c.sourceCtx.Done():
+				return
+			default:
+				c.requestFatal(ErrPipelineOverflow)
+				return
+			}
 		}
 		if err != nil {
 			return
@@ -587,7 +595,7 @@ func (c *Controller) handleObservation(observation Observation, receivedAt time.
 			receivedAt,
 			observation.DeviceTimestamp,
 			cause,
-			false,
+			invalid,
 		)
 	}) {
 		if err := c.publish(event); err != nil {

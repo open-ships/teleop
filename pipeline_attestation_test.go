@@ -70,38 +70,40 @@ func TestControllerAttestsExactSealedPipeline(t *testing.T) {
 }
 
 func TestControllerAttestationDetectsPostSealOverride(t *testing.T) {
-	sink := &attestedSink{}
-	processor := &attestedProcessor{}
-	attestation, err := teleop.NewPipelineAttestation(teleop.PipelineRequirements{
-		AuditSinks:       []teleop.EventSink{sink},
-		Processors:       []teleop.Processor{processor},
-		SynchronousAudit: true,
-		LivenessInterval: 20 * time.Millisecond,
-		ShutdownTimeout:  250 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := testkit.NewFakeSource(teleop.Descriptor{ID: "pipeline-attestation:1"}, 1)
-	controller, err := teleop.NewController(
-		source,
-		teleop.WithAuditSink(sink),
-		teleop.WithSynchronousAudit(),
-		teleop.WithProcessor(processor),
-		teleop.WithLiveness(20*time.Millisecond, 0),
-		teleop.WithShutdownTimeout(250*time.Millisecond),
-		attestation.Option(),
-		teleop.WithLiveness(0, 0),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controller.Close()
-	if err := controller.AttestPipeline(attestation); !errors.Is(
-		err,
-		teleop.ErrPipelineAttestation,
-	) {
-		t.Fatalf("AttestPipeline error = %v, want override rejection", err)
+	for _, override := range []teleop.OpenOption{teleop.WithLiveness(0, 0), teleop.WithReplayBackpressure()} {
+		sink := &attestedSink{}
+		processor := &attestedProcessor{}
+		attestation, err := teleop.NewPipelineAttestation(teleop.PipelineRequirements{
+			AuditSinks:       []teleop.EventSink{sink},
+			Processors:       []teleop.Processor{processor},
+			SynchronousAudit: true,
+			LivenessInterval: 20 * time.Millisecond,
+			ShutdownTimeout:  250 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := testkit.NewFakeSource(teleop.Descriptor{ID: "pipeline-attestation:1"}, 1)
+		controller, err := teleop.NewController(
+			source,
+			teleop.WithAuditSink(sink),
+			teleop.WithSynchronousAudit(),
+			teleop.WithProcessor(processor),
+			teleop.WithLiveness(20*time.Millisecond, 0),
+			teleop.WithShutdownTimeout(250*time.Millisecond),
+			attestation.Option(),
+			override,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer controller.Close()
+		if err := controller.AttestPipeline(attestation); !errors.Is(
+			err,
+			teleop.ErrPipelineAttestation,
+		) {
+			t.Fatalf("AttestPipeline error = %v, want override rejection", err)
+		}
 	}
 }
 
@@ -123,6 +125,7 @@ func TestControllerAttestationRejectsUnsafeEffectiveOptions(t *testing.T) {
 		{name: "pipeline buffers", option: teleop.WithPipelineBuffers(4, 4)},
 		{name: "callback timeout", option: teleop.WithCallbackTimeout(time.Millisecond)},
 		{name: "deferred start", option: teleop.WithDeferredStart()},
+		{name: "replay backpressure", option: teleop.WithReplayBackpressure()},
 		{name: "stale policy", option: teleop.WithLiveness(20*time.Millisecond, time.Second)},
 		{name: "stale neutralization", option: teleop.WithNeutralizeOnStale(true)},
 		{name: "clock step threshold", option: teleop.WithClockStepThreshold(time.Millisecond)},

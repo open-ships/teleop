@@ -148,6 +148,12 @@ advertises rumble also implements `teleop.RumbleSource`; the controller exposes
 it through `GameController.SetRumble`. New control IDs and controller types can
 be introduced as string-backed values without registering them globally.
 
+Time-based processors can use the optional `teleop.MonotonicProcessingContext`
+extension, which Controller implements, to read the session ID and elapsed
+monotonic time. Existing `ProcessingContext` adapters remain compatible. Timer
+state must stay within its originating session; wall time is descriptive
+metadata and must not determine live gesture durations.
+
 Provider implementations should:
 
 1. Preserve every OS reading.

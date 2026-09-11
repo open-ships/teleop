@@ -85,8 +85,30 @@ applications should use `assured.Session`, which requires that mode and checks
 `Recorder.EvidenceStatus` before actuation.
 
 Finite `testkit.ReplaySource` instances should be opened with
-`teleop.WithDeferredStart()`; the first subscription then attaches before the
-replay source starts returning observations.
+`teleop.WithDeferredStart()` and `teleop.WithReplayBackpressure()`. The first
+subscription attaches before the source starts, and ingestion waits for bounded
+queue space rather than overflowing on a long history. Subscriber delivery
+policies and sink deadlines still apply. Cancellation and `Close` interrupt an
+ingest wait. Finite EOF is reported as `teleop.ErrDisconnected`, including by
+`Controller.Close`. Assured pipeline attestation rejects replay backpressure;
+live input retains fail-fast overflow detection.
+
+`ReplaySource` copies all observation data at construction and returns isolated
+values. It neither sleeps nor advances a clock. Controller re-derivation uses
+the new session's clock; use `teleop.WithClock` and explicitly coordinate source
+delivery and clock advancement for a deterministic simulation. Original
+`ObservedAt` values alone do not reproduce gesture durations. Use `audit.Events`
+to preserve the recorded event stream exactly.
+
+For standalone gesture reconstruction from canonical `audit.Events`, the
+recognizer uses `ReceivedMonotonic` when reception metadata is present, or
+`Monotonic` for publication-only metadata. Advance idle timers with
+`Recognizer.AdvanceMonotonic(session, elapsed)` on the same session timeline.
+Keep one time basis per session. A zero reading is a valid session origin;
+`AdvanceMonotonic` can explicitly establish that basis before a nonzero event
+arrives. `AdvanceGestures` only advances legacy wall-time sessions. Event wall
+timestamps remain descriptive metadata; elapsed durations use the selected
+monotonic timeline even after JSON decoding or a host clock correction.
 
 ## What each mechanism actually proves
 

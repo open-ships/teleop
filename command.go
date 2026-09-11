@@ -55,8 +55,10 @@ type commandResult struct {
 
 // RecordCommand publishes a CommandEvent to every subscription and audit sink.
 //
-// It never blocks the caller. A full queue returns ErrPipelineOverflow
-// immediately rather than stalling a control loop; a safety-critical caller
+// Queue admission does not wait for space or sink callbacks. Payload JSON
+// serialization runs synchronously in the caller, including any custom
+// MarshalJSON method; callers must bound that work. A full queue returns
+// ErrPipelineOverflow immediately; a safety-critical caller
 // should treat that error as a fault and inhibit output, because the command
 // it just issued is not in the record.
 func (c *Controller) RecordCommand(ctx context.Context, command Command) error {

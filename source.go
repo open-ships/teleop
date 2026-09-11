@@ -61,6 +61,18 @@ type Observation struct {
 	Gap             *SourceGap
 }
 
+// Clone returns an isolated copy, including extension buttons, native bytes
+// and fields, and gap metadata. Time values are preserved unchanged.
+func (observation Observation) Clone() Observation {
+	observation.State = observation.State.Clone()
+	observation.Native = observation.Native.clone()
+	if observation.Gap != nil {
+		gap := *observation.Gap
+		observation.Gap = &gap
+	}
+	return observation
+}
+
 // InputSource is the small boundary implemented by platform drivers and fakes.
 type InputSource interface {
 	Descriptor() Descriptor
@@ -79,6 +91,15 @@ type EventSink interface {
 type ProcessingContext interface {
 	NewHeader(stream string, observedAt time.Time, deviceTimestamp int64, causes ...EventID) Header
 	Now() time.Time
+}
+
+// MonotonicProcessingContext supplies the session clock for time-based
+// processors. Controller implements this optional extension. Keeping it
+// separate preserves compatibility with legacy ProcessingContext adapters.
+type MonotonicProcessingContext interface {
+	ProcessingContext
+	Session() SessionID
+	Monotonic() time.Duration
 }
 
 // Processor derives events from events earlier in a controller pipeline.
@@ -138,6 +159,7 @@ type controllerOptions struct {
 	neutralizeOnStale  bool
 	synchronousAudit   bool
 	deferredStart      bool
+	replayBackpressure bool
 	pipelineNonce      [32]byte
 }
 
@@ -198,6 +220,18 @@ func WithContext(ctx context.Context) OpenOption {
 func WithDeferredStart() OpenOption {
 	return func(options *controllerOptions) {
 		options.deferredStart = true
+	}
+}
+
+// WithReplayBackpressure makes source ingestion wait for bounded queue space
+// instead of terminating with ErrPipelineOverflow. Use only for finite,
+// pausable replay input; live device input must retain overflow detection.
+// Cancellation and Close interrupt the wait. Subscriber delivery policies and
+// sink deadlines remain unchanged. Pipeline attestation rejects this option,
+// so it cannot weaken an Assured Session's live-input contract.
+func WithReplayBackpressure() OpenOption {
+	return func(options *controllerOptions) {
+		options.replayBackpressure = true
 	}
 }
 

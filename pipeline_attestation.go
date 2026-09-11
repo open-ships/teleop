@@ -16,8 +16,8 @@ import (
 // concrete type. Their order and count are significant. All controller options
 // not represented here are sealed to their conservative defaults: the system
 // clock and background context, default buffers and callback timeout, eager
-// start, no observation staleness policy, no stale neutralization, and the
-// default clock-step threshold.
+// start, fail-fast ingest overflow, no observation staleness policy, no stale
+// neutralization, and the default clock-step threshold.
 type PipelineRequirements struct {
 	AuditSinks       []EventSink
 	Processors       []Processor
@@ -46,6 +46,7 @@ type pipelineSnapshot struct {
 	neutralizeOnStale  bool
 	synchronousAudit   bool
 	deferredStart      bool
+	replayBackpressure bool
 }
 
 // PipelineAttestation is an opaque, per-open option seal. Construct one, pass
@@ -206,6 +207,7 @@ func (attestation *PipelineAttestation) accepts(snapshot pipelineSnapshot) bool 
 		!snapshot.neutralizeOnStale &&
 		snapshot.synchronousAudit == attestation.synchronousAudit &&
 		!snapshot.deferredStart &&
+		!snapshot.replayBackpressure &&
 		slices.Equal(snapshot.sinks, attestation.sinks) &&
 		slices.Equal(snapshot.processors, attestation.processors)
 }
@@ -226,6 +228,7 @@ func snapshotPipeline(options *controllerOptions) (pipelineSnapshot, bool) {
 		neutralizeOnStale:  options.neutralizeOnStale,
 		synchronousAudit:   options.synchronousAudit,
 		deferredStart:      options.deferredStart,
+		replayBackpressure: options.replayBackpressure,
 	}
 	_, snapshot.systemClock = options.clock.(systemClock)
 	var ok bool
@@ -270,7 +273,8 @@ func (snapshot pipelineSnapshot) equal(other pipelineSnapshot) bool {
 		snapshot.clockStepThreshold != other.clockStepThreshold ||
 		snapshot.neutralizeOnStale != other.neutralizeOnStale ||
 		snapshot.synchronousAudit != other.synchronousAudit ||
-		snapshot.deferredStart != other.deferredStart {
+		snapshot.deferredStart != other.deferredStart ||
+		snapshot.replayBackpressure != other.replayBackpressure {
 		return false
 	}
 	return slices.Equal(snapshot.sinks, other.sinks) &&
