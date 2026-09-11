@@ -62,6 +62,21 @@ That claim depends on deployment evidence outside this repository:
 | SR-11 | Live commands require an unexpired policy grant bound to exact command evidence. | `safety/policy_test.go`, `policy/policy_test.go`; Assured rejects a missing policy. | Approved limits, independent authorization service, revocation and key custody. |
 | SR-12 | Receiver enforcement can be fault-tested independently from input processing. | `simulation/receiver_test.go` exercises boot epochs, ownership, replay, expiry, authenticated policy faults and fallback. | The model is not hardware; run the same scenarios against the installed receiver and independent watchdog. |
 
+### SDK regression checks
+
+These tests retain executable evidence for the input, lifecycle, and replay
+contracts affected by the September 2026 SDK review. Run them with `go test
+-race ./...`.
+
+| Contract | Related requirements | Regression evidence |
+| --- | --- | --- |
+| Disarm and Emergency Stop revoke authority with canceled or expired caller contexts, including during Apply; attempts and outcomes survive signed-log verification. | SR-04, SR-05, SR-06 | [assured/stop_context_test.go](../assured/stop_context_test.go) |
+| Rejected analog input marks every resulting reset and derived gesture/action synthetic. | SR-01, SR-06 | [invalid_provenance_test.go](../invalid_provenance_test.go) |
+| Gesture timing survives clock steps and JSON decoding; tap boundaries and finite configuration values are enforced. | SR-06 | [gesture/timing_test.go](../gesture/timing_test.go) |
+| Finite replay preserves ordered observations and gaps beyond ingest capacity, including synchronous recording; cancellation unblocks ingestion. | SR-06 | [replay_backpressure_test.go](../replay_backpressure_test.go) |
+| Live ingestion still fails on overflow; Assured attestation rejects replay backpressure before and after sealing. | SR-03, SR-09 | [ingest_overflow_test.go](../ingest_overflow_test.go), [pipeline_attestation_test.go](../pipeline_attestation_test.go) |
+| Replay and fake inputs own extension buttons, native bytes/fields, and gap metadata independently of callers and other readers. | SR-06 | [testkit/ownership_test.go](../testkit/ownership_test.go) |
+
 ## Hazard log
 
 | Hazard | Initiating condition | Software control | Residual risk |

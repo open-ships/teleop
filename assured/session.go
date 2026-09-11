@@ -423,9 +423,10 @@ func (session *Session) Reset(ctx context.Context, detail string) error {
 }
 
 // Disarm revokes authority and synchronously attempts the engineered safe
-// state.
+// state. Caller cancellation does not suppress revocation or the bounded
+// safe-state attempt; use Close for a Session already shutting down.
 func (session *Session) Disarm(ctx context.Context, detail string) error {
-	if err := session.active(ctx); err != nil {
+	if err := session.activeSafety(ctx); err != nil {
 		return err
 	}
 	return session.authority.Disarm(ctx, detail)
@@ -433,8 +434,10 @@ func (session *Session) Disarm(ctx context.Context, detail string) error {
 
 // EmergencyStop latches an inhibit and synchronously attempts the engineered
 // safe state. It does not replace an independent hardware emergency stop.
+// Caller cancellation does not suppress revocation or the bounded safe-state
+// attempt; use Close for a Session already shutting down.
 func (session *Session) EmergencyStop(ctx context.Context, detail string) error {
-	if err := session.active(ctx); err != nil {
+	if err := session.activeSafety(ctx); err != nil {
 		return err
 	}
 	return session.authority.EmergencyStop(ctx, detail)
@@ -590,6 +593,16 @@ func (session *Session) active(ctx context.Context) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	return session.activeSafety(ctx)
+}
+
+// Revoking authority must not inherit caller cancellation. Keep the lifetime
+// check shared with ordinary operations so ordered finalization still owns a
+// closing Session. Authority supplies its own bounded safety contexts.
+func (session *Session) activeSafety(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: nil context", ErrInvalidConfig)
 	}
 	session.stateMu.Lock()
 	closing := session.closing

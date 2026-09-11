@@ -70,6 +70,9 @@ type ChordSpec struct {
 
 // Config controls gesture timing and analog hysteresis.
 type Config struct {
+	// TapMaximum is the inclusive tap duration limit. Durations between this
+	// limit and HoldMinimum produce neither gesture and clear a pending tap.
+	// Hold wins at the shared boundary when both limits are equal.
 	TapMaximum        time.Duration
 	DoubleTapWindow   time.Duration
 	HoldMinimum       time.Duration
@@ -103,8 +106,9 @@ type press struct {
 }
 
 type tap struct {
-	at      time.Time
-	eventID teleop.EventID
+	at        time.Time
+	monotonic time.Duration
+	eventID   teleop.EventID
 }
 
 type streamKey struct {
@@ -113,6 +117,7 @@ type streamKey struct {
 }
 
 type streamState struct {
+	monotonic    bool
 	pressed      map[teleop.ControlID]press
 	lastTap      map[teleop.ControlID]tap
 	activeChords map[int]teleop.EventID
@@ -175,6 +180,14 @@ func New(config Config) *Recognizer {
 }
 
 func validateConfig(config Config) error {
+	for _, value := range []float32{
+		config.StickThreshold, config.StickHysteresis,
+		config.TriggerThreshold, config.TriggerHysteresis,
+	} {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return fmt.Errorf("gesture: thresholds and hysteresis must be finite")
+		}
+	}
 	if config.TapMaximum < 0 ||
 		config.DoubleTapWindow < 0 ||
 		config.HoldMinimum <= 0 {
@@ -237,7 +250,8 @@ func (r *Recognizer) Advance(now time.Time) []teleop.Event {
 	return asEvents(recognized)
 }
 
-// AdvanceContext implements teleop.ContextAdvancingProcessor.
+// AdvanceContext implements teleop.ContextAdvancingProcessor. With a
+// MonotonicProcessingContext it advances only that controller's session.
 func (r *Recognizer) AdvanceContext(
 	_ context.Context,
 	processing teleop.ProcessingContext,
@@ -247,11 +261,22 @@ func (r *Recognizer) AdvanceContext(
 	defer r.mu.Unlock()
 	r.processing = processing
 	defer func() { r.processing = nil }()
-	recognized := r.advanceLocked(now)
+	var recognized []Event
+	if clock, ok := processing.(teleop.MonotonicProcessingContext); ok {
+		session, elapsed := clock.Session(), clock.Monotonic()
+		recognized = r.advanceLocked(now, &session, &elapsed)
+	} else {
+		recognized = r.advanceLocked(now, nil, nil)
+	}
 	return asEvents(recognized), nil
 }
 
-// Recognize consumes one canonical input event.
+// Recognize consumes one canonical input event. Timing uses session-relative
+// monotonic metadata when available, including metadata decoded from audit.
+// Legacy events with only wall time retain wall-time timing. Keep one time
+// basis per session; after monotonic metadata appears, zero means the session
+// origin rather than missing timing. Use AdvanceMonotonic for idle advancement
+// of recorded monotonic sessions.
 func (r *Recognizer) Recognize(input teleop.Event) []Event {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -262,12 +287,13 @@ func (r *Recognizer) recognizeLocked(input teleop.Event) []Event {
 	header := input.Header()
 	key := streamKey{session: header.ID.Session, device: header.DeviceID}
 	state := r.state(key)
-	r.expireTaps(state, header.ObservedAt)
+	now := state.eventTime(header, r.processing)
+	r.expireTaps(state, now)
 	switch event := input.(type) {
 	case teleop.ButtonEvent:
-		return r.processButton(state, event)
+		return r.processButton(state, event, now)
 	case *teleop.ButtonEvent:
-		return r.processButton(state, *event)
+		return r.processButton(state, *event, now)
 	case teleop.StickEvent:
 		return r.processStick(state, event)
 	case *teleop.StickEvent:
@@ -278,24 +304,40 @@ func (r *Recognizer) recognizeLocked(input teleop.Event) []Event {
 		return r.processTrigger(state, *event)
 	case teleop.ConnectionEvent:
 		if event.State == teleop.Disconnected {
-			return r.reset(key, state, event.Meta)
+			return r.reset(key, state, event.Meta, now)
 		}
 	case *teleop.ConnectionEvent:
 		if event.State == teleop.Disconnected {
-			return r.reset(key, state, event.Meta)
+			return r.reset(key, state, event.Meta, now)
 		}
 	}
 	return nil
 }
 
-// AdvanceGestures emits elapsed holds using the supplied event-timeline time.
+// AdvanceGestures emits elapsed holds for legacy wall-time sessions using the
+// supplied event-timeline time. Monotonic sessions require AdvanceMonotonic;
+// wall time cannot safely advance their timers across a clock correction.
 func (r *Recognizer) AdvanceGestures(now time.Time) []Event {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.advanceLocked(now)
+	return r.advanceLocked(now, nil, nil)
 }
 
-func (r *Recognizer) advanceLocked(now time.Time) []Event {
+// AdvanceMonotonic emits elapsed holds for one session using its recorded or
+// live session-relative monotonic time. It does not consult the host clock or
+// advance other sessions. It establishes a monotonic time basis even when the
+// only input so far arrived at session origin (zero). Negative values are
+// ignored. Use AdvanceGestures for legacy wall-time sessions instead.
+func (r *Recognizer) AdvanceMonotonic(session teleop.SessionID, now time.Duration) []Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.advanceLocked(time.Time{}, &session, &now)
+}
+
+func (r *Recognizer) advanceLocked(wall time.Time, session *teleop.SessionID, elapsed *time.Duration) []Event {
+	if elapsed != nil && *elapsed < 0 {
+		return nil
+	}
 	keys := slices.SortedFunc(maps.Keys(r.states), func(left, right streamKey) int {
 		return cmp.Or(
 			bytes.Compare(left.session[:], right.session[:]),
@@ -305,6 +347,21 @@ func (r *Recognizer) advanceLocked(now time.Time) []Event {
 	var result []Event
 	for _, key := range keys {
 		state := r.states[key]
+		if session != nil && key.session != *session {
+			continue
+		}
+		if elapsed != nil {
+			state.useMonotonic()
+		}
+		// Never infer a monotonic duration from wall time or use one
+		// controller's session origin to advance another controller.
+		if state.monotonic != (elapsed != nil) {
+			continue
+		}
+		now := wall
+		if elapsed != nil {
+			now = monotonicEpoch.Add(*elapsed)
+		}
 		r.expireTaps(state, now)
 		buttons := sortedPressed(state.pressed)
 		for _, button := range buttons {
@@ -314,9 +371,13 @@ func (r *Recognizer) advanceLocked(now time.Time) []Event {
 				continue
 			}
 			pressState.holdSent = true
-			startedAt := pressState.at.Add(r.config.HoldMinimum)
+			startedAt := pressState.header.ObservedAt.Add(r.config.HoldMinimum)
+			cause := pressState.header
+			if elapsed != nil {
+				cause.Monotonic = *elapsed
+			}
 			event := r.event(
-				pressState.header,
+				cause,
 				startedAt,
 				Hold,
 				teleop.PhaseStarted,
@@ -334,15 +395,16 @@ func (r *Recognizer) advanceLocked(now time.Time) []Event {
 	return result
 }
 
-func (r *Recognizer) processButton(state *streamState, event teleop.ButtonEvent) []Event {
-	now := event.Meta.ObservedAt
-	if now.IsZero() {
+func (r *Recognizer) processButton(state *streamState, event teleop.ButtonEvent, now time.Time) []Event {
+	if event.Meta.ObservedAt.IsZero() {
 		if r.processing != nil {
-			now = r.processing.Now()
+			event.Meta.ObservedAt = r.processing.Now()
 		} else {
-			now = time.Now()
+			event.Meta.ObservedAt = time.Now()
 		}
-		event.Meta.ObservedAt = now
+		if !state.monotonic {
+			now = event.Meta.ObservedAt
+		}
 	}
 	if event.Pressed {
 		if _, repeated := state.pressed[event.Button]; repeated {
@@ -365,7 +427,7 @@ func (r *Recognizer) processButton(state *streamState, event teleop.ButtonEvent)
 	if pressState.holdSent {
 		ended := r.event(
 			event.Meta,
-			now,
+			event.Meta.ObservedAt,
 			Hold,
 			teleop.PhaseEnded,
 			[]teleop.ControlID{event.Button},
@@ -377,9 +439,14 @@ func (r *Recognizer) processButton(state *streamState, event teleop.ButtonEvent)
 		return append(result, ended)
 	}
 	if duration >= r.config.HoldMinimum {
+		// The release reveals an elapsed hold. Preserve the press as its
+		// cause, but publication occurs on the release's timeline.
+		cause := pressState.header
+		cause.Monotonic = event.Meta.Monotonic
+		cause.PublishedAt = event.Meta.PublishedAt
 		started := r.event(
-			pressState.header,
-			pressState.at.Add(r.config.HoldMinimum),
+			cause,
+			pressState.header.ObservedAt.Add(r.config.HoldMinimum),
 			Hold,
 			teleop.PhaseStarted,
 			[]teleop.ControlID{event.Button},
@@ -390,7 +457,7 @@ func (r *Recognizer) processButton(state *streamState, event teleop.ButtonEvent)
 		started.Meta.Causes = []teleop.EventID{pressState.header.ID}
 		ended := r.event(
 			event.Meta,
-			now,
+			event.Meta.ObservedAt,
 			Hold,
 			teleop.PhaseEnded,
 			[]teleop.ControlID{event.Button},
@@ -402,12 +469,16 @@ func (r *Recognizer) processButton(state *streamState, event teleop.ButtonEvent)
 		return append(result, started, ended)
 	}
 
+	if duration > r.config.TapMaximum {
+		delete(state.lastTap, event.Button)
+		return result
+	}
 	if last, ok := state.lastTap[event.Button]; ok && !now.Before(last.at) {
 		since := now.Sub(last.at)
 		if since <= r.config.DoubleTapWindow {
 			doubleTapped := r.event(
 				event.Meta,
-				now,
+				event.Meta.ObservedAt,
 				DoubleTap,
 				teleop.PhaseEnded,
 				[]teleop.ControlID{event.Button},
@@ -426,7 +497,7 @@ func (r *Recognizer) processButton(state *streamState, event teleop.ButtonEvent)
 	}
 	tapped := r.event(
 		event.Meta,
-		now,
+		event.Meta.ObservedAt,
 		Tap,
 		teleop.PhaseEnded,
 		[]teleop.ControlID{event.Button},
@@ -435,7 +506,7 @@ func (r *Recognizer) processButton(state *streamState, event teleop.ButtonEvent)
 		0,
 	)
 	tapped.Meta.Causes = []teleop.EventID{pressState.header.ID, event.Meta.ID}
-	state.lastTap[event.Button] = tap{at: now, eventID: tapped.Meta.ID}
+	state.lastTap[event.Button] = tap{at: now, monotonic: headerMonotonic(event.Meta), eventID: tapped.Meta.ID}
 	return append(result, tapped)
 }
 
@@ -569,6 +640,7 @@ func (r *Recognizer) reset(
 	key streamKey,
 	state *streamState,
 	cause teleop.Header,
+	now time.Time,
 ) []Event {
 	var result []Event
 	for index, chord := range r.config.Chords {
@@ -588,7 +660,7 @@ func (r *Recognizer) reset(
 		if value.consumed || !value.holdSent {
 			continue
 		}
-		duration := max(cause.ObservedAt.Sub(value.at), 0)
+		duration := max(now.Sub(value.at), 0)
 		ended := r.event(
 			cause, cause.ObservedAt, Hold, teleop.PhaseEnded,
 			[]teleop.ControlID{button}, duration, "", 0,
@@ -661,13 +733,15 @@ func (r *Recognizer) event(
 				Stream:   r.fallbackStream,
 				Sequence: r.fallbackSeq[cause.ID.Session],
 			},
-			DeviceID:        cause.DeviceID,
-			ObservedAt:      observedAt,
-			ReceivedAt:      cause.ReceivedAt,
-			PublishedAt:     cause.PublishedAt,
-			DeviceTimestamp: cause.DeviceTimestamp,
-			Causes:          []teleop.EventID{cause.ID},
-			Synthetic:       cause.Synthetic,
+			DeviceID:          cause.DeviceID,
+			ObservedAt:        observedAt,
+			ReceivedAt:        cause.ReceivedAt,
+			PublishedAt:       cause.PublishedAt,
+			Monotonic:         cause.Monotonic,
+			ReceivedMonotonic: cause.ReceivedMonotonic,
+			DeviceTimestamp:   cause.DeviceTimestamp,
+			Causes:            []teleop.EventID{cause.ID},
+			Synthetic:         cause.Synthetic,
 		}
 	}
 	return Event{
