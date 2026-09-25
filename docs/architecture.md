@@ -11,7 +11,7 @@ See [integration choices and compatibility](integration.md).
 ```text
 OS controller API
     ↕
-xbox device source
+xbox source OR generic raw source → device mapping + profile
     ↕
 teleop.Controller
     ├── immutable CanonicalEventSink → audit.Recorder → external witness
@@ -28,6 +28,11 @@ teleop.Controller
   immutable sink admission, subscriptions, provider interfaces, normalization,
   transport-health metadata, and lifecycle semantics.
 - `xbox` supplies Xbox labels and selects the platform backend.
+- `generic` reads raw gamepad state and applies explicit device mappings before
+  handing observations to the existing controller lifecycle.
+- `profiles` supplies physical layouts and labels; `snes` supplies printed-button
+  aliases. Raw button numbers belong to a device mapping, not its layout.
+  See [generic controllers](generic-controllers.md).
 - `gesture` derives temporal patterns without hiding canonical input.
 - `action` maps physical or gesture events to application-defined identifiers.
 - `safety` owns strict interlocks, the operator lifecycle state machine, Safety

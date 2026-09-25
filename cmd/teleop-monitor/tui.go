@@ -758,95 +758,67 @@ func (m *monitorModel) renderFooter(width int) string {
 
 func (m *monitorModel) renderState(width int) string {
 	state := m.state
-	leftTrigger := triggerMeter("LT", state.LeftTrigger, meterWidth(width))
-	rightTrigger := triggerMeter("RT", state.RightTrigger, meterWidth(width))
-	if width >= 54 {
-		leftTrigger = padBetween(leftTrigger, rightTrigger, width)
+	lines := []string{sectionHeader("INPUT STATE", width)}
+	group := func(title string, controls ...struct {
+		label string
+		id    teleop.ControlID
+	}) string {
+		var parts []string
+		for _, c := range controls {
+			if m.supports(c.id) {
+				parts = append(parts, m.control(c.label, c.id))
+			}
+		}
+		if len(parts) == 0 {
+			return ""
+		}
+		return title + "  " + strings.Join(parts, " ")
+	}
+	type control = struct {
+		label string
+		id    teleop.ControlID
+	}
+	add := func(line string) {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	add(group("SHOULDERS", control{"LB", teleop.ButtonBumperLeft}, control{"RB", teleop.ButtonBumperRight}))
+	var triggers []string
+	if m.supports(teleop.TriggerLeft) {
+		triggers = append(triggers, triggerMeter("LT", state.LeftTrigger, meterWidth(width)))
+	}
+	if m.supports(teleop.TriggerRight) {
+		triggers = append(triggers, triggerMeter("RT", state.RightTrigger, meterWidth(width)))
+	}
+	if len(triggers) == 2 && width >= 54 {
+		add(padBetween(triggers[0], triggers[1], width))
 	} else {
-		leftTrigger += "\n" + rightTrigger
+		for _, line := range triggers {
+			add(line)
+		}
 	}
-
-	shoulders := padBetween(
-		"SHOULDERS  "+
-			m.control("LB", teleop.ButtonBumperLeft),
-		m.control("RB", teleop.ButtonBumperRight),
-		width,
-	)
-	sticks := padBetween(
-		fmt.Sprintf(
-			"LEFT   x=%+.3f  y=%+.3f  %s",
-			state.LeftStick.X,
-			state.LeftStick.Y,
-			m.control("LS", teleop.ButtonStickLeft),
-		),
-		fmt.Sprintf(
-			"RIGHT  x=%+.3f  y=%+.3f  %s",
-			state.RightStick.X,
-			state.RightStick.Y,
-			m.control("RS", teleop.ButtonStickRight),
-		),
-		width,
-	)
-	if width < 72 {
-		sticks = fmt.Sprintf(
-			"LEFT   x=%+.3f y=%+.3f %s\nRIGHT  x=%+.3f y=%+.3f %s",
-			state.LeftStick.X,
-			state.LeftStick.Y,
-			m.control("LS", teleop.ButtonStickLeft),
-			state.RightStick.X,
-			state.RightStick.Y,
-			m.control("RS", teleop.ButtonStickRight),
-		)
+	if m.supports(teleop.StickLeft) {
+		add(fmt.Sprintf("LEFT   x=%+.3f y=%+.3f %s", state.LeftStick.X, state.LeftStick.Y, m.control("LS", teleop.ButtonStickLeft)))
 	}
-
-	digital := padBetween(
-		"D-PAD  "+
-			m.control("↑", teleop.DPadUp)+" "+
-			m.control("←", teleop.DPadLeft)+" "+
-			m.control("↓", teleop.DPadDown)+" "+
-			m.control("→", teleop.DPadRight),
-		"FACE  "+
-			m.control("Y", teleop.ButtonFaceNorth)+" "+
-			m.control("X", teleop.ButtonFaceWest)+" "+
-			m.control("A", teleop.ButtonFaceSouth)+" "+
-			m.control("B", teleop.ButtonFaceEast),
-		width,
-	)
-	if width < 58 {
-		digital = "D-PAD  " +
-			m.control("↑", teleop.DPadUp) + " " +
-			m.control("←", teleop.DPadLeft) + " " +
-			m.control("↓", teleop.DPadDown) + " " +
-			m.control("→", teleop.DPadRight) + "\n" +
-			"FACE   " +
-			m.control("Y", teleop.ButtonFaceNorth) + " " +
-			m.control("X", teleop.ButtonFaceWest) + " " +
-			m.control("A", teleop.ButtonFaceSouth) + " " +
-			m.control("B", teleop.ButtonFaceEast)
+	if m.supports(teleop.StickRight) {
+		add(fmt.Sprintf("RIGHT  x=%+.3f y=%+.3f %s", state.RightStick.X, state.RightStick.Y, m.control("RS", teleop.ButtonStickRight)))
 	}
+	dpad := group("D-PAD", control{"↑", teleop.DPadUp}, control{"←", teleop.DPadLeft}, control{"↓", teleop.DPadDown}, control{"→", teleop.DPadRight})
+	face := group("FACE", control{"Y", teleop.ButtonFaceNorth}, control{"X", teleop.ButtonFaceWest}, control{"A", teleop.ButtonFaceSouth}, control{"B", teleop.ButtonFaceEast})
+	if dpad != "" && face != "" && lipgloss.Width(dpad)+lipgloss.Width(face)+3 <= width {
+		add(padBetween(dpad, face, width))
+	} else {
+		add(dpad)
+		add(face)
+	}
+	add(group("SYSTEM", control{"View", teleop.ButtonMenuSecondary}, control{"Xbox", teleop.ButtonSystem}, control{"Menu", teleop.ButtonMenuPrimary}, control{"Share", teleop.ButtonCapture}))
+	add(group("PADDLES", control{"P1", teleop.ButtonPaddle1}, control{"P2", teleop.ButtonPaddle2}, control{"P3", teleop.ButtonPaddle3}, control{"P4", teleop.ButtonPaddle4}))
+	return lipgloss.NewStyle().MaxWidth(width).Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+}
 
-	system := "SYSTEM  " +
-		m.control("View", teleop.ButtonMenuSecondary) + " " +
-		m.control("Xbox", teleop.ButtonSystem) + " " +
-		m.control("Menu", teleop.ButtonMenuPrimary) + " " +
-		m.control("Share", teleop.ButtonCapture)
-	paddles := "PADDLES " +
-		m.control("P1", teleop.ButtonPaddle1) + " " +
-		m.control("P2", teleop.ButtonPaddle2) + " " +
-		m.control("P3", teleop.ButtonPaddle3) + " " +
-		m.control("P4", teleop.ButtonPaddle4)
-
-	content := lipgloss.JoinVertical(
-		lipgloss.Left,
-		sectionHeader("INPUT STATE", width),
-		shoulders,
-		leftTrigger,
-		sticks,
-		digital,
-		system,
-		paddles,
-	)
-	return lipgloss.NewStyle().MaxWidth(width).Render(content)
+func (m *monitorModel) supports(id teleop.ControlID) bool {
+	return len(m.descriptor.Capability.Controls) == 0 || m.descriptor.Capability.Supports(id)
 }
 
 func (m *monitorModel) renderEvents(width, limit int) string {
@@ -883,10 +855,16 @@ func (m *monitorModel) renderEvents(width, limit int) string {
 }
 
 func (m *monitorModel) control(label string, id teleop.ControlID) string {
-	if len(m.descriptor.Capability.Controls) > 0 &&
-		!m.descriptor.Capability.Supports(id) {
-		return mutedStyle.Render(" " + label + " ")
+	if !m.supports(id) {
+		return ""
 	}
+	for _, control := range m.descriptor.Capability.Controls {
+		if control.ID == id && control.Label != "" && control.Kind != teleop.ControlDPad {
+			label = terminalText(control.Label)
+			break
+		}
+	}
+
 	if m.state.Button(id) {
 		return activeControlStyle.Render(" " + label + " ")
 	}
