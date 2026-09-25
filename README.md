@@ -9,8 +9,8 @@ teleoperation, and autonomy applications.
 application control logic. It exposes transport-independent state snapshots,
 an ordered event stream, optional gestures and semantic actions, fail-closed
 output authority with expiring command leases, and signed, externally witnessed
-audit recording. The included `xbox` provider works on Linux, macOS, and
-Windows.
+audit recording. The included `xbox` and `generic` providers work on Linux,
+macOS, and Windows; generic devices use explicit mappings and layout profiles.
 
 Start with controller input and add auditing as needed. `safety` and `assured`
 are optional modules, not prerequisites for opening a controller or recording
@@ -158,6 +158,29 @@ controller or radio, and operating-system disconnect-detection latency still
 applies. Each backend descriptor's `transport_health_scope` property records
 the checked seam.
 
+## Generic and SNES controllers
+
+Start the monitor with one command for Xbox and generic controllers:
+
+```sh
+go run ./cmd/teleop-monitor
+```
+
+Each interactive launch asks which connected controller to use. If the selected
+generic pad needs a mapping, the monitor walks through its buttons and D-pad,
+saves the mapping, and opens the live monitor in the same run. Mappings are
+loaded automatically per device on subsequent launches; the selected controller
+is never remembered. No profile filenames or provider flags are needed.
+
+The `generic` provider returns the same `teleop.GameController` API as Xbox.
+Its sampled-state backends support macOS (cgo), Linux and Windows. The first
+layout is SNES; device mappings handle raw button numbering, axis-based D-pads
+and hats. The monitor owns automatic mapping storage; application integrations
+still configure the library explicitly.
+
+See [generic controller integration](docs/generic-controllers.md) and the
+[runnable example](examples/generic/main.go).
+
 ## Controller rumble
 
 Check the discovered capability before applying vibration:
@@ -288,8 +311,8 @@ subscriptions and audit sinks as the input events that caused them.
 
 ## Discovery and hotplug
 
-`Discover` returns a descriptor for each connected controller. The Xbox
-provider also implements `teleop.WatchingProvider`:
+`Discover` returns a descriptor for each connected controller. Both providers
+also implement `teleop.WatchingProvider`:
 
 ```go
 for event := range provider.Watch(ctx) {
@@ -309,6 +332,8 @@ controllers are exposed independently when the OS provides a distinct device
 or XInput slot.
 
 ## Platform support
+
+The Xbox provider uses these backends:
 
 | Platform | Backend | Audit grade | Notes |
 | --- | --- | --- | --- |
@@ -578,6 +603,9 @@ redirected.
 | --- | --- |
 | `teleop` | Controller-neutral API, event runtime, normalization, and registry |
 | `xbox` | Cross-platform Xbox provider and familiar control aliases |
+| `generic` | Generic gamepad discovery, sampled input, and saved device mappings |
+| `profiles` | Physical layouts and labels, starting with SNES |
+| `snes` | SNES printed-button aliases |
 | `gesture` | Optional gesture recognition |
 | `action` | Optional mapping from physical input or gestures to semantic actions |
 | `safety` | Strict interlocks, serialized actuation authority, leases, and safe fallback |
